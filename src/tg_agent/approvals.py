@@ -60,12 +60,27 @@ async def _deliver(settings: Settings, draft_id: str, by: str) -> str:
     """Отправить подтверждённый черновик и вернуть строку итога для карточки."""
     from . import service  # внутри функции: service сам зовёт этот модуль
 
-    draft = Outbox(settings.outbox_path).get(draft_id)
-    try:
-        result = await service.deliver_approved(settings, draft_id, by=by)
-    except Exception as exc:  # noqa: BLE001 — итог всё равно показываем человеку
-        audit.log(settings.audit_path, "send_failed", draft_id=draft_id, error=str(exc))
-        return f"⚠️ **Не отправлено** — {bot.md_escape(f'{type(exc).__name__}: {exc}')}"
+    outbox = Outbox(settings.outbox_path)
+    draft = outbox.get(draft_id)
+    # Человек уже нажал «Отправить»: временные сбои (сессия занята, сеть)
+    # переживаем сами, прежде чем сдаваться и звать агента.
+    result: dict | None = None
+    error = ""
+    for attempt in (1, 2, 3):
+        try:
+            result = await service.deliver_approved(settings, draft_id, by=by)
+            break
+        except service.Denied as exc:  # запрет (чат закрыт, статус не тот) — повтор не поможет
+            error = f"{type(exc).__name__}: {exc}"
+            break
+        except Exception as exc:  # noqa: BLE001 — сессия занята, сеть, файл лока: пробуем ещё
+            error = f"{type(exc).__name__}: {exc}"
+            audit.log(settings.audit_path, "send_failed", draft_id=draft_id, attempt=attempt, error=str(exc))
+            if attempt < 3:
+                await asyncio.sleep(15)
+    if not (result and result.get("sent")):
+        outbox.mark_send_error(draft_id, error or "неизвестная ошибка")
+        return f"⚠️ **Не отправлено** — {bot.md_escape(error)}"
     when = datetime.now().strftime("%H:%M")
     title = bot.md_escape(_title(settings, draft))
     return f"✅ **Отправлено** в «{title}» в {when} (id {result['message_id']})"
@@ -171,9 +186,11 @@ async def wait_for_decision(settings: Settings, draft_id: str, timeout_sec: int)
 
     def resolved() -> bool:
         try:
-            return outbox.get(draft_id).status in FINAL
+            d = outbox.get(draft_id)
         except KeyError:
             return True
+        # одобрено, но отправка сорвалась — агенту надо знать сразу, а не ждать таймаута
+        return d.status in FINAL or (d.status == APPROVED and bool(d.send_error))
 
     lock = FileLock(settings.updates_lock_path, timeout=0.5)
     try:
@@ -189,6 +206,25 @@ async def wait_for_decision(settings: Settings, draft_id: str, timeout_sec: int)
         draft = outbox.get(draft_id)
     except KeyError:
         return {"draft_id": draft_id, "status": "not_found"}
+    if draft.status == APPROVED and draft.send_error:
+        return {
+            "draft_id": draft_id,
+            "chat": draft.chat,
+            "status": "send_failed",
+            "error": draft.send_error,
+            "hint": (
+                "Владелец НАЖАЛ «Отправить», но отправка сорвалась (см. error). Черновик "
+                "одобрен — повтори отправку через tg_send_draft(draft_id), новое "
+                "подтверждение не нужно. Если снова не выйдет, скажи владельцу."
+            ),
+        }
+    if draft.status == APPROVED:
+        return {
+            "draft_id": draft_id,
+            "chat": draft.chat,
+            "status": "sending",
+            "hint": "Владелец нажал «Отправить», отправка идёт — проверь через tg_list_drafts чуть позже.",
+        }
     return {
         "draft_id": draft_id,
         "chat": draft.chat,

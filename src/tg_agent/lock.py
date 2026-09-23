@@ -72,9 +72,18 @@ class FileLock:
             owner = json.loads(self.path.read_text(encoding="utf-8") or "{}").get("pid")
         except (FileNotFoundError, ValueError, OSError):
             return
-        # владелец убит (рестарт слушателя, закрытая сессия) — ждать нечего
-        if age > STALE_AFTER_SEC or (owner and not _pid_alive(int(owner))):
+        # Протухшим считаем только лок мёртвого владельца. Живой процесс может
+        # законно держать сессию долго (скачивание видео, чтение с расшифровкой),
+        # и сносить его лок по возрасту нельзя: так уже падала отправка.
+        # Возраст решает, лишь если владельца не записали (упал между
+        # созданием файла и записью pid).
+        stale = (not _pid_alive(int(owner))) if owner else age > STALE_AFTER_SEC
+        if not stale:
+            return
+        try:
             self.path.unlink(missing_ok=True)
+        except PermissionError:
+            pass  # Windows: файл ещё открыт владельцем — значит, не протух
 
     def __enter__(self) -> FileLock:
         deadline = time.monotonic() + self.timeout

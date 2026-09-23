@@ -384,6 +384,7 @@ async def list_drafts(settings: Settings, status: str | None = None) -> dict:
                 "created_at": d.created_at,
                 "expires_at": d.expires_at,
                 "message_id": d.message_id,
+                **({"send_error": d.send_error} if d.send_error else {}),
             }
             for d in drafts
         ],

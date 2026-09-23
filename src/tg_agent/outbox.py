@@ -31,6 +31,7 @@ class Draft:
     bot_message_id: int | None = None
     fmt: str = "markdown"
     files: list[dict] = field(default_factory=list)  # снимки вложений: path, name, size
+    send_error: str | None = None  # одобрено, но отправка сорвалась — текст ошибки
     note: str = ""
     history: list[dict] = field(default_factory=list)
 
@@ -167,9 +168,20 @@ class Outbox:
 
         return self._update(draft_id, mutate)
 
+    def mark_send_error(self, draft_id: str, error: str) -> Draft:
+        def mutate(draft: Draft) -> None:
+            draft.send_error = error[:500]
+            draft.history.append(
+                {"event": "send_failed", "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 "error": error[:300]}
+            )
+
+        return self._update(draft_id, mutate)
+
     def mark_sent(self, draft_id: str, message_id: int, at: str) -> Draft:
         def mutate(draft: Draft) -> None:
             draft.status = SENT
+            draft.send_error = None
             draft.sent_at = at
             draft.message_id = message_id
             draft.history.append({"event": "sent", "at": at, "message_id": message_id})

@@ -26,26 +26,45 @@ async def open_client(settings: Settings, *, require_auth: bool = True, wait: fl
     проектов, а файл сессии один.
     """
     # wait — сколько ждать, пока сессию отпустит другой процесс tg-agent
+    import inspect
+    import time as _time
+
+    from . import audit
+
+    caller = next((f.function for f in inspect.stack()[2:6] if f.function not in ("__aenter__", "helper")), "?")
     with FileLock(settings.session_path, timeout=wait):
-        client = TelegramClient(
-            str(settings.session_path),
-            settings.api_id,
-            settings.api_hash,
-            proxy=settings.proxy,
-            device_model="tg-agent",
-            system_version="claude-code",
-            app_version="0.1.0",
-        )
-        await client.connect()
+        taken = _time.monotonic()
         try:
-            if require_auth and not await client.is_user_authorized():
-                raise NotLoggedIn(
-                    "Нет валидной сессии Telegram. Человек должен выполнить "
-                    f"`uv run --directory {ROOT} tg login` и ввести код из Telegram."
-                )
-            yield client
+            async with _connected(settings, require_auth) as client:
+                yield client
         finally:
-            await client.disconnect()
+            held = _time.monotonic() - taken
+            if held > 30:
+                # долгие захваты мешают отправке — пусть будет видно, кто
+                audit.log(settings.audit_path, "long_session_hold", seconds=round(held), by=caller)
+
+
+@asynccontextmanager
+async def _connected(settings: Settings, require_auth: bool):
+    client = TelegramClient(
+        str(settings.session_path),
+        settings.api_id,
+        settings.api_hash,
+        proxy=settings.proxy,
+        device_model="tg-agent",
+        system_version="claude-code",
+        app_version="0.1.0",
+    )
+    await client.connect()
+    try:
+        if require_auth and not await client.is_user_authorized():
+            raise NotLoggedIn(
+                "Нет валидной сессии Telegram. Человек должен выполнить "
+                f"`uv run --directory {ROOT} tg login` и ввести код из Telegram."
+            )
+        yield client
+    finally:
+        await client.disconnect()
 
 
 async def entity_for(client: TelegramClient, rule: ChatRule):
