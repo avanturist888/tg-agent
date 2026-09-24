@@ -415,7 +415,9 @@ func (o *Outbox) Update(id string, mutate func(*Draft) error) (*Draft, error) {
 
 func (o *Outbox) Approve(id, by string) (*Draft, error) {
 	return o.Update(id, func(d *Draft) error {
-		if d.Status != Pending {
+		// scheduled — владелец не стал ждать окна автоотправки: «Отправить сейчас».
+		// Захват под локом очереди, так что таймер его уже не подхватит.
+		if d.Status != Pending && d.Status != Scheduled {
 			return &BadState{fmt.Sprintf("Черновик %s в статусе '%s', подтвердить нельзя", id, d.Status)}
 		}
 		at := audit.Now()

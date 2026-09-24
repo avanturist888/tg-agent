@@ -63,3 +63,23 @@ func TestExtraFieldsKeptAndScheduled(t *testing.T) {
 		t.Fatal("повторный захват")
 	}
 }
+
+// «Отправить сейчас» у автоотправки: одобрение до срока, таймер его не трогает.
+func TestApproveScheduledBeforeDue(t *testing.T) {
+	o := New(filepath.Join(t.TempDir(), "outbox.json"))
+	at := time.Now().Add(-time.Second)
+	d, err := o.Create(CreateOpts{Chat: "c", Text: "hi", TTLMin: 60, SendAt: &at})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := o.Approve(d.ID, "telegram_button:1")
+	if err != nil || got.Status != Approved || got.ApprovedBy() != "telegram_button:1" {
+		t.Fatalf("%v %+v", err, got)
+	}
+	if due, _ := o.ClaimDue(time.Now()); len(due) != 0 {
+		t.Fatal("таймер подхватил уже одобренный черновик")
+	}
+	if _, err := o.Approve(d.ID, "x"); err == nil {
+		t.Fatal("повторное одобрение прошло")
+	}
+}

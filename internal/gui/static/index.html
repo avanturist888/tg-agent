@@ -388,7 +388,7 @@ async function loadDrafts() {
         <div class="row" style="margin-top:8px">
           ${d.status === "pending" ? `<button class="btn ok approve">✅ Отправить</button><button class="btn danger reject">✋ Отклонить</button>` : ""}
           ${["pending", "scheduled"].includes(d.status) ? `<button class="btn edit-draft">✎ Изменить текст</button>` : ""}
-          ${d.status === "scheduled" ? `<span class="meta">Уйдёт в ${fmtTime(d.send_at)} — через ${left} с</span><button class="btn danger reject">✋ Отменить отправку</button>` : ""}
+          ${d.status === "scheduled" ? `<span class="meta">Уйдёт в ${fmtTime(d.send_at)} — через ${left} с</span><button class="btn ok approve">✅ Отправить сейчас</button><button class="btn danger reject">✋ Отменить</button>` : ""}
         </div></div>`;
     }).join("") || `<div class="empty">Здесь пусто.</div>`;
     document.querySelectorAll(".draft .approve").forEach(b => b.onclick = async () => {

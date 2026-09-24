@@ -183,11 +183,9 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		cardID = fromCallback
 	}
 
-	if d.Status == outbox.Scheduled {
-		if verdict != "no" {
-			bot.AnswerCallback(ctx, s, q.ID, "Уйдёт само по таймеру.")
-			return
-		}
+	// «Отправить сейчас» у автоотправки идёт обычным путём ниже: Approve
+	// принимает и scheduled, а таймер после этого черновик уже не тронет.
+	if d.Status == outbox.Scheduled && verdict == "no" {
 		if _, err := box.Cancel(draftID, fmt.Sprintf("telegram_button:%d", q.From.ID)); err != nil {
 			bot.AnswerCallback(ctx, s, q.ID, "Поздно — уже отправляется.")
 			return

@@ -302,11 +302,13 @@ func CardHTML(d *outbox.Draft, title, note, status string) string {
 	return card
 }
 
-// Keyboard — кнопки под карточкой. У автоотправки только «Отменить».
+// Keyboard — кнопки под карточкой. У автоотправки — «Отправить сейчас»
+// (не ждать окна) и «Отменить».
 func Keyboard(d *outbox.Draft) map[string]any {
 	if d.Status == outbox.Scheduled {
 		return map[string]any{"inline_keyboard": [][]map[string]string{{
-			{"text": "✋ Отменить отправку", "callback_data": "d:" + d.ID + ":no"},
+			{"text": "✅ Отправить сейчас", "callback_data": "d:" + d.ID + ":ok"},
+			{"text": "✋ Отменить", "callback_data": "d:" + d.ID + ":no"},
 		}}}
 	}
 	return map[string]any{"inline_keyboard": [][]map[string]string{{
@@ -323,7 +325,7 @@ func ScheduledStatus(d *outbox.Draft) string {
 			when = at.Local().Format("15:04:05")
 		}
 	}
-	return fmt.Sprintf("⏳ **Уйдёт в %s**, если не отменить.", when)
+	return fmt.Sprintf("⏳ **Уйдёт в %s**, если не отменить. Можно отправить сразу.", when)
 }
 
 // SendDraftCard показывает черновик в боте и возвращает id карточки.
