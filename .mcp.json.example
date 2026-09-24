@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "telegram": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/tg-agent", "tg-mcp"]
+      "command": "C:/path/to/tg-agent/bin/tg.exe",
+      "args": ["mcp"]
     }
   }
 }
