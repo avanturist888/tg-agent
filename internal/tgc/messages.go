@@ -103,32 +103,88 @@ func (c *Conn) History(ctx context.Context, t Target, limit, beforeID, afterID i
 
 // Message — одно сообщение по id (nil — нет такого).
 func (c *Conn) Message(ctx context.Context, t Target, id int) (tg.MessageClass, *Batch, error) {
-	ids := []tg.InputMessageClass{&tg.InputMessageID{ID: id}}
-	var (
-		res tg.MessagesMessagesClass
-		err error
-	)
-	if ch, ok := t.Input.(*tg.InputPeerChannel); ok {
-		res, err = c.API.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
-			Channel: &tg.InputChannel{ChannelID: ch.ChannelID, AccessHash: ch.AccessHash}, ID: ids,
-		})
-	} else {
-		res, err = c.API.MessagesGetMessages(ctx, ids)
-	}
+	b, err := c.Messages(ctx, t, []int{id})
 	if err != nil {
 		return nil, nil, err
 	}
-	b := c.unpack(res)
-	c.Peers.Save()
-	for _, m := range b.Messages {
-		if _, empty := m.(*tg.MessageEmpty); empty {
-			continue
+	if len(b.Messages) == 0 {
+		return nil, b, nil
+	}
+	return b.Messages[0], b, nil
+}
+
+// MaxByID — сколько сообщений Telegram отдаёт по id за один запрос.
+const MaxByID = 100
+
+// Messages — сообщения чата по id (удалённые и чужие пропускаются), в
+// порядке запроса.
+func (c *Conn) Messages(ctx context.Context, t Target, ids []int) (*Batch, error) {
+	all := &Batch{Users: map[int64]*tg.User{}, Chats: map[int64]tg.ChatClass{}}
+	for start := 0; start < len(ids); start += MaxByID {
+		part := ids[start:min(start+MaxByID, len(ids))]
+		input := make([]tg.InputMessageClass, len(part))
+		for i, id := range part {
+			input[i] = &tg.InputMessageID{ID: id}
 		}
-		if m.GetID() == id {
-			return m, b, nil
+		var (
+			res tg.MessagesMessagesClass
+			err error
+		)
+		if ch, ok := t.Input.(*tg.InputPeerChannel); ok {
+			res, err = c.API.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+				Channel: &tg.InputChannel{ChannelID: ch.ChannelID, AccessHash: ch.AccessHash}, ID: input,
+			})
+		} else {
+			res, err = c.API.MessagesGetMessages(ctx, input)
+		}
+		if err != nil {
+			return nil, err
+		}
+		b := c.unpack(res)
+		for k, v := range b.Users {
+			all.Users[k] = v
+		}
+		for k, v := range b.Chats {
+			all.Chats[k] = v
+		}
+		byID := map[int]tg.MessageClass{}
+		for _, m := range b.Messages {
+			if _, empty := m.(*tg.MessageEmpty); empty {
+				continue
+			}
+			// messages.getMessages ищет по всем личкам и группам сразу —
+			// чужое сообщение с тем же номером отдавать нельзя
+			if !belongs(m, t) {
+				continue
+			}
+			byID[m.GetID()] = m
+		}
+		for _, id := range part {
+			if m, ok := byID[id]; ok {
+				all.Messages = append(all.Messages, m)
+			}
 		}
 	}
-	return nil, b, nil
+	c.Peers.Save()
+	return all, nil
+}
+
+// belongs — сообщение из этого чата.
+func belongs(m tg.MessageClass, t Target) bool {
+	var peer tg.PeerClass
+	switch v := m.(type) {
+	case *tg.Message:
+		peer = v.PeerID
+	case *tg.MessageService:
+		peer = v.PeerID
+	default:
+		return false
+	}
+	if t.Kind == "self" {
+		p, ok := peer.(*tg.PeerUser)
+		return ok && p.UserID == t.ID
+	}
+	return peerKey(peer) == peerKey(PeerOfTarget(t))
 }
 
 // ── разбор медиа ──────────────────────────────────────────────────────────

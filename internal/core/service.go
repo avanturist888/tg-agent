@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -91,29 +92,63 @@ func ListChats(ctx context.Context, s *config.Settings, withStatus bool) (*omap.
 	return omap.New().Set("send_policy", s.SendPolicy).Set("chats", chats), nil
 }
 
+// ReadOpts — что читать.
+type ReadOpts struct {
+	Limit    int
+	BeforeID int
+	AfterID  int
+	Search   string
+	// IDs — конкретные сообщения по номерам (остальные параметры не нужны)
+	IDs        []int
+	Transcribe bool
+}
+
 // ReadChat — tg_read_chat / tg_search_chat.
-func ReadChat(ctx context.Context, s *config.Settings, chat string, limit, beforeID, afterID int, search string, transcribe bool) (*omap.Map, error) {
+//
+// Ответ на сообщение, которого нет в выдаче (ответили на старое), приходит
+// вместе с ним: поле reply_to_message — само исходное сообщение, у голосового
+// с расшифровкой. Иначе агент видит только номер и не понимает, о чём речь.
+func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) (*omap.Map, error) {
 	rule, err := readable(s, chat)
 	if err != nil {
 		return nil, err
 	}
-	limit = clamp(limit, s)
+	limit := clamp(o.Limit, s)
+	if len(o.IDs) > s.MaxLimit {
+		return nil, &Bad{Msg: fmt.Sprintf("Не больше %d сообщений за раз.", s.MaxLimit)}
+	}
 	var messages []*omap.Map
 	err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
 		t, err := c.Resolve(ctx, rule)
 		if err != nil {
 			return err
 		}
-		batch, err := c.History(ctx, t, limit, beforeID, afterID, search)
+		var batch *tgc.Batch
+		if len(o.IDs) > 0 {
+			ids := append([]int(nil), o.IDs...)
+			sort.Ints(ids)
+			if batch, err = c.Messages(ctx, t, ids); err != nil {
+				return err
+			}
+			for _, m := range batch.Messages { // уже по возрастанию
+				messages = append(messages, c.Serialize(m, batch))
+			}
+		} else {
+			if batch, err = c.History(ctx, t, limit, o.BeforeID, o.AfterID, o.Search); err != nil {
+				return err
+			}
+			// хронологический порядок: старые сверху
+			for i := len(batch.Messages) - 1; i >= 0; i-- {
+				messages = append(messages, c.Serialize(batch.Messages[i], batch))
+			}
+		}
+		parents, err := replyParents(ctx, c, t, messages)
 		if err != nil {
 			return err
 		}
-		// хронологический порядок: старые сверху
-		for i := len(batch.Messages) - 1; i >= 0; i-- {
-			messages = append(messages, c.Serialize(batch.Messages[i], batch))
-		}
-		if transcribe {
-			c.AttachTranscripts(ctx, t, rule, messages, tgc.TranscriptCache{Path: s.TranscriptsPath()}, s.TranscribePerCall)
+		if o.Transcribe {
+			cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
+			c.AttachTranscripts(ctx, t, rule, append(messages, parents...), cache, s.TranscribePerCall)
 		}
 		return nil
 	})
@@ -121,10 +156,14 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, limit, befor
 		return nil, err
 	}
 	var searchVal any
-	if search != "" {
-		searchVal = search
+	if o.Search != "" {
+		searchVal = o.Search
 	}
-	_ = audit.Log(s.AuditPath(), "read", "chat", rule.Alias, "limit", limit, "search", searchVal, "returned", len(messages))
+	kv := []any{"chat", rule.Alias, "limit", limit, "search", searchVal, "returned", len(messages)}
+	if len(o.IDs) > 0 {
+		kv = append(kv, "ids", o.IDs)
+	}
+	_ = audit.Log(s.AuditPath(), "read", kv...)
 	var oldest, newest any
 	if len(messages) > 0 {
 		oldest, _ = messages[0].Get("id")
@@ -135,6 +174,65 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, limit, befor
 	}
 	return omap.New().Set("chat", rule.Alias).Set("title", rule.Title).Set("count", len(messages)).
 		Set("oldest_id", oldest).Set("newest_id", newest).Set("messages", messages), nil
+}
+
+// replyParents вкладывает в ответы исходные сообщения, которых нет в выдаче,
+// — одним запросом на все. Возвращает вложенные (им тоже нужна расшифровка).
+func replyParents(ctx context.Context, c *tgc.Conn, t tgc.Target, messages []*omap.Map) ([]*omap.Map, error) {
+	have := map[int]bool{}
+	for _, m := range messages {
+		if id, ok := m.Get("id"); ok {
+			have[toInt(id)] = true
+		}
+	}
+	var want []int
+	seen := map[int]bool{}
+	for _, m := range messages {
+		if r, ok := m.Get("reply_to"); ok {
+			id := toInt(r)
+			if id > 0 && !have[id] && !seen[id] {
+				seen[id] = true
+				want = append(want, id)
+			}
+		}
+	}
+	if len(want) == 0 {
+		return nil, nil
+	}
+	batch, err := c.Messages(ctx, t, want)
+	if err != nil {
+		return nil, err
+	}
+	byID := map[int]*omap.Map{}
+	var parents []*omap.Map
+	for _, m := range batch.Messages {
+		p := c.Serialize(m, batch)
+		p.Delete("reply_to") // цепочку дальше не разворачиваем: при нужде — ids
+		byID[m.GetID()] = p
+		parents = append(parents, p)
+	}
+	for _, m := range messages {
+		if r, ok := m.Get("reply_to"); ok {
+			if p, ok := byID[toInt(r)]; ok {
+				m.Set("reply_to_message", p)
+			} else if !have[toInt(r)] {
+				m.Set("reply_to_message", nil) // удалено или недоступно
+			}
+		}
+	}
+	return parents, nil
+}
+
+func toInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return 0
 }
 
 // DownloadFile — вложение из разрешённого чата в data/downloads/<alias>/.

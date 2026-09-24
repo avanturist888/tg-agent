@@ -116,6 +116,7 @@ type readChatIn struct {
 	Limit    int    `json:"limit,omitempty" jsonschema:"сколько сообщений (по умолчанию 50)"`
 	BeforeID int    `json:"before_id,omitempty" jsonschema:"вернуть сообщения СТАРШЕ этого id"`
 	AfterID  int    `json:"after_id,omitempty" jsonschema:"вернуть сообщения НОВЕЕ этого id"`
+	IDs      []int  `json:"ids,omitempty" jsonschema:"конкретные сообщения по id (тогда limit, before_id, after_id не нужны)"`
 }
 
 type msgIn struct {
@@ -200,9 +201,14 @@ chat      — alias из tg_list_chats
 limit     — сколько сообщений (по умолчанию 50, потолок задан владельцем)
 before_id — вернуть сообщения СТАРШЕ этого id (постраничная прокрутка назад)
 after_id  — вернуть сообщения НОВЕЕ этого id (что нового с прошлого раза)
+ids       — конкретные сообщения по id, например [3585092, 3585000]
 
 Сообщения приходят в хронологическом порядке, старые сверху.
 Чтение не помечает чат прочитанным.
+
+Ответ на сообщение (reply_to), которого нет в выдаче, приходит вместе с ним:
+reply_to_message — само исходное сообщение (у голосового — с расшифровкой);
+null — оно удалено. Дальше по цепочке — через ids.
 
 Голосовые и кружки (media = voice / video_note) приходят с расшифровкой
 Telegram. transcript_status: done — transcript полный; pending — готово
@@ -211,7 +217,8 @@ not_requested — вызови tg_transcribe; error — скачай через
 tg_download_file и расшифруй своим STT.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in readChatIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
-				return core.ReadChat(ctx, s, in.Chat, in.Limit, in.BeforeID, in.AfterID, "", true)
+				return core.ReadChat(ctx, s, in.Chat, core.ReadOpts{Limit: in.Limit, BeforeID: in.BeforeID,
+					AfterID: in.AfterID, IDs: in.IDs, Transcribe: true})
 			})
 		})
 
@@ -280,7 +287,7 @@ MSG_VOICE_TOO_LONG) — тогда скачай tg_download_file и прогон
 				limit = 30
 			}
 			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
-				return core.ReadChat(ctx, s, in.Chat, limit, 0, 0, in.Query, true)
+				return core.ReadChat(ctx, s, in.Chat, core.ReadOpts{Limit: limit, Search: in.Query, Transcribe: true})
 			})
 		})
 
