@@ -87,13 +87,19 @@ func init() {
 		{name: "doctor", help: "проверить конфигурацию", run: cmdDoctor},
 		{name: "mcp", help: "MCP-сервер для Claude Code (stdio)", run: cmdMCP},
 		{name: "gui", help: "окно управления: чаты, черновики, настройки", run: cmdGUI},
+		// служебные: их запускает сама программа
+		{name: "tool-list", run: cmdToolList},
+		{name: "tool-call", run: cmdToolCall},
+		{name: "send-due", run: cmdSendDue},
 	}
 }
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "tg-agent — доступ агентов Claude Code к Telegram по белому списку чатов.\n\nКоманды:")
 	for _, c := range commands {
-		fmt.Fprintf(os.Stderr, "  %-10s %s\n", c.name, c.help)
+		if c.help != "" {
+			fmt.Fprintf(os.Stderr, "  %-10s %s\n", c.name, c.help)
+		}
 	}
 }
 
@@ -632,9 +638,39 @@ func cmdFeeds(ctx context.Context, args []string) int {
 }
 
 func cmdMCP(ctx context.Context, args []string) int {
-	if err := mcpserver.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	run := mcpserver.RunProxy // каждый вызов — свежей сборкой, без перезапуска сессий
+	if len(args) > 0 && args[0] == "--direct" {
+		run = mcpserver.Run
+	}
+	if err := run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintln(os.Stderr, "mcp:", err)
 		return 1
+	}
+	return 0
+}
+
+func cmdToolList(ctx context.Context, args []string) int {
+	if err := mcpserver.ToolList(ctx, os.Stdout); err != nil {
+		return fail(err)
+	}
+	return 0
+}
+
+func cmdToolCall(ctx context.Context, args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "Использование: tg tool-call <инструмент> < аргументы.json")
+		return 2
+	}
+	if err := mcpserver.ToolCall(ctx, args[0], os.Stdin, os.Stdout); err != nil {
+		return fail(err)
+	}
+	return 0
+}
+
+// cmdSendDue — дослать автоотправку в срок, когда слушателя нет.
+func cmdSendDue(ctx context.Context, args []string) int {
+	if err := core.SendDueLoop(ctx, config.Load); err != nil && !errors.Is(err, context.Canceled) {
+		return fail(err)
 	}
 	return 0
 }

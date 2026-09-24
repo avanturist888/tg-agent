@@ -278,23 +278,37 @@ func SendDue(ctx context.Context, s *config.Settings) {
 	}
 }
 
-// ScheduleLocal — процесс, создавший черновик с автоотправкой, сам дошлёт
-// его в срок, если слушателя нет. Слушатель, если есть, успеет раньше или
-// позже — захват под локом не даст отправить дважды.
+// ScheduleLocal — если слушателя нет, автоотправку дошлёт отдельный процесс
+// `tgw send-due`: процесс вызова инструмента живёт только до ответа агенту.
+// Слушатель, если есть, отправит сам — захват под локом не даст отправить дважды.
 func ScheduleLocal(s *config.Settings, d *outbox.Draft) {
-	if d.SendAt == nil {
+	if d.SendAt == nil || lock.Held(s.UpdatesLockPath()) {
 		return
 	}
-	at, err := time.Parse(time.RFC3339, *d.SendAt)
-	if err != nil {
-		return
+	if err := spawnSendDue(); err != nil {
+		_ = audit.Log(s.AuditPath(), "auto_send_spawn_failed", "draft_id", d.ID, "error", err.Error())
 	}
-	go func() {
-		time.Sleep(time.Until(at) + 1500*time.Millisecond) // даём слушателю отработать первым
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
+}
+
+// SendDueLoop — ждать ближайшую автоотправку, отправить, и так пока
+// запланированное не кончится.
+func SendDueLoop(ctx context.Context, loader func() (*config.Settings, error)) error {
+	for ctx.Err() == nil {
+		s, err := loader()
+		if err != nil {
+			return err
+		}
+		next, err := outbox.New(s.OutboxPath()).NextDue()
+		if err != nil {
+			return err
+		}
+		if next == nil {
+			return nil
+		}
+		sleepCtx(ctx, time.Until(*next)+500*time.Millisecond)
 		SendDue(ctx, s)
-	}()
+	}
+	return ctx.Err()
 }
 
 // ── разбор апдейтов ──────────────────────────────────────────────────────
