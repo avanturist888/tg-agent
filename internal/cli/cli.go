@@ -5,6 +5,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,19 +14,19 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/term"
 
 	"tgagent/internal/audit"
-	"tgagent/internal/bot"
 	"tgagent/internal/chatsfile"
 	"tgagent/internal/config"
 	"tgagent/internal/core"
-	"tgagent/internal/lock"
+	"tgagent/internal/mcpproxy"
 	"tgagent/internal/mcpserver"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
+	"tgagent/internal/service"
 	"tgagent/internal/tgc"
 )
 
@@ -78,7 +79,8 @@ func init() {
 		{name: "read", help: "прочитать чат", run: cmdRead},
 		{name: "drafts", help: "очередь черновиков от агентов", run: cmdDrafts},
 		{name: "pending", help: "что ждёт нажатия кнопки", run: cmdPending},
-		{name: "approvals", help: "слушатель кнопок: демон или разбор накопившегося (--once)", run: cmdApprovals},
+		{name: "serve", help: "служба: соединение с Telegram, ленты, кнопки бота (её запускает Планировщик)", run: cmdServe},
+		{name: "approvals", help: "--once: разобрать накопившиеся нажатия без службы", run: cmdApprovals},
 		{name: "approve", help: "подтвердить отправку (--send — и отправить)", run: cmdApprove},
 		{name: "reject", help: "отменить черновик", run: cmdReject},
 		{name: "send", help: "отправить подтверждённый черновик вручную", run: cmdSend},
@@ -176,7 +178,36 @@ func cmdLogin(ctx context.Context, args []string) int {
 	if p == "" {
 		p = s.Phone
 	}
-	me, err := tgc.Login(ctx, s, &terminal{phone: p, in: bufio.NewReader(os.Stdin)})
+	term := &terminal{phone: p, in: bufio.NewReader(os.Stdin)}
+	if service.Up(ctx) {
+		// сессию держит служба — вход идёт через неё
+		if p == "" {
+			if p, err = term.Phone(ctx); err != nil {
+				return fail(err)
+			}
+		}
+		var step tgc.LoginStep
+		if err := service.Do(ctx, "login_begin", service.ValueArgs{Value: p}, &step); err != nil {
+			return fail(err)
+		}
+		for step.Stage != "done" {
+			var answer string
+			if step.Stage == "need_password" {
+				answer, err = term.Password(ctx)
+			} else {
+				answer, err = term.Code(ctx)
+			}
+			if err != nil {
+				return fail(err)
+			}
+			if err := service.Do(ctx, "login_answer", service.ValueArgs{Value: answer}, &step); err != nil {
+				return fail(err)
+			}
+		}
+		fmt.Printf("Готово. Аккаунт: %s\n", step.User)
+		return 0
+	}
+	me, err := tgc.Login(ctx, s, term)
 	if err != nil {
 		return fail(err)
 	}
@@ -195,10 +226,16 @@ func cmdLogout(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	if err := tgc.Logout(ctx, s); err != nil {
-		return fail(err)
+	if service.Up(ctx) {
+		if err := service.Do(ctx, "logout", nil, nil); err != nil {
+			return fail(err)
+		}
+	} else {
+		if err := tgc.Logout(ctx, s); err != nil {
+			return fail(err)
+		}
+		_ = audit.Log(s.AuditPath(), "logout")
 	}
-	_ = audit.Log(s.AuditPath(), "logout")
 	fmt.Println("Сессия отозвана на стороне Telegram.")
 	return 0
 }
@@ -208,23 +245,16 @@ func cmdWhoami(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
-		me, err := c.Self(ctx)
-		if err != nil {
-			return err
-		}
-		c.Peers.Save()
-		var username any
-		if me.Username != "" {
-			username = me.Username
-		}
-		printJSON(omap.New().Set("id", me.ID).Set("username", username).Set("name", me.FirstName).
-			Set("session", s.SessionPath).Set("send_policy", s.SendPolicy).Set("chats_allowed", len(s.Chats)))
-		return nil
-	})
-	if err != nil {
+	var me service.Self
+	if err := service.Do(ctx, "self", nil, &me); err != nil {
 		return fail(err)
 	}
+	var username any
+	if me.Username != "" {
+		username = me.Username
+	}
+	printJSON(omap.New().Set("id", me.ID).Set("username", username).Set("name", me.FirstName).
+		Set("session", s.SessionPath).Set("send_policy", s.SendPolicy).Set("chats_allowed", len(s.Chats)))
 	return 0
 }
 
@@ -241,12 +271,9 @@ func cmdDialogs(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
+	_ = s
 	var rows []tgc.DialogRow
-	err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
-		rows, err = c.ListDialogs(ctx, *limit)
-		return err
-	})
-	if err != nil {
+	if err := service.Do(ctx, "dialogs", service.LimitArgs{Limit: *limit}, &rows); err != nil {
 		return fail(err)
 	}
 	needle := strings.ToLower(*filter)
@@ -324,12 +351,7 @@ func cmdAllow(ctx context.Context, args []string) int {
 	}
 	if *match != "" {
 		var rows []tgc.DialogRow
-		err := tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
-			var err error
-			rows, err = c.ListDialogs(ctx, *limit)
-			return err
-		})
-		if err != nil {
+		if err := service.Do(ctx, "dialogs", service.LimitArgs{Limit: *limit}, &rows); err != nil {
 			return fail(err)
 		}
 		needle := strings.ToLower(*match)
@@ -401,12 +423,8 @@ func cmdChats(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	out, err := core.ListChats(ctx, s, *status)
-	if err != nil {
-		return fail(err)
-	}
-	printJSON(out)
-	return 0
+	_ = s
+	return runTool(ctx, "tg_list_chats", map[string]any{"with_status": *status})
 }
 
 func cmdRead(ctx context.Context, args []string) int {
@@ -422,12 +440,11 @@ func cmdRead(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	out, err := core.ReadChat(ctx, s, pos[0], *limit, 0, 0, *search, true)
-	if err != nil {
-		return fail(err)
+	_ = s
+	if *search != "" {
+		return runTool(ctx, "tg_search_chat", map[string]any{"chat": pos[0], "query": *search, "limit": *limit})
 	}
-	printJSON(out)
-	return 0
+	return runTool(ctx, "tg_read_chat", map[string]any{"chat": pos[0], "limit": *limit})
 }
 
 // ── черновики ────────────────────────────────────────────────────────────
@@ -521,11 +538,7 @@ func cmdApprove(ctx context.Context, args []string) int {
 	_ = audit.Log(s.AuditPath(), "approve", "draft_id", pos[0], "chat", d.Chat, "by", "human")
 	fmt.Println("Подтверждено:", pos[0])
 	if *send {
-		out, err := core.SendDraft(ctx, s, pos[0], "tg approve --send")
-		if err != nil {
-			return fail(err)
-		}
-		printJSON(out)
+		return runTool(ctx, "tg_send_draft", map[string]any{"draft_id": pos[0], "user_confirmation": "tg approve --send"})
 	} else {
 		fmt.Println("Агент может отправить его через tg_send_draft (или запусти `tg send <id>`).")
 	}
@@ -558,15 +571,11 @@ func cmdSend(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	out, err := core.SendDraft(ctx, s, args[0], "cli send by owner")
-	if err != nil {
-		return fail(err)
-	}
-	printJSON(out)
-	return 0
+	_ = s
+	return runTool(ctx, "tg_send_draft", map[string]any{"draft_id": args[0], "user_confirmation": "cli send by owner"})
 }
 
-// ── слушатель и ленты ────────────────────────────────────────────────────
+// ── служба и ленты ────────────────────────────────────────────────────
 
 func cmdApprovals(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("approvals", flag.ContinueOnError)
@@ -583,6 +592,10 @@ func cmdApprovals(ctx context.Context, args []string) int {
 		return 1
 	}
 	if *once {
+		if service.Up(ctx) {
+			fmt.Println("Кнопки разбирает служба — разбирать вручную нечего.")
+			return 0
+		}
 		n, err := core.SweepOnce(ctx, s)
 		if err != nil {
 			return fail(err)
@@ -590,7 +603,7 @@ func cmdApprovals(ctx context.Context, args []string) int {
 		fmt.Println("Разобрано накопившихся нажатий:", n)
 		return 0
 	}
-	if err := core.RunDaemon(ctx, s, config.Load); err != nil && !errors.Is(err, context.Canceled) {
+	if err := service.Run(ctx, config.Load); err != nil && !errors.Is(err, context.Canceled) {
 		return fail(err)
 	}
 	return 0
@@ -618,8 +631,8 @@ func cmdFeeds(ctx context.Context, args []string) int {
 		return fail(err)
 	}
 	if *poll {
-		added, err := core.PollOnce(ctx, s, false)
-		if err != nil {
+		var added map[string]int
+		if err := service.Do(ctx, "poll", nil, &added); err != nil {
 			return fail(err)
 		}
 		if len(added) == 0 {
@@ -638,7 +651,7 @@ func cmdFeeds(ctx context.Context, args []string) int {
 }
 
 func cmdMCP(ctx context.Context, args []string) int {
-	run := mcpserver.RunProxy // каждый вызов — свежей сборкой, без перезапуска сессий
+	run := mcpproxy.Run // вызовы — в службу или в свежую сборку, без перезапуска сессий
 	if len(args) > 0 && args[0] == "--direct" {
 		run = mcpserver.Run
 	}
@@ -649,11 +662,19 @@ func cmdMCP(ctx context.Context, args []string) int {
 	return 0
 }
 
-func cmdToolList(ctx context.Context, args []string) int {
-	if err := mcpserver.ToolList(ctx, os.Stdout); err != nil {
+func cmdServe(ctx context.Context, args []string) int {
+	if err := service.Run(ctx, config.Load); err != nil && !errors.Is(err, context.Canceled) {
 		return fail(err)
 	}
 	return 0
+}
+
+func cmdToolList(ctx context.Context, args []string) int {
+	var tools []*mcp.Tool
+	if err := service.Do(ctx, "tools", nil, &tools); err != nil {
+		return fail(err)
+	}
+	return writeJSON(tools)
 }
 
 func cmdToolCall(ctx context.Context, args []string) int {
@@ -661,18 +682,55 @@ func cmdToolCall(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "Использование: tg tool-call <инструмент> < аргументы.json")
 		return 2
 	}
-	if err := mcpserver.ToolCall(ctx, args[0], os.Stdin, os.Stdout); err != nil {
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
 		return fail(err)
 	}
-	return 0
+	var res mcp.CallToolResult
+	if err := service.Do(ctx, "tool", service.ToolArgs{Name: args[0], Args: json.RawMessage(raw)}, &res); err != nil {
+		res = *mcpserver.Failed(err)
+	}
+	return writeJSON(&res)
 }
 
-// cmdSendDue — дослать автоотправку в срок, когда слушателя нет.
+// cmdSendDue — дослать автоотправку в срок, когда службы нет.
 func cmdSendDue(ctx context.Context, args []string) int {
 	if err := core.SendDueLoop(ctx, config.Load); err != nil && !errors.Is(err, context.Canceled) {
 		return fail(err)
 	}
 	return 0
+}
+
+func writeJSON(v any) int {
+	if err := json.NewEncoder(os.Stdout).Encode(v); err != nil {
+		return fail(err)
+	}
+	return 0
+}
+
+// runTool — инструмент агента (через службу или на месте); печатает его ответ.
+func runTool(ctx context.Context, name string, args map[string]any) int {
+	raw, _ := json.Marshal(args)
+	var res mcp.CallToolResult
+	if err := service.Do(ctx, "tool", service.ToolArgs{Name: name, Args: raw}, &res); err != nil {
+		return fail(err)
+	}
+	code := 0
+	if res.IsError {
+		code = 1
+	}
+	for _, c := range res.Content {
+		if t, ok := c.(*mcp.TextContent); ok {
+			fmt.Println(t.Text)
+			var probe struct {
+				Error string `json:"error"`
+			}
+			if json.Unmarshal([]byte(t.Text), &probe) == nil && probe.Error != "" {
+				code = 1
+			}
+		}
+	}
+	return code
 }
 
 func cmdGUI(ctx context.Context, args []string) int {
@@ -706,54 +764,58 @@ func cmdDoctor(ctx context.Context, args []string) int {
 	if s.APIID == exampleAPIID {
 		problems = append(problems, "в .env остались значения-заглушки из .env.example — впиши свои с my.telegram.org")
 	}
+	up := service.Up(ctx)
+	var status service.Status
+	if up {
+		_ = service.Do(ctx, "status", nil, &status)
+		fmt.Printf("[v] служба запущена: сборка %s, pid %d, с %s\n", status.Build, status.PID, status.Started.Local().Format("02.01 15:04"))
+	} else {
+		fmt.Println("[?] служба не запущена — всё работает напрямую, но без лент в реальном времени и без кнопок, пока агент не ждёт")
+		problems = append(problems, "служба не запущена — scripts\\install-task.ps1 ставит её в автозапуск")
+	}
+	var chk service.Check
 	switch {
 	case *offline:
 		fmt.Printf("[?] сессия: %s (проверка пропущена, --offline)\n", s.SessionPath)
 	case s.APIID == exampleAPIID:
 		fmt.Println("[?] сессия: не проверяю, пока не заданы настоящие ключи")
 	default:
-		tctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		err := tgc.Run(tctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
-			me, err := c.Self(ctx)
-			if err != nil {
-				return err
-			}
-			c.Peers.Save()
-			u := me.Username
+		if err := service.Do(ctx, "check", nil, &chk); err != nil {
+			fmt.Printf("[?] сессия: не удалось проверить (%v)\n", err)
+			break
+		}
+		switch chk.Session {
+		case "ok":
+			u := chk.User.Username
 			if u == "" {
 				u = "—"
 			}
-			fmt.Printf("[v] авторизован: %s @%s (id %d)\n", me.FirstName, u, me.ID)
-			return nil
-		})
-		cancel()
-		var nl *tgc.NotLoggedIn
-		switch {
-		case err == nil:
-		case errors.As(err, &nl):
+			fmt.Printf("[v] авторизован: %s @%s (id %d)\n", chk.User.FirstName, u, chk.User.ID)
+		case "not_logged_in":
 			fmt.Println("[x] сессия:", s.SessionPath)
-			problems = append(problems, "аккаунт не подключён — выполни `tg login`")
+			problems = append(problems, "аккаунт не подключён — выполни `tg login` или войди в окне управления")
 		default:
-			fmt.Printf("[?] сессия: не удалось проверить (%v)\n", err)
+			fmt.Printf("[?] сессия: не удалось проверить (%s)\n", chk.SessionError)
+		}
+		if off := chk.ClockOffset; off > 2 || off < -2 {
+			fmt.Printf("[?] часы компьютера расходятся с Telegram на %.0f с (учтено)\n", -off)
 		}
 	}
 	fmt.Println("[v] политика отправки:", s.SendPolicy)
 	if s.SendPolicy == "bot_approval" {
-		if *offline {
+		switch {
+		case *offline:
 			fmt.Printf("[?] бот подтверждений: chat %d (не проверяю, --offline)\n", s.ApprovalChatID)
-		} else {
-			name, err := bot.Me(ctx, s)
-			if err != nil {
-				fmt.Println("[x] бот подтверждений:", err)
-				problems = append(problems, "бот недоступен — кнопки подтверждения работать не будут")
-			} else {
-				fmt.Printf("[v] бот подтверждений: @%s → chat %d\n", name, s.ApprovalChatID)
-			}
+		case chk.Bot != "":
+			fmt.Printf("[v] бот подтверждений: %s → chat %d\n", chk.Bot, s.ApprovalChatID)
+		case chk.BotError != "":
+			fmt.Println("[x] бот подтверждений:", chk.BotError)
+			problems = append(problems, "бот недоступен — кнопки подтверждения работать не будут")
 		}
-		if lock.Held(s.UpdatesLockPath()) {
-			fmt.Println("[v] слушатель кнопок работает (`tg approvals`)")
-		} else {
-			fmt.Println("[?] слушатель кнопок не запущен — нажатие сработает, только пока агент ждёт")
+		if up && status.Buttons {
+			fmt.Println("[v] кнопки бота слушает служба")
+		} else if !up {
+			fmt.Println("[?] кнопки бота никто не слушает — нажатие сработает, только пока агент ждёт")
 		}
 	}
 	fmt.Printf("[v] чатов в белом списке: %d (автоотправка через %d с)\n", len(s.Chats), s.AutoSendDelaySec)

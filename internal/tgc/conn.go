@@ -38,17 +38,14 @@ func (e *NotLoggedIn) Error() string { return e.Msg }
 type Opts struct {
 	// Wait — сколько ждать, пока сессию отпустит другой процесс (0 — 45 с).
 	Wait time.Duration
-	// Background — фоновая работа (опрос лент): уступает всем. Если сессия
-	// занята — сразу lock.Busy; если держим, а сессия понадобилась кому-то
-	// ещё в этом процессе (отправка после кнопки), фоновую работу отменяют.
-	Background bool
 	// NoAuth — не требовать авторизации (login/logout).
 	NoAuth bool
 	// Caller — кто держит сессию, для журнала долгих захватов.
 	Caller string
 }
 
-// Conn — открытое соединение на время одного запроса.
+// Conn — соединение с Telegram: на время одного запроса (прямой режим) или
+// общее постоянное соединение службы.
 type Conn struct {
 	Client   *telegram.Client
 	API      *tg.Client
@@ -58,45 +55,19 @@ type Conn struct {
 	hub *updateHub
 }
 
-var (
-	procMu   sync.Mutex
-	procSem  = make(chan struct{}, 1) // сессия одна на весь процесс
-	bgCancel context.CancelFunc       // отмена текущей фоновой работы
-)
+// procSem — сессия одна на весь процесс (прямой режим).
+var procSem = make(chan struct{}, 1)
 
-func acquireProc(ctx context.Context, o Opts, wait time.Duration) (context.Context, func(), error) {
-	if o.Background {
-		select {
-		case procSem <- struct{}{}:
-		default:
-			return nil, nil, &lock.Busy{Msg: "Сессия Telegram занята — фоновая задача подождёт."}
-		}
-		bctx, cancel := context.WithCancel(ctx)
-		procMu.Lock()
-		bgCancel = cancel
-		procMu.Unlock()
-		return bctx, func() {
-			procMu.Lock()
-			bgCancel = nil
-			procMu.Unlock()
-			cancel()
-			<-procSem
-		}, nil
-	}
-	procMu.Lock()
-	if bgCancel != nil {
-		bgCancel() // опрос лент повторится на следующем круге, отправка — нет
-	}
-	procMu.Unlock()
+func acquireProc(ctx context.Context, wait time.Duration) (func(), error) {
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case procSem <- struct{}{}:
-		return ctx, func() { <-procSem }, nil
+		return func() { <-procSem }, nil
 	case <-timer.C:
-		return nil, nil, &lock.Busy{Msg: "Сессия Telegram занята другой задачей этого процесса."}
+		return nil, &lock.Busy{Msg: "Сессия Telegram занята другой задачей этого процесса."}
 	case <-ctx.Done():
-		return nil, nil, ctx.Err()
+		return nil, ctx.Err()
 	}
 }
 
@@ -114,23 +85,29 @@ func callerName(o Opts) string {
 	return "?"
 }
 
-// Run — подключиться, выполнить fn и сразу отпустить сессию.
+// Run — выполнить fn с соединением. В службе — общим постоянным; в остальных
+// процессах (служба не запущена) — подключиться под локом сессии и сразу
+// отпустить её.
 func Run(ctx context.Context, s *config.Settings, o Opts, fn func(ctx context.Context, c *Conn) error) error {
+	if InService() {
+		return runShared(ctx, o, fn)
+	}
+	if serviceUp(ctx) {
+		// сессию держит служба: прямое подключение прождало бы лок и упало
+		return ServiceOwned{}
+	}
 	wait := o.Wait
 	if wait == 0 {
 		wait = 45 * time.Second
 	}
 	caller := callerName(o)
-	ctx, release, err := acquireProc(ctx, o, wait)
+	release, err := acquireProc(ctx, wait)
 	if err != nil {
 		return err
 	}
 	defer release()
 
 	flock := lock.New(s.SessionPath, wait)
-	if o.Background {
-		flock.Timeout = 500 * time.Millisecond
-	}
 	if err := flock.Acquire(ctx); err != nil {
 		return err
 	}
@@ -177,7 +154,7 @@ func (c *Conn) start(ctx context.Context, client *telegram.Client, s *config.Set
 	return fn(ctx, c)
 }
 
-func newClient(s *config.Settings, hub *updateHub) (*telegram.Client, error) {
+func newClient(s *config.Settings, hub telegram.UpdateHandler) (*telegram.Client, error) {
 	opts := telegram.Options{
 		SessionStorage: &session.FileStorage{Path: s.SessionPath},
 		Device: telegram.DeviceConfig{
@@ -216,12 +193,12 @@ func NewLoginClient(s *config.Settings) (*telegram.Client, error) {
 
 // updateHub раздаёт апдейты тем, кто их ждёт (расшифровка голосовых).
 type updateHub struct {
-	mu          sync.Mutex
-	transcribed map[int]chan *tg.UpdateTranscribedAudio
+	mu      sync.Mutex
+	waiting map[int]chan *tg.UpdateTranscribedAudio
 }
 
 func newUpdateHub() *updateHub {
-	return &updateHub{transcribed: map[int]chan *tg.UpdateTranscribedAudio{}}
+	return &updateHub{waiting: map[int]chan *tg.UpdateTranscribedAudio{}}
 }
 
 func (h *updateHub) Handle(_ context.Context, u tg.UpdatesClass) error {
@@ -236,28 +213,33 @@ func (h *updateHub) Handle(_ context.Context, u tg.UpdatesClass) error {
 	}
 	for _, up := range list {
 		if t, ok := up.(*tg.UpdateTranscribedAudio); ok {
-			h.mu.Lock()
-			ch := h.transcribed[t.MsgID]
-			h.mu.Unlock()
-			if ch != nil {
-				select {
-				case ch <- t:
-				default:
-				}
-			}
+			h.transcribed(t)
 		}
 	}
 	return nil
 }
 
+// transcribed — доставить кусок расшифровки тому, кто её ждёт.
+func (h *updateHub) transcribed(t *tg.UpdateTranscribedAudio) {
+	h.mu.Lock()
+	ch := h.waiting[t.MsgID]
+	h.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- t:
+		default:
+		}
+	}
+}
+
 func (h *updateHub) watchTranscribed(msgID int) (<-chan *tg.UpdateTranscribedAudio, func()) {
 	ch := make(chan *tg.UpdateTranscribedAudio, 16)
 	h.mu.Lock()
-	h.transcribed[msgID] = ch
+	h.waiting[msgID] = ch
 	h.mu.Unlock()
 	return ch, func() {
 		h.mu.Lock()
-		delete(h.transcribed, msgID)
+		delete(h.waiting, msgID)
 		h.mu.Unlock()
 	}
 }

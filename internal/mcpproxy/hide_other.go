@@ -1,6 +1,6 @@
 //go:build !windows
 
-package mcpserver
+package mcpproxy
 
 import "os/exec"
 

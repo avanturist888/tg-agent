@@ -1,4 +1,4 @@
-// tg — tg-agent на Go: MCP-сервер, слушатель кнопок, CLI и окно управления.
+// tg — tg-agent: служба, MCP-прослойка агентов, CLI и окно управления.
 package main
 
 import (

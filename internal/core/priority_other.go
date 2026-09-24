@@ -2,4 +2,4 @@
 
 package core
 
-func raisePriority() {}
+func RaisePriority() {}

@@ -133,7 +133,6 @@ type Settings struct {
 	MaxFileMB          int
 	MaxDownloadMB      int
 	Reactions          bool
-	FeedInterval       float64
 	AutoSendDelaySec   int
 	Chats              map[string]ChatRule
 	ChatOrder          []string // порядок из chats.toml
@@ -383,12 +382,6 @@ func load(requireCredentials bool) (*Settings, error) {
 	if err != nil {
 		return nil, err
 	}
-	feed := 10.0
-	if v := strings.TrimSpace(os.Getenv("TG_FEED_INTERVAL")); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			feed = f
-		}
-	}
 	chats, order, err := LoadChats(filepath.Join(Root, "config", "chats.toml"))
 	if err != nil {
 		return nil, err
@@ -410,7 +403,6 @@ func load(requireCredentials bool) (*Settings, error) {
 		MaxFileMB:          envInt("TG_MAX_FILE_MB", 200),
 		MaxDownloadMB:      envInt("TG_MAX_DOWNLOAD_MB", 1024),
 		Reactions:          strings.ToLower(strings.TrimSpace(os.Getenv("TG_REACTIONS"))) != "off",
-		FeedInterval:       feed,
 		AutoSendDelaySec:   envInt("TG_AUTO_SEND_DELAY_SEC", 30),
 		Chats:              chats,
 		ChatOrder:          order,
@@ -440,7 +432,7 @@ var startupEnv = func() map[string]bool {
 }()
 
 // applyDotenv перечитывает .env на каждом вызове: долгоживущие процессы
-// (MCP-сервер, слушатель) подхватывают правки без перезапуска.
+// (служба, окно управления) подхватывают правки без перезапуска.
 func applyDotenv(path string) {
 	values, err := godotenv.Read(path)
 	if err != nil {
@@ -468,3 +460,6 @@ var (
 	dotenvMu   sync.Mutex
 	dotenvKeys = map[string]bool{}
 )
+
+// Build — метка сборки (scripts\build.ps1 подставляет коммит и время).
+var Build = "dev"

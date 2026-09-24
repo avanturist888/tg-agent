@@ -17,6 +17,7 @@ import (
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
+	"tgagent/internal/svc"
 )
 
 // Подтверждение отправки кнопкой в боте.
@@ -278,11 +279,11 @@ func SendDue(ctx context.Context, s *config.Settings) {
 	}
 }
 
-// ScheduleLocal — если слушателя нет, автоотправку дошлёт отдельный процесс
+// ScheduleLocal — если службы нет, автоотправку дошлёт отдельный процесс
 // `tgw send-due`: процесс вызова инструмента живёт только до ответа агенту.
 // Слушатель, если есть, отправит сам — захват под локом не даст отправить дважды.
 func ScheduleLocal(s *config.Settings, d *outbox.Draft) {
-	if d.SendAt == nil || lock.Held(s.UpdatesLockPath()) {
+	if d.SendAt == nil || svc.Up(context.Background()) || lock.Held(s.UpdatesLockPath()) {
 		return
 	}
 	if err := spawnSendDue(); err != nil {
@@ -294,6 +295,9 @@ func ScheduleLocal(s *config.Settings, d *outbox.Draft) {
 // запланированное не кончится.
 func SendDueLoop(ctx context.Context, loader func() (*config.Settings, error)) error {
 	for ctx.Err() == nil {
+		if svc.Up(ctx) {
+			return nil // служба запущена — дошлёт сама
+		}
 		s, err := loader()
 		if err != nil {
 			return err
@@ -346,7 +350,7 @@ func Pump(ctx context.Context, s *config.Settings, until time.Time, stop func() 
 			writeOffset(s, offset)
 			if u.CallbackQuery != nil {
 				func() {
-					// одно нажатие не должно ронять слушателя
+					// одно нажатие не должно ронять службу
 					defer func() {
 						if r := recover(); r != nil {
 							_ = audit.Log(s.AuditPath(), "callback_failed", "error", fmt.Sprint(r))
@@ -381,7 +385,7 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 	}
 	updates := lock.New(s.UpdatesLockPath(), 500*time.Millisecond)
 	if s.BotReady() && updates.Acquire(ctx) == nil {
-		// слушателя нет — качаем апдейты сами, пока ждём
+		// службы нет — качаем апдейты бота сами, пока ждём
 		Pump(ctx, s, deadline, resolved)
 		updates.Release()
 	} else {
@@ -436,7 +440,7 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 }
 
 // RecoverInterrupted досылает то, что одобрили кнопкой (или автоотправкой),
-// но прошлый слушатель не успел отправить — его убили между нажатием и
+// но прошлая служба не успела отправить — её убили между нажатием и
 // отправкой. В режимах без бота статус approved законно ждёт агента или CLI.
 func RecoverInterrupted(ctx context.Context, s *config.Settings) {
 	drafts, err := outbox.New(s.OutboxPath()).List(outbox.Approved)
@@ -453,15 +457,14 @@ func RecoverInterrupted(ctx context.Context, s *config.Settings) {
 			continue // уже сорвалось и об этом знают — не долбим повторно
 		}
 		_ = audit.Log(s.AuditPath(), "recover_interrupted", "draft_id", d.ID, "chat", d.Chat)
-		summary := deliver(ctx, s, d.ID, by+" (дослано после перезапуска слушателя)")
+		summary := deliver(ctx, s, d.ID, by+" (дослано после перезапуска службы)")
 		card(ctx, s, d.BotMessageID, d, summary)
 	}
 }
 
-// RunDaemon — постоянный слушатель кнопок: нажатие срабатывает, даже если агент ушёл.
-func RunDaemon(ctx context.Context, s *config.Settings, loader func() (*config.Settings, error)) error {
-	fmt.Printf("Слушаю кнопки бота, чат %d. Ctrl+C — выход.\n", s.ApprovalChatID)
-	raisePriority()
+// RunButtons — постоянный слушатель кнопок бота (часть службы): нажатие
+// срабатывает, даже если агент ушёл; заодно досылает автоотправку в срок.
+func RunButtons(ctx context.Context, s *config.Settings, loader func() (*config.Settings, error)) error {
 	// Лок может держать ожидающий агент (пока демона не было, кнопки разбирал
 	// он). Выходить нельзя — тогда после ухода агента не останется никого.
 	updates := lock.New(s.UpdatesLockPath(), 500*time.Millisecond)
@@ -480,11 +483,6 @@ func RunDaemon(ctx context.Context, s *config.Settings, loader func() (*config.S
 	}
 	defer updates.Release()
 
-	pollerCtx, stopPoller := context.WithCancel(ctx)
-	defer stopPoller()
-	go RunPoller(pollerCtx, loader, time.Duration(s.FeedInterval*float64(time.Second)))
-
-	_ = audit.Log(s.AuditPath(), "daemon_start")
 	RecoverInterrupted(ctx, s)
 	for ctx.Err() == nil {
 		updates.Touch() // иначе лок сочтут протухшим и перехватят

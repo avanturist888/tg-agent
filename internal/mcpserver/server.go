@@ -58,7 +58,7 @@ func ErrorKind(err error) string {
 		return "not_found"
 	case errors.As(err, &bad), errors.As(err, &tgBad), errors.As(err, &attBad), errors.As(err, &badState):
 		return "bad_request"
-	case errors.As(err, &busy):
+	case errors.As(err, &busy), errors.As(err, new(tgc.ServiceOwned)):
 		return "SessionBusy"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "TimeoutError"
@@ -180,8 +180,8 @@ tg_cancel_draft, потом оно отправляется само.
 with_status=true дополнительно тянет число непрочитанных и превью
 последнего сообщения (медленнее, один запрос к Telegram).
 
-У читаемых чатов есть feed: path — локальный файл, куда демон раз в
-~10 с дописывает id новых сообщений (по одному на строку), last_id —
+У читаемых чатов есть feed: path — локальный файл, куда служба сразу по
+приходу дописывает id новых сообщений (по одному на строку), last_id —
 последний из них. Так следят за чатом без опроса Telegram: сравни
 last_id со своим последним обработанным id и, если он больше, забери
 новое через tg_read_chat(after_id=<твой последний id>). Подписка с

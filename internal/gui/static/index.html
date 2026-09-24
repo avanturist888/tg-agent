@@ -456,7 +456,10 @@ async function loadState() {
       <div>Папка установки</div><div class="mono">${esc(s.root)}</div>
       <div>Программа</div><div class="mono">${esc(s.exe)}</div>
       <div>Режим отправки</div><div>${esc(s.send_policy)}</div>
-      <div>Слушатель кнопок</div><div><span class="dot ${s.listener ? "on" : "off"}"></span>${s.listener ? "работает" : "не запущен — кнопки сработают, только пока агент ждёт"}</div>
+      <div>Служба</div><div><span class="dot ${s.service ? "on" : "off"}"></span>${s.service
+        ? `работает с ${fmtTime(s.service_started)}, сборка ${esc(s.service_build)} · ${s.service_connected ? (s.service_authorized ? "подключена к Telegram" : "ждёт входа") : "подключается к Telegram…"}`
+        : "не запущена — всё работает напрямую, но без лент в реальном времени и без кнопок, пока агент не ждёт"}</div>
+      <div>Кнопки бота</div><div><span class="dot ${s.listener ? "on" : "off"}"></span>${s.listener ? "слушает служба" : "никто не слушает"}</div>
       <div>Бот подтверждений</div><div><span class="dot ${s.bot_ready ? "on" : "off"}"></span>${s.bot_ready ? "настроен" : "не настроен"}</div>
       <div>Файл сессии</div><div><span class="dot ${s.session_file ? "on" : "off"}"></span>${s.session_file ? "есть (проверь вход кнопкой ниже)" : "нет — нужен вход"}</div>
       <div>Чатов в белом списке</div><div>${s.chats}</div>
@@ -488,6 +491,7 @@ async function pollLogin() {
   const row = $("#login-answer-row"), input = $("#login-answer"), st = $("#login-status");
   if (s.stage === "need_code") { row.hidden = false; input.type = "text"; input.placeholder = "Код из Telegram"; st.textContent = "Код отправлен в приложение Telegram."; }
   else if (s.stage === "need_password") { row.hidden = false; input.type = "password"; input.placeholder = "Пароль двухфакторной защиты"; st.textContent = "Включена двухфакторная защита — нужен пароль."; }
+  else if (s.stage === "checking" || s.stage === "phone_sent") { row.hidden = true; st.textContent = "Проверяю…"; }
   else if (s.stage === "done") { row.hidden = true; st.textContent = "✅ Вход выполнен: " + s.user; clearInterval(loginTimer); loadState(); }
   else if (s.stage === "error") { row.hidden = true; st.textContent = "❌ " + s.error; clearInterval(loginTimer); }
 }
@@ -521,7 +525,7 @@ async function refreshPill() {
     const s = await api("GET", "/api/state");
     if (s.config_error) { $("#status-pill").textContent = "⚠️ ошибка конфигурации"; return; }
     autoDelay = s.auto_send_delay;
-    $("#status-pill").innerHTML = `<span class="dot ${s.listener ? "on" : "off"}"></span>слушатель ${s.listener ? "работает" : "не запущен"} · ${esc(s.send_policy)}`;
+    $("#status-pill").innerHTML = `<span class="dot ${s.service ? "on" : "off"}"></span>служба ${s.service ? "работает" : "не запущена"} · ${esc(s.send_policy)}`;
   } catch (e) { $("#status-pill").textContent = "нет связи"; }
 }
 refreshPill().then(loadChats);

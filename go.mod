@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/BurntSushi/toml v1.6.0
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/gotd/log v0.1.0
 	github.com/gotd/td v0.162.0
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808

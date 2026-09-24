@@ -26,14 +26,13 @@ import (
 	"time"
 
 	"tgagent/internal/audit"
-	"tgagent/internal/bot"
 	"tgagent/internal/chatsfile"
 	"tgagent/internal/config"
 	"tgagent/internal/core"
 	"tgagent/internal/envfile"
-	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
+	"tgagent/internal/service"
 	"tgagent/internal/tgc"
 )
 
@@ -140,12 +139,20 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, sessErr := os.Stat(st.SessionPath)
-	writeJSON(w, omap.New().
+	var status service.Status
+	up := service.Do(r.Context(), "status", nil, &status) == nil
+	out := omap.New().
 		Set("root", config.Root).
 		Set("exe", config.CLIHint()).
 		Set("send_policy", st.SendPolicy).
 		Set("session_file", sessErr == nil).
-		Set("listener", lock.Held(st.UpdatesLockPath())).
+		Set("service", up).
+		Set("listener", up && status.Buttons)
+	if up {
+		out.Set("service_build", status.Build).Set("service_started", status.Started).
+			Set("service_connected", status.Connected).Set("service_authorized", status.Authorized)
+	}
+	writeJSON(w, out.
 		Set("bot_ready", st.BotReady()).
 		Set("auto_send_delay", st.AutoSendDelaySec).
 		Set("chats", len(st.Chats)))
@@ -158,35 +165,28 @@ func (s *Server) check(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	_ = st
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
-	out := omap.New()
-	err = tgc.Run(ctx, st, tgc.Opts{Wait: 20 * time.Second}, func(ctx context.Context, c *tgc.Conn) error {
-		me, err := c.Self(ctx)
-		if err != nil {
-			return err
-		}
-		c.Peers.Save()
-		out.Set("user", omap.New().Set("id", me.ID).Set("name", strings.TrimSpace(me.FirstName+" "+me.LastName)).Set("username", me.Username))
-		return nil
-	})
-	var nl *tgc.NotLoggedIn
-	switch {
-	case err == nil:
-		out.Set("session", "ok")
-	case errors.As(err, &nl):
-		out.Set("session", "not_logged_in")
-	default:
-		out.Set("session", "error").Set("session_error", err.Error())
+	var chk service.Check
+	if err := service.Do(ctx, "check", nil, &chk); err != nil {
+		writeErr(w, err)
+		return
 	}
-	if st.BotReady() {
-		if name, err := bot.Me(ctx, st); err == nil {
-			out.Set("bot", "@"+name)
-		} else {
-			out.Set("bot_error", err.Error())
-		}
+	out := omap.New().Set("session", chk.Session).Set("clock_offset_sec", chk.ClockOffset)
+	if chk.User != nil {
+		out.Set("user", omap.New().Set("id", chk.User.ID).
+			Set("name", strings.TrimSpace(chk.User.FirstName+" "+chk.User.LastName)).Set("username", chk.User.Username))
 	}
-	out.Set("clock_offset_sec", tgc.ClockOffset(st).Seconds())
+	if chk.SessionError != "" {
+		out.Set("session_error", chk.SessionError)
+	}
+	if chk.Bot != "" {
+		out.Set("bot", chk.Bot)
+	}
+	if chk.BotError != "" {
+		out.Set("bot_error", chk.BotError)
+	}
 	writeJSON(w, out)
 }
 
@@ -308,12 +308,7 @@ func (s *Server) dialogs(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
 	var rows []tgc.DialogRow
-	err = tgc.Run(ctx, st, tgc.Opts{Wait: 30 * time.Second}, func(ctx context.Context, c *tgc.Conn) error {
-		var err error
-		rows, err = c.ListDialogs(ctx, limit)
-		return err
-	})
-	if err != nil {
+	if err := service.Do(ctx, "dialogs", service.LimitArgs{Limit: limit}, &rows); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -364,19 +359,16 @@ func (s *Server) drafts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
-	st, err := config.Load()
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	summary, err := core.ApproveAndSend(ctx, st, r.PathValue("id"), "gui")
-	if err != nil {
+	var out struct {
+		Summary string `json:"summary"`
+	}
+	if err := service.Do(ctx, "approve_send", service.DraftArgs{ID: r.PathValue("id"), By: "gui"}, &out); err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, omap.New().Set("summary", summary))
+	writeJSON(w, omap.New().Set("summary", out.Summary))
 }
 
 func (s *Server) reject(w http.ResponseWriter, r *http.Request) {
@@ -434,7 +426,6 @@ var editable = []setting{
 	{"TG_AUTO_SEND_DELAY_SEC", "Окно отмены автоотправки, с", "int", "30", nil, "Сколько секунд у агента есть, чтобы отозвать сообщение в чате с автоотправкой"},
 	{"TG_DRAFT_TTL_MIN", "Жизнь черновика, мин", "int", "60", nil, "Неподтверждённый черновик протухает через это время"},
 	{"TG_APPROVAL_TIMEOUT_SEC", "Ожидание кнопки агентом, с", "int", "600", nil, "Потолок tg_wait_approval — агент не висит дольше"},
-	{"TG_FEED_INTERVAL", "Опрос лент, с", "int", "10", nil, "Как часто слушатель проверяет новые сообщения для data/feeds"},
 	{"TG_REACTIONS", "Реакции агентов", "choice", "direct", []string{"direct", "off"}, "direct — ставят сразу (только в чатах с отправкой), off — запрещены"},
 	{"TG_MAX_LIMIT", "Сообщений за запрос", "int", "200", nil, "Потолок tg_read_chat"},
 	{"TG_TRANSCRIBE_PER_CALL", "Расшифровок за чтение", "int", "10", nil, "Сколько голосовых расшифровывать за один tg_read_chat"},
@@ -550,10 +541,22 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 // loginFlow — вход по шагам: окно спрашивает код и пароль по мере надобности.
 type loginFlow struct {
 	mu      sync.Mutex
-	stage   string // phone_sent → need_code → need_password → done / error
+	stage   string // phone_sent → need_code → need_password → checking → done / error
 	err     string
 	user    string
 	answers chan string
+	service bool // вход идёт через службу (она держит сессию)
+}
+
+// step — применить шаг входа от службы.
+func (l *loginFlow) step(st tgc.LoginStep, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err != nil {
+		l.stage, l.err = "error", err.Error()
+		return
+	}
+	l.stage, l.user = st.Stage, st.User
 }
 
 func (l *loginFlow) set(stage string) {
@@ -616,6 +619,18 @@ func (s *Server) loginStart(w http.ResponseWriter, r *http.Request) {
 	}
 	l := &loginFlow{stage: "phone_sent", answers: make(chan string)}
 	s.login = l
+	if service.Up(r.Context()) {
+		l.service = true
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			var step tgc.LoginStep
+			err := service.Do(ctx, "login_begin", service.ValueArgs{Value: phone}, &step)
+			l.step(step, err)
+		}()
+		writeJSON(w, omap.New().Set("ok", true))
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 		defer cancel()
@@ -656,6 +671,20 @@ func (s *Server) loginAnswer(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.login == nil {
 		writeErr(w, errors.New("вход не начат"))
+		return
+	}
+	if l := s.login; l.service {
+		l.mu.Lock()
+		l.stage = "checking"
+		l.mu.Unlock()
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			var step tgc.LoginStep
+			err := service.Do(ctx, "login_answer", service.ValueArgs{Value: strings.TrimSpace(in.Value)}, &step)
+			l.step(step, err)
+		}()
+		writeJSON(w, omap.New().Set("ok", true))
 		return
 	}
 	select {

@@ -141,6 +141,32 @@ func (c *PeerCache) Remember(users []tg.UserClass, chats []tg.ChatClass) {
 	}
 }
 
+// RememberEntities — то же для сущностей из апдейта.
+func (c *PeerCache) RememberEntities(e tg.Entities) {
+	users := make([]tg.UserClass, 0, len(e.Users))
+	for _, u := range e.Users {
+		users = append(users, u)
+	}
+	chats := make([]tg.ChatClass, 0, len(e.Channels))
+	for _, ch := range e.Channels {
+		chats = append(chats, ch)
+	}
+	c.Remember(users, chats)
+}
+
+// MarkedByUsername — id чата по @username из кэша (0 — не знаем).
+func (c *PeerCache) MarkedByUsername(name string) int64 {
+	kind, idStr, ok := strings.Cut(c.byUsername(strings.TrimPrefix(name, "@")), ":")
+	if !ok {
+		return 0
+	}
+	id, _ := strconv.ParseInt(idStr, 10, 64)
+	if kind == "channel" {
+		return -(channelShift + id)
+	}
+	return id
+}
+
 func (c *PeerCache) user(id int64) (int64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

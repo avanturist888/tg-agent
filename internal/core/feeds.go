@@ -2,29 +2,28 @@ package core
 
 // Ленты новых сообщений: data/feeds/<alias>.ids — по id на строку.
 //
-// Пишет только слушатель (демон): раз в несколько секунд одним запросом
-// смотрит верхние сообщения всех разрешённых чатов и дописывает новые id.
-// Агенты файл только читают — это не стоит ни сессии, ни сети, ни лока.
+// Пишет служба: Telegram сам присылает ей новые сообщения (FeedOnMessage), а
+// раз в минуту она сверяет верхние сообщения чатов (PollOnce) — на случай
+// пропусков и собственных отправок. Агенты файл только читают — это не стоит
+// ни сессии, ни сети, ни лока.
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/gotd/td/tg"
 
 	"tgagent/internal/audit"
 	"tgagent/internal/config"
-	"tgagent/internal/lock"
 	"tgagent/internal/tgc"
 )
-
-// PollLimit — секунд на один проход; дольше — бросаем и ждём следующего.
-const PollLimit = 30 * time.Second
 
 func FeedPath(s *config.Settings, alias string) string {
 	return filepath.Join(s.FeedsDir(), alias+".ids")
@@ -72,8 +71,9 @@ func appendIDs(path string, ids []int) error {
 	return err
 }
 
-// PollOnce — один проход: дописать новые id во все ленты. Возвращает, сколько добавлено.
-func PollOnce(ctx context.Context, s *config.Settings, background bool) (map[string]int, error) {
+// PollOnce — сверка: дописать во все ленты то, что пришло после последнего
+// id. Возвращает, сколько добавлено.
+func PollOnce(ctx context.Context, s *config.Settings) (map[string]int, error) {
 	added := map[string]int{}
 	var rules []config.ChatRule
 	for _, r := range s.Rules() {
@@ -84,8 +84,7 @@ func PollOnce(ctx context.Context, s *config.Settings, background bool) (map[str
 	if len(rules) == 0 {
 		return added, nil
 	}
-	// короткое ожидание: сессия занята — пропускаем проход, а не стоим
-	err := tgc.Run(ctx, s, tgc.Opts{Wait: 500 * time.Millisecond, Background: background, Caller: "poll_once"},
+	err := tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "poll_once"},
 		func(ctx context.Context, c *tgc.Conn) error {
 			targets := map[string]tgc.Target{}
 			for _, r := range rules {
@@ -104,7 +103,7 @@ func PollOnce(ctx context.Context, s *config.Settings, background bool) (map[str
 				known := LastID(path)
 				if known == 0 {
 					// новая лента начинается с текущего момента — историю не льём
-					if err := appendIDs(path, []int{topID}); err != nil {
+					if _, err := appendNewer(path, []int{topID}); err != nil {
 						return err
 					}
 					continue
@@ -122,11 +121,12 @@ func PollOnce(ctx context.Context, s *config.Settings, background bool) (map[str
 						ids = append(ids, id)
 					}
 				}
-				if len(ids) > 0 {
-					if err := appendIDs(path, ids); err != nil {
-						return err
-					}
-					added[alias] = len(ids)
+				n, err := appendNewer(path, ids)
+				if err != nil {
+					return err
+				}
+				if n > 0 {
+					added[alias] = n
 				}
 			}
 			return nil
@@ -134,33 +134,63 @@ func PollOnce(ctx context.Context, s *config.Settings, background bool) (map[str
 	return added, err
 }
 
-// RunPoller — фоновый цикл внутри демона. Сбой одного прохода не роняет демона;
-// сессию проход отдаёт отправке по первому требованию.
-func RunPoller(ctx context.Context, loader func() (*config.Settings, error), interval time.Duration) {
-	if interval <= 0 {
-		interval = 10 * time.Second
+// feedMu — ленты дописывают и события, и сверка: по очереди.
+var feedMu sync.Mutex
+
+// appendNewer дописывает id, если он новее последнего в ленте. Новая лента
+// начинается с текущего сообщения — историю не льём.
+func appendNewer(path string, ids []int) (int, error) {
+	feedMu.Lock()
+	defer feedMu.Unlock()
+	last := LastID(path)
+	var fresh []int
+	for _, id := range ids {
+		if id > last {
+			fresh = append(fresh, id)
+			last = id
+		}
 	}
-	for ctx.Err() == nil {
-		s, err := loader() // белый список мог поменяться
-		if err == nil {
-			pctx, cancel := context.WithTimeout(ctx, PollLimit)
-			_, err = PollOnce(pctx, s, true)
-			timedOut := errors.Is(pctx.Err(), context.DeadlineExceeded)
-			cancel()
-			switch {
-			case err == nil, lock.IsBusy(err):
-				// сессию держит отправка или чтение — зайдём на следующем круге
-			case timedOut:
-				_ = audit.Log(s.AuditPath(), "feed_poll_timeout", "seconds", int(PollLimit.Seconds()))
-			case ctx.Err() != nil:
-				return
-			case errors.Is(err, context.Canceled):
-				// уступили сессию отправке
-			default:
-				_ = audit.Log(s.AuditPath(), "feed_poll_failed", "error", fmt.Sprintf("%v", err))
+	if len(fresh) == 0 {
+		return 0, nil
+	}
+	return len(fresh), appendIDs(path, fresh)
+}
+
+// ruleMarkedID — id чата из белого списка в формате Bot API (0 — пока неизвестен).
+func ruleMarkedID(rule config.ChatRule, c *tgc.Conn) int64 {
+	switch p := rule.Peer.(type) {
+	case int64:
+		return p
+	case string:
+		v := strings.TrimSpace(p)
+		if strings.EqualFold(v, "me") || strings.EqualFold(v, "self") {
+			return c.Peers.SelfID()
+		}
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+		return c.Peers.MarkedByUsername(v)
+	}
+	return 0
+}
+
+// FeedOnMessage — обработчик новых сообщений для службы: дописать id в ленту
+// разрешённого чата сразу, как Telegram прислал сообщение.
+func FeedOnMessage(loader func() (*config.Settings, error)) tgc.OnMessage {
+	return func(ctx context.Context, c *tgc.Conn, peer tg.PeerClass, msgID int) {
+		s, err := loader()
+		if err != nil {
+			return
+		}
+		marked := tgc.MarkedPeerID(peer)
+		for _, rule := range s.Rules() {
+			if !rule.Read || ruleMarkedID(rule, c) != marked {
+				continue
+			}
+			if _, err := appendNewer(FeedPath(s, rule.Alias), []int{msgID}); err != nil {
+				_ = audit.Log(s.AuditPath(), "feed_write_failed", "chat", rule.Alias, "error", err.Error())
 			}
 		}
-		sleepCtx(ctx, interval)
 	}
 }
 
@@ -211,5 +241,3 @@ func Watch(ctx context.Context, s *config.Settings, aliases []string, out io.Wri
 	}
 	return nil
 }
-
-var _ = audit.Now

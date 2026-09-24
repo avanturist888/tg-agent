@@ -1,6 +1,7 @@
 //go:build live
 
 // Живые проверки с настоящим Telegram — только на чате saved (Избранное).
+// Нужна запущенная служба: сессию держит она.
 // Запуск: go test -tags live -run Live -v ./internal/core
 package core
 
@@ -9,49 +10,56 @@ import (
 	"testing"
 	"time"
 
-	"tgagent/internal/bot"
 	"tgagent/internal/config"
 	"tgagent/internal/outbox"
+	"tgagent/internal/svc"
 )
 
-// «✅ Отправить сейчас» под карточкой автоотправки: уходит сразу, не ждёт окна.
-func TestLiveSendNow(t *testing.T) {
+// Черновик → «Отправить» (как из окна управления) → ушло через службу и
+// попало в ленту чата.
+func TestLiveApproveSendViaService(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if !svc.Up(ctx) {
+		t.Skip("служба не запущена")
+	}
 	s, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	rule, ok := s.Chats["saved"]
-	if !ok {
+	if _, ok := s.Chats["saved"]; !ok {
 		t.Skip("нет чата saved")
 	}
-	// автоотправку включаем только в памяти — chats.toml не трогаем
-	rule.Send, rule.Auto = true, true
-	s.Chats["saved"] = rule
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	out, err := DraftMessage(ctx, s, "saved", "Проверка кнопки **«Отправить сейчас»**: ушло сразу, без 30 секунд ожидания.",
-		nil, "проверка кнопки «Отправить сейчас»", "markdown", nil)
+	out, err := DraftMessage(ctx, s, "saved", "Проверка службы tg-agent: черновик одобрен из окна и **ушёл через службу**.",
+		nil, "живой тест службы", "markdown", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st, _ := out.Get("status"); st != "scheduled" {
-		t.Fatalf("статус %v", st)
-	}
 	id, _ := out.Get("draft_id")
-	q := &bot.CallbackQuery{ID: "live-test", Data: "d:" + id.(string) + ":ok"}
-	q.From.ID = s.ApprovalChatID
 	start := time.Now()
-	HandleCallback(ctx, s, q)
+	var res struct {
+		Summary string `json:"summary"`
+	}
+	if _, err := svc.Call(ctx, "approve_send", map[string]string{"id": id.(string), "by": "live-test"}, &res); err != nil {
+		t.Fatal(err)
+	}
 	d, err := outbox.New(s.OutboxPath()).Get(id.(string))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if d.Status != outbox.Sent || d.MessageID == nil {
-		t.Fatalf("не отправлено: %s %v", d.Status, d.SendError)
+		t.Fatalf("не отправлено: %s %v (%s)", d.Status, d.SendError, res.Summary)
 	}
-	if took := time.Since(start); took > 20*time.Second {
-		t.Fatalf("слишком долго: %v", took)
+	t.Logf("ушло за %v, message_id %d", time.Since(start).Round(time.Millisecond), *d.MessageID)
+
+	// лента: событие или сверка (раз в минуту) должны дописать id
+	feed := FeedPath(s, "saved")
+	deadline := time.Now().Add(75 * time.Second)
+	for LastID(feed) < int(*d.MessageID) {
+		if time.Now().After(deadline) {
+			t.Fatalf("id %d не попал в ленту за 75 с (последний %d)", *d.MessageID, LastID(feed))
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
-	t.Logf("ушло за %v, message_id %d, одобрил %s", time.Since(start).Round(time.Millisecond), *d.MessageID, d.ApprovedBy())
+	t.Logf("в ленте через %v после отправки", time.Since(start).Round(time.Second))
 }
