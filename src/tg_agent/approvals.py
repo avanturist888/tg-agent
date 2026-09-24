@@ -79,6 +79,15 @@ async def _deliver(settings: Settings, draft_id: str, by: str) -> str:
             if attempt < 3:
                 await asyncio.sleep(15)
     if not (result and result.get("sent")):
+        # сбой мог случиться уже после отправки (при записи статуса) —
+        # тогда сообщение ушло, и «Не отправлено» было бы враньём
+        try:
+            done = outbox.get(draft_id)
+        except Exception:  # noqa: BLE001
+            done = None
+        if done and done.status == SENT:
+            result = {"sent": True, "message_id": done.message_id}
+    if not (result and result.get("sent")):
         outbox.mark_send_error(draft_id, error or "неизвестная ошибка")
         return f"⚠️ **Не отправлено** — {bot.md_escape(error)}"
     when = datetime.now().strftime("%H:%M")
@@ -176,7 +185,10 @@ async def pump(settings: Settings, *, until: float, stop_when=None) -> None:
             offset = max(offset, int(update["update_id"]) + 1)
             _write_offset(settings, offset)
             if "callback_query" in update:
-                await handle_callback(settings, update["callback_query"])
+                try:
+                    await handle_callback(settings, update["callback_query"])
+                except Exception as exc:  # noqa: BLE001 — одно нажатие не должно ронять слушателя
+                    audit.log(settings.audit_path, "callback_failed", error=f"{type(exc).__name__}: {exc}")
 
 
 async def wait_for_decision(settings: Settings, draft_id: str, timeout_sec: int) -> dict:
@@ -261,9 +273,23 @@ async def recover_interrupted(settings: Settings) -> None:
         await _card(settings, draft.bot_message_id, draft, summary)
 
 
+def _normal_priority() -> None:
+    """Планировщик запускает задачи с пониженным приоритетом, и Windows
+    морозила слушателя на десятки секунд при почти пустом процессоре —
+    нажатие ждало, пока ему дадут поработать."""
+    import os
+
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x20)  # NORMAL_PRIORITY_CLASS
+
+
 async def run_daemon(settings: Settings) -> None:
     """Постоянный слушатель кнопок: нажатие срабатывает, даже если агент ушёл."""
     print(f"Слушаю кнопки бота, чат {settings.approval_chat_id}. Ctrl+C — выход.")
+    _normal_priority()
     # Лок может держать ожидающий агент (пока демона не было, кнопки разбирал
     # он). Выходить нельзя — тогда после ухода агента не останется никого.
     # Ждём, пока агент дождётся своего решения и отпустит лок.

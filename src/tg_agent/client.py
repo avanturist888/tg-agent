@@ -11,7 +11,7 @@ from telethon.tl import functions, types
 
 from .config import ROOT, ChatRule, Settings
 from . import richtext
-from .lock import FileLock
+from .lock import FileLock, SessionBusy
 
 
 class NotLoggedIn(RuntimeError):
@@ -19,29 +19,77 @@ class NotLoggedIn(RuntimeError):
 
 
 @asynccontextmanager
-async def open_client(settings: Settings, *, require_auth: bool = True, wait: float = 45.0):
+async def open_client(
+    settings: Settings, *, require_auth: bool = True, wait: float = 45.0, background: bool = False
+):
     """Подключиться на время запроса и сразу отпустить сессию.
 
     Долго держать соединение нельзя: параллельно живут MCP-серверы других
     проектов, а файл сессии один.
+
+    background — фоновая работа (опрос лент): уступает всем. Если сессия
+    занята — сразу SessionBusy; если держим, а сессия понадобилась кому-то
+    ещё в этом процессе (отправка после кнопки), фоновую задачу отменяют.
     """
     # wait — сколько ждать, пока сессию отпустит другой процесс tg-agent
-    import inspect
+    import sys
     import time as _time
 
     from . import audit
 
-    caller = next((f.function for f in inspect.stack()[2:6] if f.function not in ("__aenter__", "helper")), "?")
-    with FileLock(settings.session_path, timeout=wait):
+    # не inspect.stack(): он читает исходники всех кадров и на слушателе
+    # с пониженным приоритетом съедал секунды цикла событий на каждом опросе
+    frame, caller = sys._getframe(2), "?"
+    for _ in range(4):
+        if frame is None:
+            break
+        if frame.f_code.co_name not in ("__aenter__", "helper"):
+            caller = frame.f_code.co_name
+            break
+        frame = frame.f_back
+    plock = _process_lock()
+    key = id(asyncio.get_running_loop())
+    if background and plock.locked():
+        raise SessionBusy("Сессия Telegram занята — фоновая задача подождёт.")
+    if not background:
+        holder = _BACKGROUND.get(key)
+        if holder is not None and not holder.done():
+            holder.cancel()  # опрос лент повторится на следующем круге, отправка — нет
+    # Сначала очередь внутри процесса (задачи одного процесса ждут друг друга
+    # через await), потом файловый лок между процессами — тоже через await.
+    try:
+        await asyncio.wait_for(plock.acquire(), timeout=wait)
+    except asyncio.TimeoutError:
+        raise SessionBusy("Сессия Telegram занята другой задачей этого процесса.") from None
+    if background:
+        _BACKGROUND[key] = asyncio.current_task()
+    lock = FileLock(settings.session_path, timeout=wait)
+    try:
+        await lock.acquire_async()
         taken = _time.monotonic()
         try:
             async with _connected(settings, require_auth) as client:
                 yield client
         finally:
+            lock.__exit__(None, None, None)
             held = _time.monotonic() - taken
             if held > 30:
                 # долгие захваты мешают отправке — пусть будет видно, кто
                 audit.log(settings.audit_path, "long_session_hold", seconds=round(held), by=caller)
+    finally:
+        if background:
+            _BACKGROUND.pop(key, None)
+        plock.release()
+
+
+_LOCKS: dict[int, asyncio.Lock] = {}
+_BACKGROUND: dict[int, asyncio.Task] = {}
+
+
+def _process_lock() -> asyncio.Lock:
+    """Один asyncio.Lock на цикл событий: сессия одна на весь процесс."""
+    loop = asyncio.get_running_loop()
+    return _LOCKS.setdefault(id(loop), asyncio.Lock())
 
 
 @asynccontextmanager

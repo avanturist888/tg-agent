@@ -5,3 +5,4 @@ __pycache__/
 *.session
 *.session-journal
 config/chats.toml
+go/bin/

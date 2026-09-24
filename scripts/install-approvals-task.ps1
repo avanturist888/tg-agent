@@ -26,7 +26,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
-    -MultipleInstances IgnoreNew
+    -MultipleInstances IgnoreNew `
+    -Priority 5  # по умолчанию 7 (ниже обычного) — Windows морозила слушателя
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $settings -Description 'tg-agent: кнопки подтверждения отправки в Telegram' -Force | Out-Null

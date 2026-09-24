@@ -49,7 +49,7 @@ async def poll_once(settings: Settings) -> dict[str, int]:
         return {}
     added: dict[str, int] = {}
     # короткое ожидание: сессия занята — пропускаем проход, а не стоим
-    async with tg.open_client(settings, wait=0.5) as client:
+    async with tg.open_client(settings, wait=0.5, background=True) as client:
         entities = {r.alias: await tg.entity_for(client, r) for r in rules}
         peers = {
             alias: types.InputDialogPeer(peer=await client.get_input_entity(e))
@@ -86,14 +86,30 @@ async def poll_once(settings: Settings) -> dict[str, int]:
     return added
 
 
+POLL_LIMIT = 30  # секунд на один проход, дольше — бросаем и ждём следующего
+
+
 async def run_poller(settings_loader, interval: float) -> None:
     """Фоновый цикл внутри демона. Сбой одного прохода не роняет демона."""
     while True:
+        # отдельной задачей: её отменяют, когда сессия нужна отправке
+        # (см. background в open_client), а сам цикл при этом живёт
+        inner: asyncio.Task | None = None
         try:
             settings = settings_loader()  # белый список мог поменяться
-            await poll_once(settings)
+            inner = asyncio.create_task(poll_once(settings))
+            # на плохой сети подключение тянулось минутами и держало сессию
+            await asyncio.wait_for(inner, timeout=POLL_LIMIT)
         except SessionBusy:
             pass  # сессию держит отправка или чтение — зайдём на следующем круге
+        except asyncio.TimeoutError:
+            audit.log(settings_loader().audit_path, "feed_poll_timeout", seconds=POLL_LIMIT)
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                if inner is not None:
+                    inner.cancel()
+                raise  # останавливают сам цикл
+            # иначе отменили только проход — уступили сессию отправке
         except Exception as exc:  # noqa: BLE001
             try:
                 audit.log(settings_loader().audit_path, "feed_poll_failed", error=f"{type(exc).__name__}: {exc}")
