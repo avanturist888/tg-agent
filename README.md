@@ -202,7 +202,7 @@ tg approvals --once          разобрать накопившиеся наж�
 tg approve <id> [--send]     подтвердить отправку
 tg reject <id>               отменить черновик
 tg send <id>                 отправить подтверждённый черновик вручную
-tg watch <alias>…            подписка: «alias id» на каждое новое сообщение
+tg watch <alias> [--after N]  подписка: «alias id» на каждое новое сообщение
 tg feeds [--poll]            состояние лент новых сообщений
 tg doctor [--offline]        проверить конфигурацию
 tg mcp                       MCP-сервер (его запускает Claude Code)

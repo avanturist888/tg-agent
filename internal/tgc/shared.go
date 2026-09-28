@@ -8,11 +8,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
 	"tgagent/internal/audit"
 	"tgagent/internal/config"
@@ -37,6 +40,8 @@ type sharedState struct {
 	login      *loginState
 	cancel     context.CancelFunc // оборвать текущее соединение
 	reset      bool               // при переподключении начать с чистой сессии (после выхода)
+	keyKept    bool               // gotd пытался сменить ключ — переподключаемся со старым
+	warned     bool               // владельцу уже сказали, что входа нет
 }
 
 var shared *sharedState
@@ -54,6 +59,9 @@ func (sh *sharedState) set(c *Conn, authorized bool) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	sh.conn, sh.authorized = c, authorized
+	if authorized {
+		sh.keyKept, sh.warned = false, false
+	}
 	if c != nil {
 		select {
 		case <-sh.ready:
@@ -79,6 +87,12 @@ func (sh *sharedState) wait(ctx context.Context, timeout time.Duration) (*Conn, 
 	case <-ctx.Done():
 		return nil, false, ctx.Err()
 	case <-time.After(timeout):
+		sh.mu.Lock()
+		kept := sh.keyKept
+		sh.mu.Unlock()
+		if kept {
+			return nil, false, &lock.Busy{Msg: KeyRejected{}.Error()}
+		}
 		return nil, false, &lock.Busy{Msg: "Служба tg-agent сейчас не подключена к Telegram (сеть?) — повтори чуть позже."}
 	}
 	sh.mu.Lock()
@@ -97,7 +111,46 @@ func runShared(ctx context.Context, o Opts, fn func(ctx context.Context, c *Conn
 	if !o.NoAuth && !authorized {
 		return notLoggedIn()
 	}
-	return fn(ctx, c)
+	err = fn(ctx, c)
+	switch {
+	case authLost(err):
+		// ключ отозван (завершили сеанс, аккаунт заблокирован): переподключимся
+		// и будем ждать входа
+		shared.drop(c, false)
+		return notLoggedIn()
+	case notInited(err):
+		// соединение живёт без initConnection (gotd сменил ключ на лету) —
+		// каждый запрос будет падать, пока не переподключимся
+		shared.drop(c, true)
+		return &lock.Busy{Msg: "Служба tg-agent переподключается к Telegram — повтори чуть позже."}
+	}
+	return err
+}
+
+// drop — оборвать соединение c (если оно ещё текущее), чтобы служба
+// переподключилась с ключом из файла.
+func (sh *sharedState) drop(c *Conn, authorized bool) {
+	sh.mu.Lock()
+	cancel := sh.cancel
+	if sh.conn != c {
+		cancel = nil
+	}
+	sh.authorized = sh.authorized && authorized
+	sh.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// authLost — Telegram больше не принимает этот ключ как вход в аккаунт.
+func authLost(err error) bool {
+	e, ok := tgerr.As(err)
+	return ok && e.Code == 401 && e.Type != "SESSION_PASSWORD_NEEDED"
+}
+
+func notInited(err error) bool {
+	e, ok := tgerr.As(err)
+	return ok && e.IsOneOf("CONNECTION_NOT_INITED", "CONNECTION_LAYER_INVALID")
 }
 
 func notLoggedIn() error {
@@ -119,8 +172,9 @@ type OnMessage func(ctx context.Context, c *Conn, peer tg.PeerClass, msgID int)
 
 // Serve — держать постоянное соединение, пока не отменят ctx. Переподключается
 // сам. onMessage получает каждое новое сообщение; onReady вызывается после
-// каждого (пере)подключения с действующим входом — чтобы догнать пропущенное.
-func Serve(ctx context.Context, s *config.Settings, onMessage OnMessage, onReady func(ctx context.Context, c *Conn)) error {
+// каждого (пере)подключения с действующим входом — чтобы догнать пропущенное;
+// onNoLogin — один раз за раз, когда Telegram не принимает сессию (нужен вход).
+func Serve(ctx context.Context, s *config.Settings, onMessage OnMessage, onReady func(ctx context.Context, c *Conn), onNoLogin func(ctx context.Context)) error {
 	if shared == nil {
 		EnableService()
 	}
@@ -147,22 +201,33 @@ func Serve(ctx context.Context, s *config.Settings, onMessage OnMessage, onReady
 		if reset {
 			// после выхода ключ отозван — новая сессия с чистого листа
 			_ = os.Remove(s.SessionPath)
+			_ = os.Remove(s.SessionPath + ".keyloss")
 		}
 		started := time.Now()
 		octx, cancel := context.WithCancel(ctx)
 		shared.mu.Lock()
 		shared.cancel = cancel
 		shared.mu.Unlock()
-		err := serveOnce(octx, s, onMessage, onReady)
+		var kept atomic.Bool
+		storage := newGuardedStorage(s, false, func() {
+			kept.Store(true)
+			shared.mu.Lock()
+			shared.keyKept = true
+			shared.mu.Unlock()
+			cancel() // в памяти клиента уже новый ключ — начинаем с файла
+		})
+		err := serveOnce(octx, s, storage, onMessage, onReady, onNoLogin)
 		cancel()
 		shared.set(nil, false)
 		if ctx.Err() != nil {
 			return nil
 		}
-		if reset || errors.Is(err, context.Canceled) {
+		if !kept.Load() && (reset || errors.Is(err, context.Canceled)) {
 			continue // переподключение по нашей же просьбе
 		}
-		_ = audit.Log(s.AuditPath(), "service_disconnected", "error", fmt.Sprint(err))
+		if !kept.Load() {
+			_ = audit.Log(s.AuditPath(), "service_disconnected", "error", fmt.Sprint(err))
+		}
 		if time.Since(started) > 5*time.Minute {
 			backoff = 2 * time.Second // долго работало — сбой разовый
 		}
@@ -172,7 +237,8 @@ func Serve(ctx context.Context, s *config.Settings, onMessage OnMessage, onReady
 	return nil
 }
 
-func serveOnce(ctx context.Context, s *config.Settings, onMessage OnMessage, onReady func(ctx context.Context, c *Conn)) error {
+func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage, onMessage OnMessage,
+	onReady func(ctx context.Context, c *Conn), onNoLogin func(ctx context.Context)) error {
 	c := &Conn{Settings: s, hub: newUpdateHub(), Peers: LoadPeers(s.PeersPath())}
 	d := tg.NewUpdateDispatcher()
 	d.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
@@ -194,7 +260,7 @@ func serveOnce(ctx context.Context, s *config.Settings, onMessage OnMessage, onR
 		return nil
 	})
 	gaps := updates.New(updates.Config{Handler: d})
-	client, err := newClient(s, gaps)
+	client, err := newClient(s, gaps, storage)
 	if err != nil {
 		return err
 	}
@@ -208,6 +274,13 @@ func serveOnce(ctx context.Context, s *config.Settings, onMessage OnMessage, onR
 		shared.set(c, st.Authorized)
 		_ = audit.Log(s.AuditPath(), "service_connected", "authorized", st.Authorized)
 		if !st.Authorized {
+			shared.mu.Lock()
+			warn := !shared.warned
+			shared.warned = true
+			shared.mu.Unlock()
+			if warn && onNoLogin != nil {
+				go onNoLogin(ctx)
+			}
 			// ждём входа через службу (окно управления или tg login)
 			select {
 			case <-ctx.Done():
@@ -315,6 +388,7 @@ func ServiceLoginAnswer(ctx context.Context, value string) (LoginStep, error) {
 	shared.mu.Lock()
 	shared.login = nil
 	shared.authorized = true
+	shared.keyKept, shared.warned = false, false
 	shared.mu.Unlock()
 	select {
 	case shared.loggedIn <- struct{}{}:
@@ -347,6 +421,7 @@ func ServiceLogout(ctx context.Context) error {
 	shared.mu.Lock()
 	shared.authorized = false
 	shared.reset = true
+	shared.warned = true // вышли сами — предупреждать не о чем
 	cancel := shared.cancel
 	shared.mu.Unlock()
 	// соединение с отозванным ключом бесполезно — переподключимся с чистого листа

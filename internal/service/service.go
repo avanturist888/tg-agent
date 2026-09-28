@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"tgagent/internal/audit"
+	"tgagent/internal/bot"
 	"tgagent/internal/config"
 	"tgagent/internal/core"
 	"tgagent/internal/mcpserver"
@@ -47,6 +48,8 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 		defer func() { done <- struct{}{} }()
 		if err := tgc.Serve(ctx, s, core.FeedOnMessage(loader), func(ctx context.Context, _ *tgc.Conn) {
 			reconcile(ctx, loader) // догнать пропущенное, пока нас не было
+		}, func(ctx context.Context) {
+			noLogin(ctx, loader)
 		}); err != nil {
 			_ = audit.Log(s.AuditPath(), "service_failed", "error", err.Error())
 			cancel()
@@ -87,6 +90,29 @@ func reconcile(ctx context.Context, loader func() (*config.Settings, error)) {
 		if !errors.As(err, &nl) {
 			_ = audit.Log(s.AuditPath(), "feed_reconcile_failed", "error", err.Error())
 		}
+	}
+}
+
+// noLogin — Telegram не принимает сессию: агенты остались без доступа, а
+// узнать об этом владелец иначе мог только от них.
+func noLogin(ctx context.Context, loader func() (*config.Settings, error)) {
+	s, err := loader()
+	if err != nil {
+		return
+	}
+	_ = audit.Log(s.AuditPath(), "service_not_logged_in")
+	if !s.BotReady() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	err = bot.Call(ctx, s, "sendMessage", map[string]any{
+		"chat_id": s.ApprovalChatID,
+		"text": "⚠️ tg-agent: Telegram не принимает сессию — у агентов нет доступа к чатам.\n" +
+			"Войди заново: ярлык tg-agent → вкладка «Состояние» (или `tg login`).",
+	}, nil)
+	if err != nil {
+		_ = audit.Log(s.AuditPath(), "notify_failed", "error", err.Error())
 	}
 }
 

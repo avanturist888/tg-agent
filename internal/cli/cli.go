@@ -614,7 +614,31 @@ func cmdWatch(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	if err := core.Watch(ctx, s, args, os.Stdout); err != nil {
+	// --after <id>: сразу выдать сообщения новее id — подписка перезапущена без
+	// пропусков. Флаг может стоять и после alias, поэтому разбираем сами.
+	var aliases []string
+	after := 0
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		val, isFlag := strings.CutPrefix(a, "--after=")
+		if a == "--after" {
+			if i+1 < len(args) {
+				i++
+				val = args[i]
+			}
+			isFlag = true
+		}
+		if !isFlag {
+			aliases = append(aliases, a)
+			continue
+		}
+		n, err := strconv.Atoi(val)
+		if err != nil {
+			return fail(&core.Bad{Msg: "--after: нужен id сообщения (число)"})
+		}
+		after = n
+	}
+	if err := core.Watch(ctx, s, aliases, after, os.Stdout); err != nil {
 		return fail(err)
 	}
 	return 0
@@ -781,7 +805,8 @@ func cmdDoctor(ctx context.Context, args []string) int {
 		fmt.Println("[?] сессия: не проверяю, пока не заданы настоящие ключи")
 	default:
 		if err := service.Do(ctx, "check", nil, &chk); err != nil {
-			fmt.Printf("[?] сессия: не удалось проверить (%v)\n", err)
+			fmt.Printf("[x] сессия: не удалось проверить (%v)\n", err)
+			problems = append(problems, "Telegram не ответил на проверку сессии")
 			break
 		}
 		switch chk.Session {
@@ -795,7 +820,8 @@ func cmdDoctor(ctx context.Context, args []string) int {
 			fmt.Println("[x] сессия:", s.SessionPath)
 			problems = append(problems, "аккаунт не подключён — выполни `tg login` или войди в окне управления")
 		default:
-			fmt.Printf("[?] сессия: не удалось проверить (%s)\n", chk.SessionError)
+			fmt.Printf("[x] сессия: не удалось проверить (%s)\n", chk.SessionError)
+			problems = append(problems, "Telegram не ответил на проверку сессии")
 		}
 		if off := chk.ClockOffset; off > 2 || off < -2 {
 			fmt.Printf("[?] часы компьютера расходятся с Telegram на %.0f с (учтено)\n", -off)

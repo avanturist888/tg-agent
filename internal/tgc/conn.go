@@ -15,6 +15,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gotd/log/logslog"
@@ -121,7 +122,11 @@ func Run(ctx context.Context, s *config.Settings, o Opts, fn func(ctx context.Co
 	}()
 
 	c := &Conn{Settings: s, hub: newUpdateHub()}
-	client, err := newClient(s, c.hub)
+	// подмену ключа отклонили — в памяти клиента уже чужой ключ, бросаем его
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var kept atomic.Bool
+	client, err := newClient(s, c.hub, newGuardedStorage(s, false, func() { kept.Store(true); cancel() }))
 	if err != nil {
 		return err
 	}
@@ -132,6 +137,9 @@ func Run(ctx context.Context, s *config.Settings, o Opts, fn func(ctx context.Co
 		ferr = c.start(ctx, client, s, o, fn)
 		return ferr
 	})
+	if kept.Load() {
+		return KeyRejected{}
+	}
 	if ferr != nil {
 		return ferr
 	}
@@ -154,9 +162,9 @@ func (c *Conn) start(ctx context.Context, client *telegram.Client, s *config.Set
 	return fn(ctx, c)
 }
 
-func newClient(s *config.Settings, hub telegram.UpdateHandler) (*telegram.Client, error) {
+func newClient(s *config.Settings, hub telegram.UpdateHandler, storage session.Storage) (*telegram.Client, error) {
 	opts := telegram.Options{
-		SessionStorage: &session.FileStorage{Path: s.SessionPath},
+		SessionStorage: storage,
 		Device: telegram.DeviceConfig{
 			DeviceModel:   "tg-agent",
 			SystemVersion: "claude-code",
@@ -188,7 +196,7 @@ func newClient(s *config.Settings, hub telegram.UpdateHandler) (*telegram.Client
 
 // NewLoginClient — клиент для интерактивного входа (tg login), без лока.
 func NewLoginClient(s *config.Settings) (*telegram.Client, error) {
-	return newClient(s, newUpdateHub())
+	return newClient(s, newUpdateHub(), newGuardedStorage(s, true, nil))
 }
 
 // updateHub раздаёт апдейты тем, кто их ждёт (расшифровка голосовых).

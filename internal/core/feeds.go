@@ -195,8 +195,10 @@ func FeedOnMessage(loader func() (*config.Settings, error)) tgc.OnMessage {
 }
 
 // Watch печатает «alias id» на каждое новое сообщение — для Monitor в Claude
-// Code. Читает только локальные файлы лент, к Telegram не ходит.
-func Watch(ctx context.Context, s *config.Settings, aliases []string, out io.Writer) error {
+// Code. Читает только локальные файлы лент, к Telegram не ходит. after > 0 —
+// сразу выдать и то, что пришло после этого id (подписку перезапустили, а
+// сообщения за перерыв терять нельзя).
+func Watch(ctx context.Context, s *config.Settings, aliases []string, after int, out io.Writer) error {
 	var rules []config.ChatRule
 	if len(aliases) > 0 {
 		for _, a := range aliases {
@@ -217,27 +219,48 @@ func Watch(ctx context.Context, s *config.Settings, aliases []string, out io.Wri
 	var names []string
 	for _, r := range rules {
 		seen[r.Alias] = LastID(FeedPath(s, r.Alias))
+		if after > 0 {
+			seen[r.Alias] = min(seen[r.Alias], after)
+		}
 		names = append(names, r.Alias)
 	}
 	fmt.Fprintf(out, "слежу за: %s (Ctrl+C — выход)\n", strings.Join(names, ", "))
+	type stamp struct {
+		size int64
+		mod  time.Time
+	}
+	last := map[string]stamp{}
 	for ctx.Err() == nil {
 		for _, alias := range names {
-			raw, err := os.ReadFile(FeedPath(s, alias))
+			path := FeedPath(s, alias)
+			st, err := os.Stat(path)
 			if err != nil {
 				continue
 			}
+			now := stamp{st.Size(), st.ModTime()}
+			if now == last[alias] {
+				continue // лента не менялась — не перечитываем
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			last[alias] = now
 			best := seen[alias]
 			for _, f := range strings.Fields(string(raw)) {
 				id, err := strconv.Atoi(f)
 				if err != nil || id <= seen[alias] {
 					continue
 				}
-				fmt.Fprintf(out, "%s %d\n", alias, id)
+				if _, err := fmt.Fprintf(out, "%s %d\n", alias, id); err != nil {
+					// читателя нет (сессия агента закрылась) — не висеть сиротой
+					return nil
+				}
 				best = max(best, id)
 			}
 			seen[alias] = best
 		}
-		sleepCtx(ctx, time.Second)
+		sleepCtx(ctx, 250*time.Millisecond)
 	}
 	return nil
 }

@@ -186,9 +186,12 @@ with_status=true дополнительно тянет число непрочи
 последний из них. Так следят за чатом без опроса Telegram: сравни
 last_id со своим последним обработанным id и, если он больше, забери
 новое через tg_read_chat(after_id=<твой последний id>). Подписка с
-уведомлениями: запусти через Monitor команду
-` + "`<TG> watch <alias>`" + `
-— она печатает «alias id» на каждое новое сообщение.`)},
+уведомлениями: запусти инструментом Monitor (не фоновым Bash — его вывод
+до тебя не доходит), timeout_ms 1800000, команду
+` + "`<TG> watch <alias> --after <последний обработанный id>`" + `
+— она печатает «alias id» на каждое новое сообщение. Monitor живёт до
+30 минут и не переживает возобновления сессии — перезапускай его (подробно
+в AGENTS.md, «Как следить за чатом»).`)},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in listChatsIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 				return core.ListChats(ctx, s, in.WithStatus)

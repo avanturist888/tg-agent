@@ -415,6 +415,10 @@ func CLIHint() string {
 	if err != nil {
 		return "tg"
 	}
+	// tgw.exe — без консоли (служба, окно): в терминале нужен tg.exe рядом
+	if dir, name := filepath.Split(exe); strings.EqualFold(name, "tgw.exe") {
+		exe = filepath.Join(dir, "tg.exe")
+	}
 	if strings.ContainsRune(exe, ' ') {
 		return "& \"" + exe + "\""
 	}
