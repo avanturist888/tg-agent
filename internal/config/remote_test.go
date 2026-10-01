@@ -35,10 +35,10 @@ func TestRemoteConfigErrors(t *testing.T) {
 	root := tempInstall(t)
 	path := filepath.Join(root, "config", "t3.toml")
 	for body, want := range map[string]string{
-		"[[env]]\nname = \"local\"\norigin = \"http://x:1\"\ntoken_file = \"t\"\n":   "занято",
-		"[[env]]\nname = \"a b\"\norigin = \"http://x:1\"\ntoken_file = \"t\"\n":     "латиница",
-		"[[env]]\nname = \"a\"\norigin = \"x:1\"\ntoken_file = \"t\"\n":              "origin",
-		"[[env]]\nname = \"a\"\norigin = \"http://x:1\"\n":                           "способа получить токен",
+		"[[env]]\nname = \"local\"\norigin = \"http://x:1\"\ntoken_file = \"t\"\n":                                                                 "занято",
+		"[[env]]\nname = \"a b\"\norigin = \"http://x:1\"\ntoken_file = \"t\"\n":                                                                   "латиница",
+		"[[env]]\nname = \"a\"\norigin = \"x:1\"\ntoken_file = \"t\"\n":                                                                            "origin",
+		"[[env]]\nname = \"a\"\norigin = \"http://x:1\"\n":                                                                                         "способа получить токен",
 		"[[env]]\nname = \"a\"\norigin = \"http://x:1\"\ntoken_file = \"t\"\n[[env]]\nname = \"A\"\norigin = \"http://y:1\"\ntoken_file = \"t\"\n": "повторяется",
 	} {
 		write(t, path, body)

@@ -854,7 +854,11 @@ func cmdDoctor(ctx context.Context, args []string) int {
 		fmt.Printf("[v] служба запущена: сборка %s, pid %d, с %s\n", status.Build, status.PID, status.Started.Local().Format("02.01 15:04"))
 	} else {
 		fmt.Println("[?] служба не запущена — всё работает напрямую, но без лент в реальном времени и без кнопок, пока агент не ждёт")
-		problems = append(problems, "служба не запущена — scripts\\install-task.ps1 ставит её в автозапуск")
+		hint := "scripts\\install-task.ps1"
+		if p := config.Profile(); p != "" {
+			hint += " -Profile " + p
+		}
+		problems = append(problems, "служба не запущена — "+hint+" ставит её в автозапуск")
 	}
 	var chk service.Check
 	switch {
