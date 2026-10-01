@@ -19,7 +19,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -135,14 +134,15 @@ func (s *Server) routes(mux *http.ServeMux) {
 func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 	st, err := config.Load()
 	if err != nil {
-		writeJSON(w, omap.New().Set("config_error", err.Error()).Set("root", config.Root))
+		writeJSON(w, omap.New().Set("config_error", err.Error()).Set("root", config.Home()))
 		return
 	}
 	_, sessErr := os.Stat(st.SessionPath)
 	var status service.Status
 	up := service.Do(r.Context(), "status", nil, &status) == nil
 	out := omap.New().
-		Set("root", config.Root).
+		Set("root", config.Home()).
+		Set("profile", config.Profile()).
 		Set("exe", config.CLIHint()).
 		Set("send_policy", st.SendPolicy).
 		Set("session_file", sessErr == nil).
@@ -433,7 +433,7 @@ var editable = []setting{
 	{"TG_MAX_DOWNLOAD_MB", "Файл на скачивание, МБ", "int", "1024", nil, "Предел файла, который агент может скачать"},
 }
 
-func envPath() string { return filepath.Join(config.Root, ".env") }
+func envPath() string { return config.EnvPath() }
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	values := envfile.Read(envPath())

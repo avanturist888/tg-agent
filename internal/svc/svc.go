@@ -52,9 +52,10 @@ type response struct {
 	Build  string          `json:"build"`
 }
 
-// Address — имя канала: своё для каждой установки (по пути к ней).
+// Address — имя канала: своё для каждой установки и профиля (по пути к
+// каталогу профиля; у основного это корень установки — имя прежнее).
 func Address() string {
-	sum := sha256.Sum256([]byte(strings.ToLower(config.Root)))
+	sum := sha256.Sum256([]byte(strings.ToLower(config.Home())))
 	return address(hex.EncodeToString(sum[:6]))
 }
 

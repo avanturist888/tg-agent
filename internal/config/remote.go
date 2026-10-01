@@ -53,15 +53,15 @@ func (e T3Env) AdminToken() string {
 
 // TokenPath — где служба хранит выпущенный для окружения токен.
 func (e T3Env) TokenPath() string {
-	return filepath.Join(Root, "data", "t3-token-"+e.Name+".json")
+	return filepath.Join(DataPath(), "t3-token-"+e.Name+".json")
 }
 
-func T3Path() string     { return filepath.Join(Root, "config", "t3.toml") }
-func AgentsPath() string { return filepath.Join(Root, "config", "agents.toml") }
+func T3Path() string     { return filepath.Join(ConfigDir(), "t3.toml") }
+func AgentsPath() string { return filepath.Join(ConfigDir(), "agents.toml") }
 
 // LoadT3 — окружения из config/t3.toml (нет файла — пусто).
 func LoadT3() ([]T3Env, error) {
-	applyDotenv(filepath.Join(Root, ".env"))
+	applyDotenv(EnvPath())
 	path := T3Path()
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -151,7 +151,7 @@ type Agents struct {
 
 // LoadAgents — агенты из config/agents.toml (нет файла — пусто).
 func LoadAgents() (*Agents, error) {
-	applyDotenv(filepath.Join(Root, ".env"))
+	applyDotenv(EnvPath())
 	out := &Agents{Listen: DefaultListen}
 	path := AgentsPath()
 	data, err := os.ReadFile(path)

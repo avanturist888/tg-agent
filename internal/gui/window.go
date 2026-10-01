@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+
+	"tgagent/internal/config"
 )
 
 // Open — поднять сервер и показать окно (или открыть страницу в браузере).
@@ -67,4 +69,12 @@ func dataDir() string {
 		base = os.TempDir()
 	}
 	return filepath.Join(base, "tg-agent", "webview2")
+}
+
+// windowTitle — заголовок окна: у именованного профиля — с его именем.
+func windowTitle() string {
+	if p := config.Profile(); p != "" {
+		return "tg-agent — управление (профиль " + p + ")"
+	}
+	return "tg-agent — управление"
 }

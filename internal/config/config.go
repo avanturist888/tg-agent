@@ -141,7 +141,7 @@ type Settings struct {
 	Agent *Agent
 }
 
-func (s *Settings) DataDir() string         { return filepath.Join(Root, "data") }
+func (s *Settings) DataDir() string         { return DataPath() }
 func (s *Settings) BotReady() bool          { return s.BotToken != "" && s.ApprovalChatID != 0 }
 func (s *Settings) UpdatesLockPath() string { return filepath.Join(s.DataDir(), "bot-updates") }
 func (s *Settings) DownloadsDir() string    { return filepath.Join(s.DataDir(), "downloads") }
@@ -152,7 +152,7 @@ func (s *Settings) AuditPath() string       { return filepath.Join(s.DataDir(), 
 func (s *Settings) PeersPath() string       { return filepath.Join(s.DataDir(), "peers.json") }
 func (s *Settings) OutboxFilesDir() string  { return filepath.Join(s.DataDir(), "outbox_files") }
 func (s *Settings) FeedsDir() string        { return filepath.Join(s.DataDir(), "feeds") }
-func (s *Settings) ChatsPath() string       { return filepath.Join(Root, "config", "chats.toml") }
+func (s *Settings) ChatsPath() string       { return ChatsFile() }
 
 // Rules — правила в порядке из chats.toml.
 func (s *Settings) Rules() []ChatRule {
@@ -278,8 +278,12 @@ func botCredentials() (string, int64) {
 	}
 	donor := os.Getenv("TG_BOT_ENV_FILE")
 	if donor == "" {
-		home, _ := os.UserHomeDir()
-		donor = filepath.Join(home, ".local", "share", "cc-telegram-notify", "config.env")
+		if profile != "" {
+			// у профиля свой бот: чужого донора не берём (его слушает основная служба)
+			id, _ := strconv.ParseInt(chatID, 10, 64)
+			return token, id
+		}
+		donor = defaultDonor()
 	}
 	if data, err := os.ReadFile(donor); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
@@ -299,6 +303,26 @@ func botCredentials() (string, int64) {
 		id = 0
 	}
 	return token, id
+}
+
+func defaultDonor() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "share", "cc-telegram-notify", "config.env")
+}
+
+// mainBotToken — токен бота основного профиля (из его .env или донора), не
+// трогая окружение процесса: профилю тот же бот брать нельзя.
+func mainBotToken() string {
+	values, _ := godotenv.Read(filepath.Join(Root, ".env"))
+	if tok := strings.TrimSpace(values["TG_BOT_TOKEN"]); tok != "" {
+		return tok
+	}
+	donor := values["TG_BOT_ENV_FILE"]
+	if donor == "" {
+		donor = defaultDonor()
+	}
+	d, _ := godotenv.Read(donor)
+	return strings.TrimSpace(d["NOTIFICATIONS_BOT_TOKEN"])
 }
 
 func parseProxy(raw string) (*url.URL, error) {
@@ -340,10 +364,14 @@ func envInt(key string, def int) int {
 func Load() (*Settings, error) { return load(true) }
 
 func load(requireCredentials bool) (*Settings, error) {
-	applyDotenv(filepath.Join(Root, ".env"))
+	applyDotenv(EnvPath())
 	apiID := strings.TrimSpace(os.Getenv("TG_API_ID"))
 	apiHash := strings.TrimSpace(os.Getenv("TG_API_HASH"))
 	if requireCredentials && (apiID == "" || apiHash == "") {
+		if profile != "" {
+			return nil, cfgErr("Профиль %s: не заданы TG_API_ID / TG_API_HASH в %s. Заготовку профиля "+
+				"делает `tg --profile %s init`.", profile, EnvPath(), profile)
+		}
 		return nil, cfgErr("Не заданы TG_API_ID / TG_API_HASH. Скопируй .env.example в .env " +
 			"и впиши значения с https://my.telegram.org")
 	}
@@ -361,7 +389,7 @@ func load(requireCredentials bool) (*Settings, error) {
 		session = "data/session.json"
 	}
 	if !filepath.IsAbs(session) {
-		session = filepath.Join(Root, session)
+		session = filepath.Join(Home(), session)
 	}
 	_ = os.MkdirAll(filepath.Dir(session), 0o700)
 
@@ -376,6 +404,11 @@ func load(requireCredentials bool) (*Settings, error) {
 	}
 
 	token, chatID := botCredentials()
+	if profile != "" && token != "" && token == mainBotToken() {
+		return nil, cfgErr("Профиль %s: тот же бот подтверждений, что у основного профиля, а апдейты бота "+
+			"слушает только одна служба. Заведи профилю своего бота (@BotFather) или убери TG_BOT_TOKEN из %s "+
+			"и поставь TG_SEND_POLICY=human_approval.", profile, EnvPath())
+	}
 	if policy == "bot_approval" && (token == "" || chatID == 0) {
 		return nil, cfgErr("TG_SEND_POLICY=bot_approval, но не найден бот для подтверждений. " +
 			"Задай TG_BOT_TOKEN и TG_APPROVAL_CHAT_ID в .env либо путь к чужому " +
@@ -385,7 +418,7 @@ func load(requireCredentials bool) (*Settings, error) {
 	if err != nil {
 		return nil, err
 	}
-	chats, order, err := LoadChats(filepath.Join(Root, "config", "chats.toml"))
+	chats, order, err := LoadChats(ChatsFile())
 	if err != nil {
 		return nil, err
 	}

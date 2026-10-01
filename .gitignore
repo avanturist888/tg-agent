@@ -2,3 +2,6 @@
 data/
 bin/
 config/chats.toml
+profiles/
+config/t3.toml
+config/agents.toml

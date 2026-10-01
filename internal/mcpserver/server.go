@@ -102,7 +102,7 @@ func safe(ctx context.Context, s *config.Settings, fn func(ctx context.Context, 
 }
 
 func localPaths(doc string) string {
-	return strings.NewReplacer("<ROOT>", config.Root, "<TG>", config.CLIHint()).Replace(doc)
+	return strings.NewReplacer("<DATA>", config.DataPath(), "<TG>", config.CLIHint()).Replace(doc)
 }
 
 // ── входные параметры инструментов ─────────────────────────────────────
@@ -298,7 +298,7 @@ tg_download_file и расшифруй своим STT.`},
 Годится для любого файла: документы, видео (целиком, не превью), кружки,
 голосовые (.oga, Opus — годится для whisper и других STT), аудио, фото в
 исходном качестве. Сохраняет в
-<ROOT>\data\downloads\<alias>\ и возвращает path —
+<DATA>\downloads\<alias>\ и возвращает path —
 дальше открывай его своими инструментами (Read, ffmpeg, архиватор…).
 Повторный вызов не качает заново. У сообщений с файлом в tg_read_chat
 есть поле file (name, size, mime_type).

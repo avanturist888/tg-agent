@@ -2,9 +2,12 @@ package svc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,5 +77,14 @@ func TestRoundTripErrorsAndCancel(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if _, err := Call(context.Background(), "echo", nil, nil); !errors.Is(err, Unavailable) {
 		t.Fatalf("после остановки: %v", err)
+	}
+}
+
+// TestAddressDefaultProfileUnchanged — у основного профиля имя канала то же,
+// что до профилей: запущенная служба и прослойки агентов не теряют друг друга.
+func TestAddressDefaultProfileUnchanged(t *testing.T) {
+	sum := sha256.Sum256([]byte(strings.ToLower(config.Root)))
+	if got, want := Address(), address(hex.EncodeToString(sum[:6])); got != want {
+		t.Fatalf("канал основного профиля: %s, а был %s", got, want)
 	}
 }

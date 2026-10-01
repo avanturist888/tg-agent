@@ -10,7 +10,7 @@ func openWindow(url string) bool {
 		AutoFocus: true,
 		DataPath:  dataDir(),
 		WindowOptions: webview2.WindowOptions{
-			Title:  "tg-agent — управление",
+			Title:  windowTitle(),
 			Width:  1200,
 			Height: 840,
 			Center: true,

@@ -45,14 +45,20 @@ try {
     }
     Write-Host "Готово: $(Join-Path $Root 'bin'), сборка $build"
 
-    # служба — на новую сборку (Stop-ScheduledTask сам процесс не убивает)
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    # службы (основная и профилей, tg-agent-<имя>) — на новую сборку
+    # (Stop-ScheduledTask сам процесс не убивает)
+    $tasks = @(Get-ScheduledTask -TaskName "$TaskName*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.TaskName -eq $TaskName -or $_.TaskName -like "$TaskName-*" } |
+        Where-Object { $_.TaskName -ne 'tg-agent-approvals' })
+    if ($tasks.Count -gt 0) {
+        foreach ($t in $tasks) { Stop-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue }
         Get-CimInstance Win32_Process |
             Where-Object { $_.CommandLine -match 'tgw?(\.old[-0-9]*)?\.exe"?\s+(serve|approvals)' } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        Start-ScheduledTask -TaskName $TaskName
-        Write-Host "Служба перезапущена: $((Get-ScheduledTask -TaskName $TaskName).State)"
+        foreach ($t in $tasks) {
+            Start-ScheduledTask -TaskName $t.TaskName
+            Write-Host "Служба $($t.TaskName) перезапущена: $((Get-ScheduledTask -TaskName $t.TaskName).State)"
+        }
     } else {
         Write-Host 'Службы в Планировщике нет — поставить: scripts\install-task.ps1'
     }

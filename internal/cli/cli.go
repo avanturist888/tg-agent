@@ -70,6 +70,7 @@ var commands []command
 
 func init() {
 	commands = []command{
+		{name: "init", help: "заготовка профиля: tg --profile <имя> init [--phone +7…]", run: cmdInit},
 		{name: "login", help: "вход и сохранение сессии", run: cmdLogin},
 		{name: "logout", help: "отозвать сессию на стороне Telegram", run: cmdLogout},
 		{name: "whoami", help: "под каким аккаунтом работаем", run: cmdWhoami},
@@ -100,7 +101,8 @@ func init() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "tg-agent — доступ агентов Claude Code к Telegram по белому списку чатов.\n\nКоманды:")
+	fmt.Fprintln(os.Stderr, "tg-agent — доступ агентов Claude Code к Telegram по белому списку чатов.\n\n"+
+		"Профиль (второй аккаунт): tg --profile <имя> <команда> или TG_PROFILE=<имя>.\n\nКоманды:")
 	for _, c := range commands {
 		if c.help != "" {
 			fmt.Fprintf(os.Stderr, "  %-10s %s\n", c.name, c.help)
@@ -108,8 +110,41 @@ func usage() {
 	}
 }
 
+// takeProfile — вынуть --profile <имя> (или --profile=<имя>) из любого места
+// строки: у команд такого флага нет, а писать его удобно где угодно.
+func takeProfile(args []string) (rest []string, name string, set bool, err error) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if v, ok := strings.CutPrefix(a, "--profile="); ok {
+			name, set = v, true
+			continue
+		}
+		if a == "--profile" || a == "-profile" {
+			if i+1 >= len(args) {
+				return nil, "", false, errors.New("--profile: нужно имя профиля")
+			}
+			i++
+			name, set = args[i], true
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return rest, name, set, nil
+}
+
 // Main — точка входа; возвращает код выхода.
 func Main(args []string) int {
+	args, name, set, err := takeProfile(args)
+	if err != nil {
+		return fail(err)
+	}
+	if set {
+		if err := config.SetProfile(name); err != nil {
+			return fail(err)
+		}
+	} else if err := config.SetProfile(config.Profile()); err != nil { // из TG_PROFILE
+		return fail(err)
+	}
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		usage()
 		if len(args) == 0 {
@@ -180,6 +215,18 @@ func cmdLogin(ctx context.Context, args []string) int {
 	p := *phone
 	if p == "" {
 		p = s.Phone
+	}
+	if prof := config.Profile(); prof != "" {
+		fmt.Printf("Профиль %s: вход в аккаунт Telegram этого профиля.\n", prof)
+		fmt.Printf("  Сессия ляжет в %s; основной профиль и его сессия не затрагиваются.\n", s.SessionPath)
+		if p == "" {
+			fmt.Printf("  Номер не задан в %s (TG_PHONE) — введи его сейчас, в международном формате.\n", config.EnvPath())
+		} else {
+			fmt.Printf("  Номер: %s (из %s или --phone).\n", p, config.EnvPath())
+		}
+		fmt.Println("  Код придёт в приложение Telegram этого аккаунта (или SMS). Если включена")
+		fmt.Println("  двухфакторная защита, следом спросит пароль. Прервать — Ctrl+C.")
+		fmt.Println()
 	}
 	term := &terminal{phone: p, in: bufio.NewReader(os.Stdin)}
 	if service.Up(ctx) {
@@ -794,6 +841,9 @@ func cmdDoctor(ctx context.Context, args []string) int {
 		return 1
 	}
 	fmt.Printf("[v] .env прочитан, api_id=%d, корень %s\n", s.APIID, config.Root)
+	if p := config.Profile(); p != "" {
+		fmt.Printf("[v] профиль %s: %s\n", p, config.Home())
+	}
 	if s.APIID == exampleAPIID {
 		problems = append(problems, "в .env остались значения-заглушки из .env.example — впиши свои с my.telegram.org")
 	}

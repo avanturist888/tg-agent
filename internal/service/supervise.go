@@ -77,7 +77,11 @@ func runWorker(ctx context.Context, s *config.Settings, exe string, job killJob)
 	defer f.Close()
 	fmt.Fprintf(f, "\n=== %s: запуск рабочего процесса, сборка %s\n", time.Now().Format("2006-01-02 15:04:05"), config.Build)
 
-	cmd := exec.CommandContext(ctx, exe, "serve", WorkerArg)
+	args := []string{"serve", WorkerArg}
+	if p := config.Profile(); p != "" {
+		args = append(args, "--profile", p) // по командной строке видно, чей это процесс
+	}
+	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Dir = config.Root
 	cmd.Stdout, cmd.Stderr = f, f
 	hideWindow(cmd)

@@ -172,8 +172,7 @@ func removeKey(lines []string, start, end int, key string) []string {
 
 // Add дописывает новый чат в конец файла.
 func Add(c Chat) error {
-	path := config.Root + "/config/chats.toml"
-	path = strings.ReplaceAll(path, "/", string(os.PathSeparator))
+	path := config.ChatsFile()
 	old, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return err
@@ -195,7 +194,7 @@ func Add(c Chat) error {
 // Update переписывает права (и, если заданы, заголовок и заметку) чата.
 // Права задаются целиком, а не накапливаются.
 func Update(alias string, read, send, auto bool, title, note *string) error {
-	path := strings.ReplaceAll(config.Root+"/config/chats.toml", "/", string(os.PathSeparator))
+	path := config.ChatsFile()
 	old, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -231,7 +230,7 @@ func Update(alias string, read, send, auto bool, title, note *string) error {
 
 // Remove убирает блок чата целиком — доступ закрыт.
 func Remove(alias string) error {
-	path := strings.ReplaceAll(config.Root+"/config/chats.toml", "/", string(os.PathSeparator))
+	path := config.ChatsFile()
 	old, err := os.ReadFile(path)
 	if err != nil {
 		return err

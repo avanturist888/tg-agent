@@ -8,16 +8,30 @@
 #
 # Запуск:   powershell -ExecutionPolicy Bypass -File scripts\install-task.ps1
 # Удалить:  Unregister-ScheduledTask -TaskName 'tg-agent' -Confirm:$false
+#
+# Профиль (второй аккаунт, tg --profile <имя>): -Profile <имя> ставит его
+# службу отдельной задачей tg-agent-<имя>; службы других профилей не трогает.
+
+# $PROFILE — встроенная переменная PowerShell, поэтому внутри имя другое
+param([Alias('Profile')][string]$ProfileName = '')
 
 $ErrorActionPreference = 'Stop'
 
 $TaskName = 'tg-agent'
+$Argument = 'serve'
+if ($ProfileName -and $ProfileName -ne 'default') {
+    if ($ProfileName -notmatch '^[A-Za-z0-9_-]+$') { throw "Имя профиля: только латиница, цифры, - и _" }
+    $TaskName = "tg-agent-$ProfileName"
+    $Argument = "serve --profile $ProfileName"
+} else {
+    $ProfileName = ''
+}
 $Root     = Split-Path -Parent $PSScriptRoot
 $Exe      = Join-Path $Root 'bin\tgw.exe'   # tgw — без окна консоли
 
 if (-not (Test-Path $Exe)) { throw "Нет $Exe — сначала scripts\build.ps1" }
 
-$action  = New-ScheduledTaskAction -Execute $Exe -Argument 'serve' -WorkingDirectory $Root
+$action  = New-ScheduledTaskAction -Execute $Exe -Argument $Argument -WorkingDirectory $Root
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 
 # Служба работает всё время: лимит времени снимаем, после падения перезапускаем.
@@ -30,13 +44,18 @@ $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -Priority 5
 
-# Прежнюю службу (и задачу старого имени) останавливаем вместе с процессом:
-# Stop-ScheduledTask сам процесс не убивает.
+# Прежнюю службу этого профиля (и задачу старого имени) останавливаем вместе
+# с процессом: Stop-ScheduledTask сам процесс не убивает. Службы других
+# профилей не трогаем: у них в командной строке другой --profile.
 foreach ($old in $TaskName, 'tg-agent-approvals') {
     Stop-ScheduledTask -TaskName $old -ErrorAction SilentlyContinue
 }
 Get-CimInstance Win32_Process |
     Where-Object { $_.CommandLine -match 'tgw?(\.old[-0-9]*)?\.exe"?\s+(serve|approvals)' } |
+    Where-Object {
+        if ($ProfileName) { $_.CommandLine -match "--profile[ =]$ProfileName(\s|$)" }
+        else { $_.CommandLine -notmatch '--profile' }
+    } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 if (Get-ScheduledTask -TaskName 'tg-agent-approvals' -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName 'tg-agent-approvals' -Confirm:$false
@@ -49,4 +68,8 @@ Start-ScheduledTask -TaskName $TaskName
 Start-Sleep -Seconds 3
 $state = (Get-ScheduledTask -TaskName $TaskName).State
 Write-Host "Задача '$TaskName' установлена и запущена. Состояние: $state"
-Write-Host "Проверить: $(Join-Path $Root 'bin\tg.exe') doctor"
+if ($ProfileName) {
+    Write-Host "Проверить: $(Join-Path $Root 'bin\tg.exe') --profile $ProfileName doctor"
+} else {
+    Write-Host "Проверить: $(Join-Path $Root 'bin\tg.exe') doctor"
+}

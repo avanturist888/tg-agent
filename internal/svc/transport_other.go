@@ -11,7 +11,7 @@ import (
 	"tgagent/internal/config"
 )
 
-func address(id string) string { return filepath.Join(config.Root, "data", "tg-agent-"+id+".sock") }
+func address(id string) string { return filepath.Join(config.DataPath(), "tg-agent-"+id+".sock") }
 
 func listen(addr string) (net.Listener, error) {
 	if conn, err := net.Dial("unix", addr); err == nil {
