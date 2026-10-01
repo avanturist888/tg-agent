@@ -139,14 +139,64 @@ func mimeOf(path string) string {
 	return "application/octet-stream"
 }
 
-// SendFiles — отправить файлы как документы, без пережатия, одним альбомом до 10 штук.
-func (c *Conn) SendFiles(ctx context.Context, t Target, paths []string, reply *int64) ([]int, error) {
+// OutFile — файл к отправке: Photo — фотографией (видна прямо в ленте),
+// иначе документом без пережатия.
+type OutFile struct {
+	Path  string
+	Photo bool
+}
+
+// SendFiles — отправить файлы альбомами до 10 штук: фото одним, документы
+// другим — смешивать их в одном альбоме Telegram не даёт. reply получает
+// первый альбом.
+func (c *Conn) SendFiles(ctx context.Context, t Target, files []OutFile, reply *int64) ([]int, error) {
+	var photos, docs []string
+	for _, f := range files {
+		if f.Photo {
+			photos = append(photos, f.Path)
+		} else {
+			docs = append(docs, f.Path)
+		}
+	}
+	var ids []int
+	for _, g := range []struct {
+		paths []string
+		photo bool
+	}{{photos, true}, {docs, false}} {
+		if len(g.paths) == 0 {
+			continue
+		}
+		got, err := c.sendAlbum(ctx, t, g.paths, g.photo, reply)
+		if err != nil && g.photo && photoRejected(err) {
+			// фото Telegram не принял (размеры, формат) — те же файлы документами
+			got, err = c.sendAlbum(ctx, t, g.paths, false, reply)
+		}
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, got...)
+		reply = nil
+	}
+	return ids, nil
+}
+
+func photoRejected(err error) bool {
+	e, ok := tgerr.As(err)
+	return ok && (strings.HasPrefix(e.Type, "PHOTO_") || e.Type == "IMAGE_PROCESS_FAILED")
+}
+
+// sendAlbum — одно сообщение или альбом: все фото или все документы.
+func (c *Conn) sendAlbum(ctx context.Context, t Target, paths []string, photo bool, reply *int64) ([]int, error) {
 	up := uploader.NewUploader(c.API)
 	var media []tg.InputMediaClass
 	for _, p := range paths {
 		file, err := up.FromPath(ctx, p)
 		if err != nil {
 			return nil, err
+		}
+		if photo {
+			media = append(media, &tg.InputMediaUploadedPhoto{File: file})
+			continue
 		}
 		media = append(media, &tg.InputMediaUploadedDocument{
 			File:       file,
@@ -175,20 +225,13 @@ func (c *Conn) SendFiles(ctx context.Context, t Target, paths []string, reply *i
 		if err != nil {
 			return nil, err
 		}
-		md, ok := got.(*tg.MessageMediaDocument)
-		if !ok {
-			return nil, fmt.Errorf("Telegram вернул не документ (%s)", typeName(got))
-		}
-		doc, ok := md.Document.(*tg.Document)
-		if !ok {
-			return nil, fmt.Errorf("Telegram не вернул документ")
+		in, err := uploadedMedia(got)
+		if err != nil {
+			return nil, err
 		}
 		r := randomID()
 		randoms = append(randoms, r)
-		single = append(single, tg.InputSingleMedia{
-			Media:    &tg.InputMediaDocument{ID: &tg.InputDocument{ID: doc.ID, AccessHash: doc.AccessHash, FileReference: doc.FileReference}},
-			RandomID: r,
-		})
+		single = append(single, tg.InputSingleMedia{Media: in, RandomID: r})
 	}
 	req := &tg.MessagesSendMultiMediaRequest{Peer: t.Input, MultiMedia: single}
 	if r := replyTo(reply); r != nil {
@@ -200,6 +243,21 @@ func (c *Conn) SendFiles(ctx context.Context, t Target, paths []string, reply *i
 	}
 	ids, _ := sent(res, randoms)
 	return ids, nil
+}
+
+// uploadedMedia — загруженное фото или документ как ссылка для альбома.
+func uploadedMedia(got tg.MessageMediaClass) (tg.InputMediaClass, error) {
+	switch m := got.(type) {
+	case *tg.MessageMediaPhoto:
+		if p, ok := m.Photo.(*tg.Photo); ok {
+			return &tg.InputMediaPhoto{ID: &tg.InputPhoto{ID: p.ID, AccessHash: p.AccessHash, FileReference: p.FileReference}}, nil
+		}
+	case *tg.MessageMediaDocument:
+		if d, ok := m.Document.(*tg.Document); ok {
+			return &tg.InputMediaDocument{ID: &tg.InputDocument{ID: d.ID, AccessHash: d.AccessHash, FileReference: d.FileReference}}, nil
+		}
+	}
+	return nil, fmt.Errorf("Telegram вернул неожиданное медиа (%s)", typeName(got))
 }
 
 // NormalizeEmoji — Telegram хранит реакции без селектора вариации: «❤», а не

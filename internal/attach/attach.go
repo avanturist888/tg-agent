@@ -7,6 +7,9 @@ package attach
 
 import (
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"os"
 	"path/filepath"
@@ -71,8 +74,41 @@ func expandHome(p string) string {
 	return p
 }
 
-// Snapshot проверяет файлы и снимает с них копии для черновика.
-func Snapshot(s *config.Settings, draftID string, paths []string) ([]outbox.FileSnap, error) {
+// Фото Telegram показывает прямо в ленте, но пережимает и принимает не любое:
+// jpg/png до 10 МБ, сумма сторон до 10000, вытянутость не больше 1:20.
+// Остальное уходит документом.
+const (
+	photoMaxSize  = 10 << 20
+	photoMaxSides = 10000
+	photoMaxRatio = 20
+)
+
+// photoOK — можно ли отправить картинку фотографией.
+func photoOK(path string, size int64) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg", ".png":
+	default:
+		return false
+	}
+	if size > photoMaxSize {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	cfg, _, err := image.DecodeConfig(f)
+	if err != nil || cfg.Width == 0 || cfg.Height == 0 {
+		return false
+	}
+	long, short := max(cfg.Width, cfg.Height), min(cfg.Width, cfg.Height)
+	return cfg.Width+cfg.Height <= photoMaxSides && long <= short*photoMaxRatio
+}
+
+// Snapshot проверяет файлы и снимает с них копии для черновика. asFiles —
+// картинки тоже документами (без сжатия); иначе подходящие уходят фото.
+func Snapshot(s *config.Settings, draftID string, paths []string, asFiles bool) ([]outbox.FileSnap, error) {
 	if len(paths) > 10 {
 		return nil, &Bad{"Не больше 10 файлов в одном сообщении (так группирует Telegram)."}
 	}
@@ -118,7 +154,11 @@ func Snapshot(s *config.Settings, draftID string, paths []string) ([]outbox.File
 		if err := copyFile(c.path, copyPath); err != nil {
 			return nil, err
 		}
-		result = append(result, outbox.FileSnap{Path: copyPath, Name: filepath.Base(c.path), Size: c.size, Source: c.path})
+		snap := outbox.FileSnap{Path: copyPath, Name: filepath.Base(c.path), Size: c.size, Source: c.path}
+		if !asFiles && photoOK(copyPath, c.size) {
+			snap.Kind = outbox.KindPhoto
+		}
+		result = append(result, snap)
 	}
 	return result, nil
 }

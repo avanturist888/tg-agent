@@ -144,20 +144,27 @@ func sleep(ctx context.Context, d time.Duration) {
 	}
 }
 
-// UploadDocument — sendDocument с файлом из снимка черновика.
-func UploadDocument(ctx context.Context, s *config.Settings, path, caption string) (int64, error) {
+// UploadFile — файл из снимка черновика: photo — sendPhoto (как уйдёт в
+// чат: картинкой в ленте), иначе sendDocument.
+func UploadFile(ctx context.Context, s *config.Settings, path, caption string, photo bool) (int64, error) {
 	if s.BotToken == "" {
 		return 0, &Error{"Не задан токен бота подтверждений."}
 	}
-	endpoint := fmt.Sprintf("%s/bot%s/sendDocument", api, s.BotToken)
+	method, field := "sendDocument", "document"
+	if photo {
+		method, field = "sendPhoto", "photo"
+	}
+	endpoint := fmt.Sprintf("%s/bot%s/%s", api, s.BotToken, method)
 	var last error
 	for _, proxy := range routes(s) {
 		var buf bytes.Buffer
 		w := multipart.NewWriter(&buf)
 		_ = w.WriteField("chat_id", fmt.Sprint(s.ApprovalChatID))
 		_ = w.WriteField("caption", truncate(caption, 1000))
-		_ = w.WriteField("disable_content_type_detection", "true")
-		part, err := w.CreateFormFile("document", filepath.Base(path))
+		if !photo {
+			_ = w.WriteField("disable_content_type_detection", "true")
+		}
+		part, err := w.CreateFormFile(field, filepath.Base(path))
 		if err != nil {
 			return 0, err
 		}
@@ -185,12 +192,12 @@ func UploadDocument(ctx context.Context, s *config.Settings, path, caption strin
 		var msg struct {
 			MessageID int64 `json:"message_id"`
 		}
-		if err := decode(resp, "sendDocument", &msg); err != nil {
+		if err := decode(resp, method, &msg); err != nil {
 			return 0, err
 		}
 		return msg.MessageID, nil
 	}
-	return 0, &Error{fmt.Sprintf("sendDocument: сеть недоступна (%v)", last)}
+	return 0, &Error{fmt.Sprintf("%s: сеть недоступна (%v)", method, last)}
 }
 
 const mdSpecial = "\\`*_[]()#+-.!|>~=<{}$^"
@@ -335,7 +342,12 @@ func SendDraftCard(ctx context.Context, s *config.Settings, d *outbox.Draft, tit
 		if f.Size > UploadLimit {
 			continue
 		}
-		if _, err := UploadDocument(ctx, s, f.Path, fmt.Sprintf("📎 %s — к черновику %s", f.Name, d.ID)); err != nil {
+		photo := f.Kind == outbox.KindPhoto
+		_, err := UploadFile(ctx, s, f.Path, fmt.Sprintf("📎 %s — к черновику %s", f.Name, d.ID), photo)
+		if err != nil && photo {
+			_, err = UploadFile(ctx, s, f.Path, fmt.Sprintf("📎 %s — к черновику %s", f.Name, d.ID), false)
+		}
+		if err != nil {
 			_ = audit.Log(s.AuditPath(), "card_file_failed", "draft_id", d.ID, "name", f.Name, "error", err.Error())
 		}
 	}

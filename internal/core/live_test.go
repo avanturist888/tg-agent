@@ -31,7 +31,7 @@ func TestLiveApproveSendViaService(t *testing.T) {
 		t.Skip("нет чата saved")
 	}
 	out, err := DraftMessage(ctx, s, "saved", "Проверка службы tg-agent: черновик одобрен из окна и **ушёл через службу**.",
-		nil, "живой тест службы", "markdown", nil)
+		nil, "живой тест службы", "markdown", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/Microsoft/go-winio"
 
+	"tgagent/internal/config"
 	"tgagent/internal/inbox"
 )
 
@@ -169,5 +170,39 @@ func TestSubscribeNeedsSessionAndReadableChat(t *testing.T) {
 	}
 	if _, err := Unsubscribe(WithAgent(context.Background(), &addr), s, ""); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSubscribeWakesStoppedT3Session(t *testing.T) {
+	s := watchEnv(t)
+	feed := FeedPath(s, "test")
+	appendNewer(feed, []int{10})
+	addr, _ := fakeSession(t)
+	addr.Socket += "-closed" // T3 Code остановил процесс сессии
+	ctx := WithAgent(context.Background(), &addr)
+	if _, err := Subscribe(ctx, s, "test", 0); err != nil {
+		t.Fatal(err)
+	}
+	var woken []string
+	wakeT3 = func(_ context.Context, _ *config.Settings, session, text string) error {
+		woken = append(woken, session+": "+text)
+		return nil
+	}
+	sent := map[string]time.Time{}
+	appendNewer(feed, []int{11})
+	notifyOnce(ctx, s, sent)
+	if len(woken) != 1 || !strings.Contains(woken[0], addr.Session) || !strings.Contains(woken[0], "after_id=10") {
+		t.Fatalf("ожидалось пробуждение через T3: %q", woken)
+	}
+	if sub := loadSubs(subsPath(s))[addr.Key()]; sub == nil || !sub.Dead.IsZero() || sub.Chats["test"] != 11 {
+		t.Fatalf("после пробуждения через T3 отметка должна сдвинуться: %+v", sub)
+	}
+
+	// пока сессия поднимается, T3 повторно не дёргаем — копим
+	appendNewer(feed, []int{12})
+	sent[addr.Key()] = time.Time{}
+	notifyOnce(ctx, s, sent)
+	if len(woken) != 1 {
+		t.Fatalf("лишнее пробуждение через T3: %d", len(woken))
 	}
 }

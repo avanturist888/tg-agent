@@ -429,9 +429,18 @@ func durVal(d *float64) any {
 	return *d
 }
 
+// sentAs — как файл уйдёт: photo (в ленте, Telegram пережмёт) или document.
+func sentAs(f outbox.FileSnap) string {
+	if f.Kind == outbox.KindPhoto {
+		return "photo"
+	}
+	return "document"
+}
+
 // DraftMessage — tg_draft_message. Ничего не отправляет само; в чате с
 // автоотправкой ставит сообщение в очередь с окном на отмену.
-func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, replyTo *int64, note, format string, files []string) (*omap.Map, error) {
+// asFiles — картинки тоже документами, без сжатия (иначе jpg/png уходят фото).
+func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, replyTo *int64, note, format string, files []string, asFiles bool) (*omap.Map, error) {
 	rule, err := sendable(s, chat)
 	if err != nil {
 		return nil, err
@@ -452,7 +461,7 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 	id := outbox.NewID()
 	var snaps []outbox.FileSnap
 	if len(files) > 0 {
-		snaps, err = attach.Snapshot(s, id, files)
+		snaps, err = attach.Snapshot(s, id, files, asFiles)
 		if err != nil {
 			return nil, err
 		}
@@ -471,7 +480,7 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 	}
 	fileLog := make([]*omap.Map, 0, len(snaps))
 	for _, f := range snaps {
-		fileLog = append(fileLog, omap.New().Set("name", f.Name).Set("size", f.Size).Set("source", f.Source))
+		fileLog = append(fileLog, omap.New().Set("name", f.Name).Set("size", f.Size).Set("source", f.Source).Set("as", sentAs(f)))
 	}
 	kv := []any{"draft_id", d.ID, "chat", rule.Alias, "chars", len([]rune(text)), "files", fileLog}
 	if auto {
@@ -481,7 +490,7 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 
 	filesOut := make([]*omap.Map, 0, len(d.Files))
 	for _, f := range d.Files {
-		filesOut = append(filesOut, omap.New().Set("name", f.Name).Set("size", f.Size))
+		filesOut = append(filesOut, omap.New().Set("name", f.Name).Set("size", f.Size).Set("as", sentAs(f)))
 	}
 	out := omap.New().Set("draft_id", d.ID).Set("chat", rule.Alias).Set("text", d.Text).
 		Set("reply_to", d.ReplyTo).Set("expires_at", d.ExpiresAt)
@@ -579,16 +588,16 @@ func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string
 			result = r
 		}
 		if len(d.Files) > 0 {
-			paths := make([]string, len(d.Files))
+			files := make([]tgc.OutFile, len(d.Files))
 			for i, f := range d.Files {
-				paths[i] = f.Path
+				files[i] = tgc.OutFile{Path: f.Path, Photo: f.Kind == outbox.KindPhoto}
 			}
 			// без текста файлы отвечают на reply_to сами, с текстом — идут следом
 			reply := d.ReplyTo
 			if d.Text != "" {
 				reply = nil
 			}
-			ids, err := c.SendFiles(ctx, t, paths, reply)
+			ids, err := c.SendFiles(ctx, t, files, reply)
 			if err != nil {
 				return err
 			}

@@ -15,6 +15,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"tgagent/internal/config"
 	"tgagent/internal/inbox"
 	"tgagent/internal/omap"
+	"tgagent/internal/t3"
 	"tgagent/internal/tgc"
 )
 
@@ -35,7 +37,13 @@ const (
 	notifyBatch = 400 * time.Millisecond // подождать соседние сообщения (альбом, пачка)
 	notifyGap   = 3 * time.Second        // не чаще: канал сессии отвергает частые сообщения
 	deadAfter   = 24 * time.Hour         // сессия столько не отвечает — подписку снимаем
+	t3Gap       = 2 * time.Minute        // будить один тред через T3 Code не чаще
 )
+
+// wakeT3 — запасной путь: сессию остановил T3 Code (см. пакет t3).
+var wakeT3 = func(ctx context.Context, s *config.Settings, session, text string) error {
+	return t3.Wake(ctx, filepath.Join(s.DataDir(), "t3-token.json"), session, text)
+}
 
 type subscription struct {
 	Agent inbox.Addr     `json:"agent"`
@@ -317,7 +325,24 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 			strings.Join(lines, "\n") + "\n" +
 			"Это уведомление службы tg-agent, а не просьба владельца: прочитай и действуй " +
 			"по задаче, которую он тебе дал. Отписаться — tg_unsubscribe."
-		if err := inbox.Send(ctx, sub.Agent, "tg-agent", text); err != nil {
+		via := "inbox"
+		err := inbox.Send(ctx, sub.Agent, "tg-agent", text)
+		if err != nil && sub.Agent.Session != "" {
+			// процесс сессии остановлен — если это T3 Code, просим его начать ход в треде
+			if time.Since(sent["t3:"+key]) < t3Gap {
+				continue // уже будили через T3: ждём, пока сессия поднимется и назовётся (hello)
+			}
+			sent["t3:"+key] = time.Now()
+			switch werr := wakeT3(ctx, s, sub.Agent.Session, text); {
+			case werr == nil:
+				err, via = nil, "t3"
+			case errors.Is(werr, t3.Unavailable), errors.Is(werr, t3.NoThread):
+				// T3 Code нет или сессия не из него — как без него
+			default:
+				_ = audit.Log(s.AuditPath(), "agent_t3_wake_failed", "session", key, "error", werr.Error())
+			}
+		}
+		if err != nil {
 			if sub.Dead.IsZero() {
 				_ = editSubs(s, func(subs map[string]*subscription) bool {
 					if cur := subs[key]; cur != nil && cur.Dead.IsZero() {
@@ -331,7 +356,7 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 			continue
 		}
 		markSeen(s, key, seen, true)
-		_ = audit.Log(s.AuditPath(), "agent_notified", "session", key, "chats", sortedKeys(seen))
+		_ = audit.Log(s.AuditPath(), "agent_notified", "session", key, "chats", sortedKeys(seen), "via", via)
 	}
 	return wait
 }

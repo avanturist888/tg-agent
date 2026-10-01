@@ -53,7 +53,11 @@ type FileSnap struct {
 	Name   string `json:"name"`
 	Size   int64  `json:"size"`
 	Source string `json:"source,omitempty"`
+	Kind   string `json:"kind,omitempty"` // KindPhoto — фото в ленте; пусто — документ без сжатия
 }
+
+// KindPhoto — файл уходит фотографией (Telegram покажет его прямо в ленте).
+const KindPhoto = "photo"
 
 // Draft — черновик сообщения.
 type Draft struct {

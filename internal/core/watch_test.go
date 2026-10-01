@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"tgagent/internal/config"
+	"tgagent/internal/t3"
 )
 
 type syncBuf struct {
@@ -34,6 +35,10 @@ func watchEnv(t *testing.T) *config.Settings {
 	old := config.Root
 	config.Root = t.TempDir()
 	t.Cleanup(func() { config.Root = old })
+	// настоящий T3 Code этой машины тесты не трогают
+	oldWake := wakeT3
+	wakeT3 = func(context.Context, *config.Settings, string, string) error { return t3.Unavailable }
+	t.Cleanup(func() { wakeT3 = oldWake })
 	s := &config.Settings{
 		Chats:     map[string]config.ChatRule{"test": {Alias: "test", Peer: int64(-100123), Read: true}},
 		ChatOrder: []string{"test"},

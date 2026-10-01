@@ -47,6 +47,15 @@
   их передаёт прослойка (`ToolArgs.Agent` и `hello` раз в минуту); сессия
   ищется по `CLAUDE_CODE_SESSION_ID`. В уведомлении только alias и id, без
   текста сообщений.
+- T3 Code сам останавливает процесс Claude у треда, простоявшего 30 минут
+  (`ProviderSessionReaper`), — канала сессии больше нет. Запасной путь
+  (`internal/t3`): тред ищется по id сессии в `~/.t3/userdata/state.sqlite`
+  (`provider_session_runtime.resume_cursor_json.$.resume`), ход запускается
+  через API T3 (`thread.turn.start`). Токен с правами только на треды служба
+  выпускает сама (`auth pairing create` + `/oauth/token`), хранит в
+  `data/t3-token.json` и обновляет. Нет T3 или он не отвечает — путь просто
+  выключен (`t3.Unavailable`), остальное работает. Живой тест:
+  `go test -tags live -run Live ./internal/t3` (будит свой же тред).
 - Перезапуск службы руками: `Stop-ScheduledTask` НЕ убивает процесс —
   добивать `tgw.exe` с `serve` в командной строке через `Stop-Process`, потом
   `Start-ScheduledTask` (или `scripts\install-task.ps1`). Локи убитых процессов

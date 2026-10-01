@@ -321,16 +321,22 @@ var errStalled = errors.New("соединение с Telegram зависло —
 
 // Сторож соединения. После сна компьютера или смены сети (VPN) gotd бывает
 // не может переподключиться сам: запросы часами висят в waitSession, хотя
-// свежий клиент подключается сразу. Поэтому соединение проверяется пингом,
-// и зависшее — бросается: служба создаёт клиента заново.
+// свежий клиент подключается сразу. Поэтому соединение проверяется лёгким
+// запросом, и зависшее — бросается: служба создаёт клиента заново.
 const (
 	stallConnect = 2 * time.Minute  // не подключились за это время — заново
-	stallEvery   = 30 * time.Second // как часто пинговать
-	stallPing    = 20 * time.Second // сколько ждать ответа на пинг
+	stallEvery   = 30 * time.Second // как часто проверять
+	stallPing    = 20 * time.Second // сколько ждать ответа на проверку
 	stallMisses  = 3                // столько неудач подряд — зависло
 )
 
 func watchdog(ctx context.Context, client *telegram.Client, up <-chan struct{}, stall func(why string)) {
+	defer func() {
+		// паника внутри gotd не должна ронять службу — считаем соединение зависшим
+		if r := recover(); r != nil {
+			stall(fmt.Sprintf("сбой проверки соединения: %v", r))
+		}
+	}()
 	select {
 	case <-ctx.Done():
 		return
@@ -345,8 +351,11 @@ func watchdog(ctx context.Context, client *telegram.Client, up <-chan struct{}, 
 		if ctx.Err() != nil {
 			return
 		}
+		// не client.Ping: он пишет в транспорт, не дожидаясь сессии, и посреди
+		// переподключения gotd падает на nil (mtproto/write.go). Обычный запрос
+		// ждёт сессию — и честно не успевает, если соединение зависло.
 		pctx, cancel := context.WithTimeout(ctx, stallPing)
-		err := client.Ping(pctx)
+		_, err := client.API().HelpGetNearestDC(pctx)
 		cancel()
 		if ctx.Err() != nil {
 			return
@@ -356,7 +365,7 @@ func watchdog(ctx context.Context, client *telegram.Client, up <-chan struct{}, 
 			continue
 		}
 		if misses++; misses >= stallMisses {
-			stall(fmt.Sprintf("%d пинга подряд без ответа: %v", misses, err))
+			stall(fmt.Sprintf("%d проверки подряд без ответа: %v", misses, err))
 			return
 		}
 	}

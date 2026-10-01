@@ -146,6 +146,7 @@ type draftIn struct {
 	Note    string   `json:"note,omitempty" jsonschema:"зачем это сообщение и из какого проекта"`
 	Format  string   `json:"format,omitempty" jsonschema:"markdown (по умолчанию) или plain"`
 	Files   []string `json:"files,omitempty" jsonschema:"локальные пути к файлам, до 10 штук"`
+	AsFiles bool     `json:"as_files,omitempty" jsonschema:"картинки тоже файлами, без сжатия (по умолчанию jpg/png уходят фото)"`
 }
 
 type reactIn struct {
@@ -355,11 +356,16 @@ text — по умолчанию Markdown, Telegram отрисует его са
 format="plain" — отправить текст как есть, без разметки.
 До 32768 символов.
 
-files — локальные пути к файлам (до 10 штук), уходят документами без
-пережатия следом за текстом. Текст при этом можно не писать. Файлы
-копируются в момент вызова: владелец одобряет и получает ровно эту версию,
-правки после вызова не попадут — нужен новый черновик. Не принимаются
-файлы самого tg-agent, .env, ключи, сессии и прочие секреты.
+files — локальные пути к файлам (до 10 штук), уходят следом за текстом.
+Текст при этом можно не писать. Картинки jpg/png уходят ФОТО — видны прямо
+в ленте чата (Telegram их пережмёт); остальные файлы — документами без
+пережатия. Фото и документы приходят двумя альбомами. В ответе у каждого
+файла as = photo / document. Нужна картинка в исходном качестве, файлом —
+as_files=true. Картинку не надо выкладывать по ссылке, чтобы её было видно:
+достаточно передать её в files. Файлы копируются в момент вызова: владелец
+одобряет и получает ровно эту версию, правки после вызова не попадут —
+нужен новый черновик. Не принимаются файлы самого tg-agent, .env, ключи,
+сессии и прочие секреты.
 
 note — зачем это сообщение и из какого проекта; показывается в карточке,
 помогает человеку решить, не переспрашивая.
@@ -368,7 +374,7 @@ reply_to — id сообщения, на которое отвечаем (из t
 В режимах human_approval / agent_confirm смотри поле next_step из ответа.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in draftIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 10*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
-				return core.DraftMessage(ctx, s, in.Chat, in.Text, in.ReplyTo, in.Note, in.Format, in.Files)
+				return core.DraftMessage(ctx, s, in.Chat, in.Text, in.ReplyTo, in.Note, in.Format, in.Files, in.AsFiles)
 			})
 		})
 

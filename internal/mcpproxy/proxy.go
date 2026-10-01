@@ -164,6 +164,7 @@ func (p *proxy) noticeBuild(build string) {
 // (и тут, раз в минуту, если агент молчит).
 func (p *proxy) watch(ctx context.Context) {
 	tick := 0
+	greeted := p.hello(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -175,8 +176,8 @@ func (p *proxy) watch(ctx context.Context) {
 		p.mu.Lock()
 		exeChanged := err == nil && !st.ModTime().Equal(p.stamp)
 		p.mu.Unlock()
-		if tick%12 == 0 {
-			p.hello(ctx)
+		if !greeted || tick%12 == 0 {
+			greeted = p.hello(ctx) // не дошло (служба перезапускается) — повторим через 5 с
 		}
 		if exeChanged || tick%12 == 0 {
 			var status service.Status
@@ -195,10 +196,12 @@ func (p *proxy) watch(ctx context.Context) {
 
 // hello — напомнить службе адрес канала сессии: после возобновления сессии
 // или перезапуска службы подписки находят агента по нему.
-func (p *proxy) hello(ctx context.Context) {
-	if p.agent != nil {
-		_, _ = svc.Call(ctx, "hello", p.agent, nil)
+func (p *proxy) hello(ctx context.Context) bool {
+	if p.agent == nil {
+		return true
 	}
+	_, err := svc.Call(ctx, "hello", p.agent, nil)
+	return err == nil
 }
 
 // Run — обслуживать MCP по stdio.
@@ -214,7 +217,6 @@ func Run(ctx context.Context) error {
 		fmt.Fprintln(os.Stderr, "mcp: прослойка не поднялась, работаю напрямую:", err)
 		return mcpserver.Run(ctx)
 	}
-	p.hello(ctx)
 	go p.watch(ctx)
 	return p.server.Run(ctx, &mcp.StdioTransport{})
 }
