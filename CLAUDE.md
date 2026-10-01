@@ -56,6 +56,41 @@
   `data/t3-token.json` и обновляет. Нет T3 или он не отвечает — путь просто
   выключен (`t3.Unavailable`), остальное работает. Живой тест:
   `go test -tags live -run Live ./internal/t3` (будит свой же тред).
+- Агенты в контейнерах (README, «Агенты в контейнерах»). Инструменты — по
+  HTTP (`mcpserver/http.go`, служба слушает по `config/agents.toml`), у
+  вызова `s.Agent != nil`, а белый список в `s` уже урезан до чатов агента
+  (`config.Settings.Restrict`). Правила для нового кода:
+  - инструмент получает настройки только через `load(ctx)` / `run` в
+    mcpserver — иначе агент из контейнера увидит весь белый список;
+  - всё, что касается чата, — через `readable` / `sendable` (`s.Resolve`):
+    урезание держится на них; черновики — через `visibleDraft`;
+  - аудит действий агента — `logEvent(s, …)`, а не `audit.Log`: так в
+    записи есть имя агента;
+  - всё, что читает или пишет файлы на диске шлюза по просьбе агента
+    (вложения, скачивание), для `s.Agent != nil` отклонять;
+  - токены агентов сравнивать `subtle.ConstantTimeCompare`, не печатать и
+    не писать в аудит; `DisableLocalhostProtection` держится только на
+    обязательном bearer-токене.
+- Окружения T3 из `config/t3.toml` (`core/remote.go`, `t3/env.go`): там служба
+  будит только свои треды «TG: <чат>» (`data/t3-threads.json`), по сессии
+  Claude их не найти — курсор API не отдаёт. Работа с T3 — только через
+  `t3.Env`: после `thread.turn.start` конец хода определять по новому
+  `turnId` (снимок какое-то время показывает прошлый ход), а не по одному
+  `state`; `bootstrap.createThread` не использовать (500 «Thread does not
+  exist»). Новый ход — только когда прошлый кончился (`remoteRun.busy`,
+  `t3.Busy`). Тесты — на `t3test.Fake`; живые — `go test -tags live -run
+  LiveEnv ./internal/t3` и `-run LiveHTTP ./internal/mcpserver` на
+  контейнере `t3-bala` (его не останавливать и не пересоздавать; треды
+  тестов — с заголовком «TG: …»).
+- Профили (`config/profile.go`): каталоги только через `config.Home()`,
+  `DataPath()`, `ConfigDir()`, `EnvPath()`, `ChatsFile()` или методы
+  `Settings`; `config.Root` — это установка (bin/, AGENTS.md, scripts/), не
+  данные. Дочерние процессы получают профиль через `TG_PROFILE`, рабочий
+  процесс службы — ещё и флагом `--profile` (по нему install-task.ps1
+  отличает службы профилей). Основной профиль менять нельзя: его пути и имя
+  канала службы прежние (тест `TestAddressDefaultProfileUnchanged`).
+  Сессию основного профиля (`data/session.json`) не трогать и не
+  перелогинивать.
 - Перезапуск службы руками: `Stop-ScheduledTask` НЕ убивает процесс —
   добивать `tgw.exe` с `serve` в командной строке через `Stop-Process`, потом
   `Start-ScheduledTask` (или `scripts\install-task.ps1`). Локи убитых процессов
