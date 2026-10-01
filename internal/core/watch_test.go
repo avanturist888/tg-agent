@@ -39,6 +39,10 @@ func watchEnv(t *testing.T) *config.Settings {
 	oldWake := wakeT3
 	wakeT3 = func(context.Context, *config.Settings, string, string) error { return t3.Unavailable }
 	t.Cleanup(func() { wakeT3 = oldWake })
+	// «свои» сообщения — память процесса: прошлые тесты не должны в неё попадать
+	outMu.Lock()
+	clear(outIDs)
+	outMu.Unlock()
 	s := &config.Settings{
 		Chats:     map[string]config.ChatRule{"test": {Alias: "test", Peer: int64(-100123), Read: true}},
 		ChatOrder: []string{"test"},

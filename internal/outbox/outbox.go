@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"tgagent/internal/audit"
@@ -302,6 +303,8 @@ type CreateOpts struct {
 	Files   []FileSnap
 	// SendAt != nil — автоотправка: черновик сразу scheduled
 	SendAt *time.Time
+	// Origin — кто создал: "" — местный агент, "agent:<имя>" — агент из контейнера
+	Origin string
 }
 
 func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
@@ -322,7 +325,7 @@ func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
 		CreatedAt: audit.FormatTime(now),
 		ExpiresAt: audit.FormatTime(now.Add(time.Duration(opts.TTLMin) * time.Minute)),
 		Status:    Pending,
-		Origin:    "agent",
+		Origin:    cmpOr(opts.Origin, "agent"),
 		Fmt:       fmtName,
 		Files:     opts.Files,
 		Note:      opts.Note,
@@ -531,6 +534,22 @@ func (o *Outbox) NextDue() (*time.Time, error) {
 }
 
 // ApprovedBy — кем одобрен черновик (последнее событие approved).
+// AgentName — имя агента из контейнера, создавшего черновик ("" — местный агент).
+func (d *Draft) AgentName() string {
+	name, ok := strings.CutPrefix(d.Origin, "agent:")
+	if !ok {
+		return ""
+	}
+	return name
+}
+
+func cmpOr(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
 func (d *Draft) ApprovedBy() string {
 	by := ""
 	for _, h := range d.HistoryEvents() {

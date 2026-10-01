@@ -244,10 +244,14 @@ func fileLabel(f outbox.FileSnap, md bool) string {
 }
 
 func heading(d *outbox.Draft) string {
-	if d.Status == outbox.Scheduled || d.ApprovedBy() == "auto_send" {
-		return "Агент отправляет сообщение (автоотправка)"
+	who := "Агент"
+	if name := d.AgentName(); name != "" {
+		who = "Агент " + name // из контейнера: владелец видит, чей черновик
 	}
-	return "Агент просит отправить сообщение"
+	if d.Status == outbox.Scheduled || d.ApprovedBy() == "auto_send" {
+		return who + " отправляет сообщение (автоотправка)"
+	}
+	return who + " просит отправить сообщение"
 }
 
 // CardMarkdown — карточка: шапка, разделитель, сам текст, отрисованный так, как уйдёт.

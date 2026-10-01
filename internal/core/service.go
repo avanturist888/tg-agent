@@ -67,7 +67,11 @@ func ListChats(ctx context.Context, s *config.Settings, withStatus bool) (*omap.
 		item := rule.AsMap()
 		if rule.Read {
 			path := FeedPath(s, rule.Alias)
-			item.Set("feed", omap.New().Set("path", path).Set("last_id", LastID(path)))
+			feed := omap.New().Set("path", path).Set("last_id", LastID(path))
+			if s.Agent != nil {
+				feed = omap.New().Set("last_id", LastID(path)) // путь на диске шлюза агенту ни к чему
+			}
+			item.Set("feed", feed)
 		}
 		chats = append(chats, item)
 	}
@@ -163,7 +167,7 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 	if len(o.IDs) > 0 {
 		kv = append(kv, "ids", o.IDs)
 	}
-	_ = audit.Log(s.AuditPath(), "read", kv...)
+	logEvent(s, "read", kv...)
 	var oldest, newest any
 	if len(messages) > 0 {
 		oldest, _ = messages[0].Get("id")
@@ -237,6 +241,9 @@ func toInt(v any) int {
 
 // DownloadFile — вложение из разрешённого чата в data/downloads/<alias>/.
 func DownloadFile(ctx context.Context, s *config.Settings, chat string, messageID int) (*omap.Map, error) {
+	if s.Agent != nil {
+		return nil, &Bad{Msg: remoteNoDownload}
+	}
 	rule, err := readable(s, chat)
 	if err != nil {
 		return nil, err
@@ -253,7 +260,7 @@ func DownloadFile(ctx context.Context, s *config.Settings, chat string, messageI
 	if err != nil {
 		return nil, err
 	}
-	_ = audit.Log(s.AuditPath(), "download", "chat", rule.Alias, "message_id", messageID, "name", got.Name, "size", got.Size)
+	logEvent(s, "download", "chat", rule.Alias, "message_id", messageID, "name", got.Name, "size", got.Size)
 	var dur any
 	if got.Duration != nil {
 		dur = *got.Duration
@@ -312,7 +319,7 @@ func React(ctx context.Context, s *config.Settings, chat string, messageID int, 
 	if shown == "" {
 		shown = "(снята)"
 	}
-	_ = audit.Log(s.AuditPath(), "react", "chat", rule.Alias, "message_id", messageID, "emoji", shown)
+	logEvent(s, "react", "chat", rule.Alias, "message_id", messageID, "emoji", shown)
 	var emojiVal, now any
 	if emoji != "" {
 		emojiVal = emoji
@@ -341,7 +348,7 @@ func ViewMedia(ctx context.Context, s *config.Settings, chat string, messageID i
 	if err != nil {
 		return nil, nil, err
 	}
-	_ = audit.Log(s.AuditPath(), "view_media", "chat", rule.Alias, "message_id", messageID, "kind", img.Kind)
+	logEvent(s, "view_media", "chat", rule.Alias, "message_id", messageID, "kind", img.Kind)
 	meta := omap.New().Set("chat", rule.Alias).Set("message_id", messageID).Set("kind", img.Kind).
 		Set("caption", img.Caption).Set("bytes", len(img.Data))
 	return meta, img, nil
@@ -398,7 +405,7 @@ func TranscribeMessage(ctx context.Context, s *config.Settings, chat string, mes
 			return nil, err
 		}
 		if rpcErr != nil {
-			_ = audit.Log(s.AuditPath(), "transcribe", "chat", rule.Alias, "message_id", messageID, "error", rpcErr.Error())
+			logEvent(s, "transcribe", "chat", rule.Alias, "message_id", messageID, "error", rpcErr.Error())
 			return omap.New().Set("chat", rule.Alias).Set("message_id", messageID).Set("duration", durVal(duration)).
 				Set("transcript_status", "error").Set("transcript", nil).
 				Set("transcript_error", tgc.RPCErrorText(rpcErr)).
@@ -416,7 +423,7 @@ func TranscribeMessage(ctx context.Context, s *config.Settings, chat string, mes
 	if got.Status == "done" {
 		cache.Put(key, got.Text)
 	}
-	_ = audit.Log(s.AuditPath(), "transcribe", "chat", rule.Alias, "message_id", messageID, "status", got.Status)
+	logEvent(s, "transcribe", "chat", rule.Alias, "message_id", messageID, "status", got.Status)
 	out := omap.New().Set("chat", rule.Alias).Set("message_id", messageID).Set("duration", durVal(duration)).Set("cached", false)
 	tgc.ApplyTranscript(out, got)
 	return out, nil
@@ -458,6 +465,9 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 	if n := len([]rune(text)); n > 32768 {
 		return nil, &Bad{fmt.Sprintf("Слишком длинно: %d символов, предел Telegram — 32768.", n)}
 	}
+	if s.Agent != nil && len(files) > 0 {
+		return nil, &Bad{Msg: remoteNoFiles}
+	}
 	id := outbox.NewID()
 	var snaps []outbox.FileSnap
 	if len(files) > 0 {
@@ -467,7 +477,7 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 		}
 	}
 	opts := outbox.CreateOpts{ID: id, Chat: rule.Alias, Text: text, ReplyTo: replyTo, TTLMin: s.DraftTTLMin,
-		Note: note, Fmt: format, Files: snaps}
+		Note: note, Fmt: format, Files: snaps, Origin: draftOrigin(s)}
 	auto := rule.AutoSend()
 	if auto {
 		at := time.Now().Add(time.Duration(s.AutoSendDelaySec) * time.Second)
@@ -486,7 +496,7 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 	if auto {
 		kv = append(kv, "auto_send_at", *d.SendAt)
 	}
-	_ = audit.Log(s.AuditPath(), "draft", kv...)
+	logEvent(s, "draft", kv...)
 
 	filesOut := make([]*omap.Map, 0, len(d.Files))
 	for _, f := range d.Files {
@@ -538,6 +548,9 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 func WaitApproval(ctx context.Context, s *config.Settings, draftID string, timeoutSec int) (*omap.Map, error) {
 	d, err := outbox.New(s.OutboxPath()).Get(draftID)
 	if err != nil {
+		return nil, err
+	}
+	if err := visibleDraft(s, d); err != nil {
 		return nil, err
 	}
 	auto := d.Status == outbox.Scheduled || d.ApprovedBy() == "auto_send"
@@ -624,7 +637,7 @@ func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string
 	}
 	format, _ := result.Get("format")
 	reason, _ := result.Get("fallback_reason")
-	_ = audit.Log(s.AuditPath(), "send", "draft_id", draftID, "chat", rule.Alias, "message_id", msgID,
+	logEvent(s, "send", "draft_id", draftID, "chat", rule.Alias, "message_id", msgID,
 		"format", format, "fallback_reason", reason, "approved_by", by, "text", d.Text, "files", names)
 	return omap.New().Set("draft_id", draftID).Set("chat", rule.Alias).Set("sent", true).Merge(result), nil
 }
@@ -696,6 +709,9 @@ func ListDrafts(s *config.Settings, status string) (*omap.Map, error) {
 	}
 	rows := make([]*omap.Map, 0, len(drafts))
 	for _, d := range drafts {
+		if visibleDraft(s, d) != nil {
+			continue
+		}
 		row := omap.New().Set("id", d.ID).Set("chat", d.Chat).Set("status", d.Status).Set("text", d.Text).
 			Set("created_at", d.CreatedAt).Set("expires_at", d.ExpiresAt).Set("message_id", d.MessageID)
 		if d.SendAt != nil {
@@ -711,12 +727,23 @@ func ListDrafts(s *config.Settings, status string) (*omap.Map, error) {
 
 // CancelDraft — tg_cancel_draft / tg reject.
 func CancelDraft(ctx context.Context, s *config.Settings, draftID, by string) (*omap.Map, error) {
-	d, err := outbox.New(s.OutboxPath()).Cancel(draftID, by)
+	box := outbox.New(s.OutboxPath())
+	if s.Agent != nil {
+		cur, err := box.Get(draftID)
+		if err != nil {
+			return nil, err
+		}
+		if err := visibleDraft(s, cur); err != nil {
+			return nil, err
+		}
+		by = draftOrigin(s)
+	}
+	d, err := box.Cancel(draftID, by)
 	if err != nil {
 		return nil, err
 	}
 	attach.Drop(s, draftID)
-	_ = audit.Log(s.AuditPath(), "cancel", "draft_id", draftID, "chat", d.Chat, "by", by)
+	logEvent(s, "cancel", "draft_id", draftID, "chat", d.Chat, "by", by)
 	if d.BotMessageID != nil {
 		CloseCard(ctx, s, draftID, nil, fmt.Sprintf("✋ **Отменено** (%s).", bot.MDEscape(by)))
 	}

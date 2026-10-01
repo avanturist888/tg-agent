@@ -136,6 +136,9 @@ type Settings struct {
 	AutoSendDelaySec   int
 	Chats              map[string]ChatRule
 	ChatOrder          []string // порядок из chats.toml
+	// Agent — вызов от агента из контейнера (HTTP): Chats уже урезаны до его
+	// чатов (Restrict). nil — местный агент или владелец.
+	Agent *Agent
 }
 
 func (s *Settings) DataDir() string         { return filepath.Join(Root, "data") }

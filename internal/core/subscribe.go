@@ -80,7 +80,7 @@ func loadSubs(path string) map[string]*subscription {
 	return subs
 }
 
-func saveSubs(path string, subs map[string]*subscription) error {
+func saveSubs(path string, subs any) error {
 	raw, err := json.MarshalIndent(subs, "", "  ")
 	if err != nil {
 		return err
@@ -139,6 +139,13 @@ const noInbox = "Сессия не передала адрес своего вх
 
 // Subscribe — tg_subscribe: будить эту сессию при новых сообщениях в чате.
 func Subscribe(ctx context.Context, s *config.Settings, chat string, after int) (*omap.Map, error) {
+	if s.Agent != nil {
+		// агент из контейнера: будим не его сессию, а тред шлюза в его окружении
+		if s.Agent.Env == "" {
+			return nil, &Bad{Msg: "У агента " + s.Agent.Name + " не задано окружение T3 (env в config/agents.toml): будить некого."}
+		}
+		return SubscribeRemote(ctx, s, s.Agent.Env, chat, after, draftOrigin(s))
+	}
 	rule, err := readable(s, chat)
 	if err != nil {
 		return nil, err
@@ -182,6 +189,12 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, after int) 
 
 // Unsubscribe — tg_unsubscribe: chat == "" — снять все подписки сессии.
 func Unsubscribe(ctx context.Context, s *config.Settings, chat string) (*omap.Map, error) {
+	if s.Agent != nil {
+		if s.Agent.Env == "" {
+			return nil, &Bad{Msg: "У агента " + s.Agent.Name + " не задано окружение T3 (env в config/agents.toml)."}
+		}
+		return UnsubscribeRemote(s, s.Agent.Env, chat)
+	}
 	a := agentFrom(ctx)
 	if a == nil {
 		return nil, &Bad{Msg: noInbox}
@@ -268,7 +281,11 @@ func RunNotifier(ctx context.Context, loader func() (*config.Settings, error)) {
 		if err != nil || ctx.Err() != nil {
 			continue
 		}
-		if wait := notifyOnce(ctx, s, sent); wait > 0 {
+		wait := notifyOnce(ctx, s, sent)
+		if w := notifyRemote(ctx, s); w > 0 && (wait == 0 || w < wait) {
+			wait = w // треды шлюза в окружениях T3 (remote.go)
+		}
+		if wait > 0 {
 			time.AfterFunc(wait, pokeSubs)
 		}
 	}
