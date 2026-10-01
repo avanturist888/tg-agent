@@ -288,6 +288,9 @@ func TestRemoteAgentScope(t *testing.T) {
 	if _, err := WaitApproval(ctx, agent, foreign.ID, 1); !errors.As(err, &nf) {
 		t.Fatalf("ожидание чужого черновика: %v", err)
 	}
+	if _, err := SendDraft(ctx, agent, foreign.ID, ""); !errors.As(err, &nf) {
+		t.Fatalf("отправка чужого черновика: %v", err)
+	}
 	if _, err := CancelDraft(ctx, agent, foreign.ID, "agent"); !errors.As(err, &nf) {
 		t.Fatalf("отмена чужого черновика: %v", err)
 	}

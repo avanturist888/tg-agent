@@ -661,6 +661,9 @@ func SendDraft(ctx context.Context, s *config.Settings, draftID, confirmation st
 	if err != nil {
 		return nil, err
 	}
+	if err := visibleDraft(s, d); err != nil {
+		return nil, err
+	}
 	if _, err := sendable(s, d.Chat); err != nil {
 		return nil, err
 	}
