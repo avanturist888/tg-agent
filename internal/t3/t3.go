@@ -1,20 +1,28 @@
-// Package t3 — запасной путь пробуждения агентов, которые работают в T3 Code.
+// Package t3 — агенты, которые работают в T3 Code.
 //
-// T3 Code останавливает процесс Claude у треда, простоявшего 30 минут без
-// фоновой работы (ProviderSessionReaper), — вместе с процессом пропадает
-// входящий канал сессии, и разбудить агента через inbox нельзя. Тогда служба
-// просит сам T3 начать в треде ход (thread.turn.start): T3 возобновит сессию,
-// а уведомление появится в треде обычным сообщением.
+// Два пути.
+//
+// Местный десктоп (Wake). T3 Code останавливает процесс Claude у треда,
+// простоявшего 30 минут без фоновой работы (ProviderSessionReaper), — вместе
+// с процессом пропадает входящий канал сессии, и разбудить агента через inbox
+// нельзя. Тогда служба просит сам T3 начать в треде ход (thread.turn.start):
+// T3 возобновит сессию, а уведомление появится в треде обычным сообщением.
+// Тред ищется по id сессии Claude в базе десктопа (state.sqlite).
+//
+// Окружения из config/t3.toml (Env, env.go) — контейнеры со своим сервером
+// T3. Их базу не прочитать, а курсор сессии Claude API наружу не отдаёт,
+// поэтому там служба заводит свои треды (thread.create) и будит их по id.
 //
 // Всё здесь необязательное. Нет T3 Code, его сервер не отвечает или сменил
 // протокол — Wake возвращает Unavailable, и остальное работает как без него.
 // API и база T3 внутренние (alpha): после его обновления путь может сломаться,
 // подписки через inbox от этого не страдают.
 //
-// Доступ: встроенная команда T3 `auth pairing create` выдаёт одноразовый код,
-// он меняется на токен с правами только на треды (orchestration:read,
-// orchestration:operate). Токен живёт 30 дней и лежит в data/t3-token.json;
-// в списке сессий T3 он подписан tg-agent.
+// Доступ: одноразовый pairing-код (у десктопа — встроенная команда T3 `auth
+// pairing create`) меняется на токен с правами только на треды
+// (orchestration:read, orchestration:operate). Токен живёт 30 дней и лежит в
+// data/t3-token.json (у окружений — data/t3-token-<имя>.json); в списке
+// сессий T3 он подписан tg-agent.
 package t3
 
 import (
@@ -27,9 +35,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -53,8 +59,8 @@ const (
 )
 
 type install struct {
-	home   string // ~/.t3 (или T3CODE_HOME)
-	origin string // http://127.0.0.1:<порт>
+	home string // ~/.t3 (или T3CODE_HOME)
+	env  *Env   // его сервер: http://127.0.0.1:<порт>
 }
 
 var client = &http.Client{Timeout: 15 * time.Second}
@@ -80,15 +86,12 @@ func find(ctx context.Context) (*install, error) {
 	if json.Unmarshal(raw, &rt) != nil || rt.Port == 0 {
 		return nil, Unavailable
 	}
-	in.origin = fmt.Sprintf("http://127.0.0.1:%d", rt.Port)
-	var env struct {
-		Protocol int `json:"orchestrationProtocolVersion"`
-	}
-	if err := in.call(ctx, http.MethodGet, "/.well-known/t3/environment", "", nil, &env); err != nil {
-		return nil, Unavailable
-	}
-	if env.Protocol != protocolVersion {
-		return nil, fmt.Errorf("%w: протокол T3 %d, а не %d", Unavailable, env.Protocol, protocolVersion)
+	in.env = &Env{Name: "local", Origin: fmt.Sprintf("http://127.0.0.1:%d", rt.Port), pairing: in.pairingCode,
+		revoke: func(ctx context.Context, sid string) {
+			_, _ = in.cli(ctx, "auth", "session", "revoke", "--base-dir", in.home, sid)
+		}}
+	if _, _, err := in.env.Descriptor(ctx); err != nil {
+		return nil, err
 	}
 	return in, nil
 }
@@ -127,103 +130,13 @@ func Wake(ctx context.Context, tokenPath, session, text string) error {
 	if err != nil {
 		return err
 	}
-	tok, err := in.token(ctx, tokenPath, false)
-	if err != nil {
-		return err
-	}
-	err = in.wake(ctx, tok, thread, text)
-	var st *statusError
-	if errors.As(err, &st) && st.code == http.StatusUnauthorized {
-		// токен отозвали в T3 — выпускаем новый
-		if tok, err = in.token(ctx, tokenPath, true); err != nil {
-			return err
-		}
-		err = in.wake(ctx, tok, thread, text)
+	in.env.TokenPath = tokenPath
+	// процесс сессии уже остановлен, так что «идущий» ход в снимке — старый
+	_, err = in.env.startTurn(ctx, thread, text, true)
+	if errors.Is(err, ThreadGone) {
+		return NoThread // тред удалён или в архиве — владелец его закрыл, не тревожим
 	}
 	return err
-}
-
-func (in *install) wake(ctx context.Context, tok, thread, text string) error {
-	var detail struct {
-		Thread struct {
-			RuntimeMode     string  `json:"runtimeMode"`
-			InteractionMode string  `json:"interactionMode"`
-			ArchivedAt      *string `json:"archivedAt"`
-		} `json:"thread"`
-	}
-	if err := in.call(ctx, http.MethodGet, "/api/orchestration/threads/"+url.PathEscape(thread), tok, nil, &detail); err != nil {
-		return err
-	}
-	if detail.Thread.ArchivedAt != nil {
-		return NoThread // тред в архиве — владелец его закрыл, не тревожим
-	}
-	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	cmd := map[string]any{
-		"type":      "thread.turn.start",
-		"commandId": randomID(),
-		"threadId":  thread,
-		"message": map[string]any{
-			"messageId":   randomID(),
-			"role":        "user",
-			"text":        text,
-			"attachments": []any{},
-		},
-		"runtimeMode":     detail.Thread.RuntimeMode,
-		"interactionMode": detail.Thread.InteractionMode,
-		"createdAt":       now,
-	}
-	return in.call(ctx, http.MethodPost, "/api/orchestration/dispatch", tok, cmd, nil)
-}
-
-// ── токен ────────────────────────────────────────────────────────────────
-
-type savedToken struct {
-	Origin  string    `json:"origin"`
-	Token   string    `json:"token"`
-	Expires time.Time `json:"expires"`
-}
-
-// token — действующий токен: из data/, а если его нет, он истекает или
-// fresh — новый (старый при этом отзывается).
-func (in *install) token(ctx context.Context, path string, fresh bool) (string, error) {
-	var old savedToken
-	if raw, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(raw, &old)
-	}
-	if !fresh && old.Token != "" && old.Origin == in.origin && time.Until(old.Expires) > renewBefore {
-		return old.Token, nil
-	}
-	code, err := in.pairingCode(ctx)
-	if err != nil {
-		return "", err
-	}
-	form := url.Values{
-		"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
-		"subject_token":        {code},
-		"subject_token_type":   {"urn:t3:params:oauth:token-type:environment-bootstrap"},
-		"requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
-		"scope":                {tokenScopes},
-		"client_label":         {tokenLabel},
-	}
-	var res struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int64  `json:"expires_in"`
-	}
-	if err := in.call(ctx, http.MethodPost, "/oauth/token", "", form, &res); err != nil {
-		return "", fmt.Errorf("токен T3: %w", err)
-	}
-	if res.AccessToken == "" {
-		return "", errors.New("токен T3: пустой ответ")
-	}
-	tok := savedToken{Origin: in.origin, Token: res.AccessToken, Expires: time.Now().Add(time.Duration(res.ExpiresIn) * time.Second)}
-	raw, _ := json.MarshalIndent(tok, "", "  ")
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return "", err
-	}
-	if sid := tokenSession(old.Token); sid != "" {
-		_, _ = in.cli(ctx, "auth", "session", "revoke", "--base-dir", in.home, sid)
-	}
-	return tok.Token, nil
 }
 
 // pairingCode — одноразовый код от встроенной команды T3 (живёт 5 минут).
@@ -232,16 +145,11 @@ func (in *install) pairingCode(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var p struct {
-		Credential string `json:"credential"`
-	}
-	if i := bytes.IndexByte(out, '{'); i >= 0 {
-		out = out[i:]
-	}
-	if json.Unmarshal(out, &p) != nil || p.Credential == "" {
+	code := credential(out)
+	if code == "" {
 		return "", errors.New("команда T3 не выдала код доступа")
 	}
-	return p.Credential, nil
+	return code, nil
 }
 
 // cli — команда сервера T3 (тот же exe в режиме node).
@@ -303,55 +211,6 @@ func tokenSession(tok string) string {
 	}
 	_ = json.Unmarshal(raw, &claims)
 	return claims.Sid
-}
-
-// ── HTTP ─────────────────────────────────────────────────────────────────
-
-type statusError struct {
-	code int
-	body string
-}
-
-func (e *statusError) Error() string { return fmt.Sprintf("T3 ответил %d: %s", e.code, e.body) }
-
-// call — запрос к серверу T3. body: url.Values — форма, иначе JSON.
-func (in *install) call(ctx context.Context, method, path, tok string, body, out any) error {
-	var rd io.Reader
-	ctype := ""
-	switch b := body.(type) {
-	case nil:
-	case url.Values:
-		rd, ctype = strings.NewReader(b.Encode()), "application/x-www-form-urlencoded"
-	default:
-		raw, err := json.Marshal(b)
-		if err != nil {
-			return err
-		}
-		rd, ctype = bytes.NewReader(raw), "application/json"
-	}
-	req, err := http.NewRequestWithContext(ctx, method, in.origin+path, rd)
-	if err != nil {
-		return err
-	}
-	if ctype != "" {
-		req.Header.Set("Content-Type", ctype)
-	}
-	if tok != "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if resp.StatusCode/100 != 2 {
-		return &statusError{code: resp.StatusCode, body: tail(string(raw), 300)}
-	}
-	if out != nil {
-		return json.Unmarshal(raw, out)
-	}
-	return nil
 }
 
 func randomID() string {
