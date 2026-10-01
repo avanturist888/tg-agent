@@ -64,7 +64,8 @@ type Status struct {
 	Started    time.Time `json:"started"`
 	Connected  bool      `json:"connected"`
 	Authorized bool      `json:"authorized"`
-	Buttons    bool      `json:"buttons"` // слушает кнопки бота
+	Buttons    bool      `json:"buttons"`            // слушает кнопки бота
+	MCPHTTP    string    `json:"mcp_http,omitempty"` // адрес MCP по HTTP для агентов из контейнеров
 }
 
 // Check — живая проверка для doctor и окна.
@@ -162,7 +163,7 @@ func init() {
 		"status": {fn: func(ctx context.Context, _ json.RawMessage) (any, error) {
 			connected, authorized := tgc.ServiceAuthorized()
 			return Status{Build: config.Build, PID: os.Getpid(), Started: started, Connected: connected,
-				Authorized: authorized, Buttons: buttonsActive.Load()}, nil
+				Authorized: authorized, Buttons: buttonsActive.Load(), MCPHTTP: HTTPAddr()}, nil
 		}},
 		"login_begin": {fn: withSettings(func(ctx context.Context, s *config.Settings, a ValueArgs) (any, error) {
 			phone := a.Value

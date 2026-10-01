@@ -427,7 +427,9 @@ func (e *Env) Thread(ctx context.Context, id string) (*Thread, error) {
 	return snap.Thread, nil
 }
 
-// project — проект, в котором шлюз заводит треды.
+// PickProject — проект, в котором шлюз заводит треды.
+func (e *Env) PickProject(sh *Shell) (*Project, error) { return e.project(sh) }
+
 func (e *Env) project(sh *Shell) (*Project, error) {
 	if len(sh.Projects) == 0 {
 		return nil, fmt.Errorf("в окружении T3 %s нет ни одного проекта (t3 project add …)", e.Name)

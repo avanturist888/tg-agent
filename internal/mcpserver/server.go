@@ -79,7 +79,7 @@ func text(s string) *mcp.CallToolResult {
 
 // run — единая точка входа: конфиг, вызов, человекочитаемая ошибка вместо трейса.
 func run(ctx context.Context, limit time.Duration, fn func(ctx context.Context, s *config.Settings) (*omap.Map, error)) (*mcp.CallToolResult, any, error) {
-	s, err := config.Load()
+	s, err := load(ctx)
 	if err != nil {
 		return text(errorText(err)), nil, nil
 	}
@@ -277,7 +277,7 @@ tg_download_file и расшифруй своим STT.`},
 чтобы увидеть альбом целиком, смотри каждое. Не открывай все фото чата
 подряд без нужды — только те, что важны для задачи.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in msgIn) (*mcp.CallToolResult, any, error) {
-			s, err := config.Load()
+			s, err := load(ctx)
 			if err != nil {
 				return text(errorText(err)), nil, nil
 			}

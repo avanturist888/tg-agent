@@ -89,6 +89,8 @@ func init() {
 		{name: "feeds", help: "состояние лент новых сообщений", run: cmdFeeds},
 		{name: "doctor", help: "проверить конфигурацию", run: cmdDoctor},
 		{name: "mcp", help: "MCP-сервер для Claude Code (stdio)", run: cmdMCP},
+		{name: "t3", help: "окружения T3 Code в контейнерах и треды шлюза (tg t3 help)", run: cmdT3},
+		{name: "agents", help: "агенты из контейнеров: MCP по HTTP (--new-token — токен для .env)", run: cmdAgents},
 		{name: "gui", help: "окно управления: чаты, черновики, настройки", run: cmdGUI},
 		// служебные: их запускает сама программа
 		{name: "tool-list", run: cmdToolList},
@@ -865,6 +867,7 @@ func cmdDoctor(ctx context.Context, args []string) int {
 		}
 		fmt.Printf("    [%s] %-16s %s  %s\n", flags, r.Alias, r.PeerString(), r.Title)
 	}
+	problems = append(problems, doctorRemote(s, up, status)...)
 	if len(problems) > 0 {
 		fmt.Println("\nЧто поправить:")
 		for _, p := range problems {

@@ -219,6 +219,50 @@ func RemoteSubs(s *config.Settings) []*omap.Map {
 	return out
 }
 
+// CheckRemote — живая проверка окружения: сервер, протокол, токен, проект,
+// живы ли треды шлюза (CLI `tg t3 check`).
+func CheckRemote(ctx context.Context, s *config.Settings, env string) (*omap.Map, error) {
+	e, err := remoteEnv(env)
+	if err != nil {
+		return nil, err
+	}
+	label, version, err := e.Descriptor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sh, err := e.Shell(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("токен: %w", err)
+	}
+	out := omap.New().Set("env", e.Name).Set("origin", e.Origin).Set("label", label).Set("version", version).
+		Set("token", "ok").Set("projects", len(sh.Projects))
+	if p, err := e.PickProject(sh); err != nil {
+		out.Set("project_error", err.Error())
+	} else {
+		out.Set("project", p.WorkspaceRoot)
+	}
+	alive := map[string]bool{}
+	for _, th := range sh.Threads {
+		alive[th.ID] = th.ArchivedAt == nil
+	}
+	var threads []*omap.Map
+	remoteMu.Lock()
+	subs := loadRemote(remotePath(s))
+	remoteMu.Unlock()
+	for _, sub := range subs {
+		if !strings.EqualFold(sub.Env, e.Name) || sub.Thread == "" {
+			continue
+		}
+		state := "есть"
+		if !alive[sub.Thread] {
+			state = "нет на сервере — служба заведёт новый при следующем сообщении"
+		}
+		threads = append(threads, omap.New().Set("chat", sub.Chat).Set("thread", sub.Thread).
+			Set("subscribed", sub.On).Set("state", state))
+	}
+	return out.Set("gateway_threads", threads), nil
+}
+
 // ── пробуждение ──────────────────────────────────────────────────────────
 
 func threadTitle(rule config.ChatRule) string {
