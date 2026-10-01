@@ -20,8 +20,11 @@
 - Реакции агент ставит сразу, без одобрения, но только в чатах с `send = true`;
   каждая пишется в аудит, выключаются целиком `TG_REACTIONS=off` в `.env`.
 - Подписка на чаты: служба получает новые сообщения от Telegram сразу и
-  дописывает их id в `data/feeds/<alias>.ids`, агенты следят за файлом
-  (`tg watch <alias>` через Monitor) и не опрашивают Telegram сами.
+  дописывает их id в `data/feeds/<alias>.ids`. Подписавшегося агента
+  (`tg_subscribe`) служба будит сама — через входящий канал его сессии Claude
+  Code (cross-session messaging; подписки — в `data/subscriptions.json`).
+  Запасной путь — `tg watch <alias>` через Monitor. Telegram агенты сами не
+  опрашивают.
 - Голосовые и кружки агент получает расшифрованными — встроенной функцией
   Telegram (Premium), с кэшем в `data/transcripts.json`.
 - Сессия Telegram лежит локально в `data/session.json`, аудит всех действий —

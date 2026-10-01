@@ -22,6 +22,7 @@ import (
 	"tgagent/internal/chatsfile"
 	"tgagent/internal/config"
 	"tgagent/internal/core"
+	"tgagent/internal/inbox"
 	"tgagent/internal/mcpproxy"
 	"tgagent/internal/mcpserver"
 	"tgagent/internal/omap"
@@ -687,7 +688,11 @@ func cmdMCP(ctx context.Context, args []string) int {
 }
 
 func cmdServe(ctx context.Context, args []string) int {
-	if err := service.Run(ctx, config.Load); err != nil && !errors.Is(err, context.Canceled) {
+	run := service.Supervise // надзиратель: поднимает упавший рабочий процесс
+	if len(args) > 0 && args[0] == service.WorkerArg {
+		run = service.Run
+	}
+	if err := run(ctx, config.Load); err != nil && !errors.Is(err, context.Canceled) {
 		return fail(err)
 	}
 	return 0
@@ -711,7 +716,9 @@ func cmdToolCall(ctx context.Context, args []string) int {
 		return fail(err)
 	}
 	var res mcp.CallToolResult
-	if err := service.Do(ctx, "tool", service.ToolArgs{Name: args[0], Args: json.RawMessage(raw)}, &res); err != nil {
+	// запущены из сессии Claude Code (прослойкой или агентом) — её канал для tg_subscribe
+	ta := service.ToolArgs{Name: args[0], Args: json.RawMessage(raw), Agent: inbox.FromEnv()}
+	if err := service.Do(ctx, "tool", ta, &res); err != nil {
 		res = *mcpserver.Failed(err)
 	}
 	return writeJSON(&res)

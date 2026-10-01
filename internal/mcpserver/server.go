@@ -119,6 +119,15 @@ type readChatIn struct {
 	IDs      []int  `json:"ids,omitempty" jsonschema:"конкретные сообщения по id (тогда limit, before_id, after_id не нужны)"`
 }
 
+type subscribeIn struct {
+	Chat    string `json:"chat" jsonschema:"alias из tg_list_chats"`
+	AfterID int    `json:"after_id,omitempty" jsonschema:"последний обработанный id: о более новых сообщат сразу"`
+}
+
+type unsubscribeIn struct {
+	Chat string `json:"chat,omitempty" jsonschema:"alias; без него — все подписки сессии"`
+}
+
 type msgIn struct {
 	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
 	MessageID int    `json:"message_id" jsonschema:"id сообщения из tg_read_chat"`
@@ -183,18 +192,50 @@ with_status=true дополнительно тянет число непрочи
 
 У читаемых чатов есть feed: path — локальный файл, куда служба сразу по
 приходу дописывает id новых сообщений (по одному на строку), last_id —
-последний из них. Так следят за чатом без опроса Telegram: сравни
-last_id со своим последним обработанным id и, если он больше, забери
-новое через tg_read_chat(after_id=<твой последний id>). Подписка с
-уведомлениями: запусти инструментом Monitor (не фоновым Bash — его вывод
-до тебя не доходит), timeout_ms 1800000, команду
-` + "`<TG> watch <alias> --after <последний обработанный id>`" + `
-— она печатает «alias id» на каждое новое сообщение. Monitor живёт до
-30 минут и не переживает возобновления сессии — перезапускай его (подробно
-в AGENTS.md, «Как следить за чатом»).`)},
+последний из них. Сравни last_id со своим последним обработанным id и,
+если он больше, забери новое через tg_read_chat(after_id=<твой последний id>).
+
+Чтобы узнавать о новых сообщениях сразу, подпишись: tg_subscribe — служба
+сама разбудит эту сессию, когда в чате появится сообщение (подробно в
+AGENTS.md, «Как следить за чатом»).`)},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in listChatsIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 				return core.ListChats(ctx, s, in.WithStatus)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_subscribe", Description: localPaths(`Подписать эту сессию на новые сообщения разрешённого чата.
+
+Когда в чате появится сообщение, служба tg-agent сама пришлёт в эту сессию
+уведомление — даже если ты в этот момент ничего не делаешь: оно начнёт
+новый ход. Опрашивать ленту, держать Monitor и перезапускать его не нужно.
+Уведомление приходит как сообщение «от другой сессии» с подписью
+tg-agent: в нём alias, сколько новых и готовый вызов
+tg_read_chat(chat, after_id) — текст сообщений читай им. Свои отправки
+(агента и владельца) не будят.
+
+chat     — alias из tg_list_chats (нужно can_read)
+after_id — твой последний обработанный id: о том, что новее, сообщат
+           сразу. Без него — только о сообщениях после подписки.
+
+Подписка живёт, пока жива сессия, и переживает перезапуск службы и
+возобновление сессии. Повторный вызов безопасен — он лишь переставляет
+after_id. На несколько чатов — по вызову на каждый.
+Отписаться — tg_unsubscribe.
+Без службы или в старой сессии (до обновления tg-agent) вернёт ошибку —
+тогда следи через Monitor и ` + "`<TG> watch`" + ` (AGENTS.md).`)},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in subscribeIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.Subscribe(ctx, s, in.Chat, in.AfterID)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_unsubscribe", Description: `Снять подписку этой сессии на чат (tg_subscribe).
+
+chat — alias; без него снимаются все подписки сессии.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in unsubscribeIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.Unsubscribe(ctx, s, in.Chat)
 			})
 		})
 

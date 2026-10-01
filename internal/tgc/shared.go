@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/session"
+	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/tg"
@@ -167,8 +168,9 @@ func (ServiceOwned) Error() string {
 
 func serviceUp(ctx context.Context) bool { return !InService() && svc.Up(ctx) }
 
-// OnMessage — новое сообщение в любом чате аккаунта (peer, id сообщения).
-type OnMessage func(ctx context.Context, c *Conn, peer tg.PeerClass, msgID int)
+// OnMessage — новое сообщение в любом чате аккаунта (peer, id сообщения;
+// out — исходящее, от владельца или агента).
+type OnMessage func(ctx context.Context, c *Conn, peer tg.PeerClass, msgID int, out bool)
 
 // Serve — держать постоянное соединение, пока не отменят ctx. Переподключается
 // сам. onMessage получает каждое новое сообщение; onReady вызывается после
@@ -244,14 +246,14 @@ func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage,
 	d.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
 		c.Peers.RememberEntities(e)
 		if peer := messagePeer(u.Message); peer != nil {
-			onMessage(ctx, c, peer, u.Message.GetID())
+			onMessage(ctx, c, peer, u.Message.GetID(), messageOut(u.Message))
 		}
 		return nil
 	})
 	d.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
 		c.Peers.RememberEntities(e)
 		if peer := messagePeer(u.Message); peer != nil {
-			onMessage(ctx, c, peer, u.Message.GetID())
+			onMessage(ctx, c, peer, u.Message.GetID(), messageOut(u.Message))
 		}
 		return nil
 	})
@@ -265,7 +267,17 @@ func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage,
 		return err
 	}
 	c.Client = client
-	return client.Run(ctx, func(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	up := make(chan struct{})
+	var stalled atomic.Bool
+	go watchdog(ctx, client, up, func(why string) {
+		_ = audit.Log(s.AuditPath(), "service_stalled", "reason", why)
+		stalled.Store(true)
+		cancel()
+	})
+	err = client.Run(ctx, func(ctx context.Context) error {
+		close(up)
 		c.API = client.API()
 		st, err := client.Auth().Status(ctx)
 		if err != nil {
@@ -299,6 +311,55 @@ func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage,
 			}
 		}})
 	})
+	if stalled.Load() {
+		return errStalled
+	}
+	return err
+}
+
+var errStalled = errors.New("соединение с Telegram зависло — клиент пересоздан")
+
+// Сторож соединения. После сна компьютера или смены сети (VPN) gotd бывает
+// не может переподключиться сам: запросы часами висят в waitSession, хотя
+// свежий клиент подключается сразу. Поэтому соединение проверяется пингом,
+// и зависшее — бросается: служба создаёт клиента заново.
+const (
+	stallConnect = 2 * time.Minute  // не подключились за это время — заново
+	stallEvery   = 30 * time.Second // как часто пинговать
+	stallPing    = 20 * time.Second // сколько ждать ответа на пинг
+	stallMisses  = 3                // столько неудач подряд — зависло
+)
+
+func watchdog(ctx context.Context, client *telegram.Client, up <-chan struct{}, stall func(why string)) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-up:
+	case <-time.After(stallConnect):
+		stall("не подключились за " + stallConnect.String())
+		return
+	}
+	misses := 0
+	for {
+		sleep(ctx, stallEvery)
+		if ctx.Err() != nil {
+			return
+		}
+		pctx, cancel := context.WithTimeout(ctx, stallPing)
+		err := client.Ping(pctx)
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			misses = 0
+			continue
+		}
+		if misses++; misses >= stallMisses {
+			stall(fmt.Sprintf("%d пинга подряд без ответа: %v", misses, err))
+			return
+		}
+	}
 }
 
 func messagePeer(m tg.MessageClass) tg.PeerClass {
@@ -309,6 +370,16 @@ func messagePeer(m tg.MessageClass) tg.PeerClass {
 		return v.PeerID
 	}
 	return nil
+}
+
+func messageOut(m tg.MessageClass) bool {
+	switch v := m.(type) {
+	case *tg.Message:
+		return v.Out
+	case *tg.MessageService:
+		return v.Out
+	}
+	return false
 }
 
 func sleep(ctx context.Context, d time.Duration) {

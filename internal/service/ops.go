@@ -20,6 +20,7 @@ import (
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
 	"tgagent/internal/core"
+	"tgagent/internal/inbox"
 	"tgagent/internal/lock"
 	"tgagent/internal/mcpserver"
 	"tgagent/internal/svc"
@@ -31,6 +32,8 @@ import (
 type ToolArgs struct {
 	Name string          `json:"name"`
 	Args json.RawMessage `json:"args,omitempty"`
+	// Agent — входящий канал сессии Claude Code, от которой вызов (для tg_subscribe)
+	Agent *inbox.Addr `json:"agent,omitempty"`
 }
 
 type LimitArgs struct {
@@ -119,8 +122,11 @@ func init() {
 			if err != nil {
 				return nil, &core.Bad{Msg: "аргументы: " + err.Error()}
 			}
-			return mcpserver.CallTool(ctx, a.Name, a.Args)
+			return mcpserver.CallTool(core.WithAgent(ctx, a.Agent), a.Name, a.Args)
 		}},
+		"hello": {fn: withSettings(func(ctx context.Context, s *config.Settings, a inbox.Addr) (any, error) {
+			return map[string]bool{"ok": true}, core.Hello(s, a)
+		})},
 		"self": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, _ struct{}) (any, error) {
 			var me Self
 			err := tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {

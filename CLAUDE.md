@@ -35,6 +35,18 @@
   перечитывает список инструментов (`tools/list_changed`). Логику держать в
   `internal/core` и инструментах, а не в прослойке: её код обновляется только
   с новой сессией.
+- `tgw.exe serve` — надзиратель (`service.Supervise`): запускает рабочий
+  процесс `serve --worker`, поднимает его после падения (`service_crashed` в
+  аудите) и пишет его вывод, включая трассировки паник, в `data/service.log`.
+  Рабочий привязан к job object и умирает вместе с надзирателем. Зависшее
+  соединение gotd служба пересоздаёт сама (сторож в `tgc/shared.go`,
+  `service_stalled`).
+- Подписки агентов (`tg_subscribe`, `core/subscribe.go`): служба будит сессию
+  Claude Code через её входящий канал (`internal/inbox`, cross-session
+  messaging). Адрес и токен канала есть только в окружении потомков сессии —
+  их передаёт прослойка (`ToolArgs.Agent` и `hello` раз в минуту); сессия
+  ищется по `CLAUDE_CODE_SESSION_ID`. В уведомлении только alias и id, без
+  текста сообщений.
 - Перезапуск службы руками: `Stop-ScheduledTask` НЕ убивает процесс —
   добивать `tgw.exe` с `serve` в командной строке через `Stop-Process`, потом
   `Start-ScheduledTask` (или `scripts\install-task.ps1`). Локи убитых процессов

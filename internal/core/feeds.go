@@ -117,8 +117,12 @@ func PollOnce(ctx context.Context, s *config.Settings) (map[string]int, error) {
 				}
 				var ids []int
 				for i := len(batch.Messages) - 1; i >= 0; i-- {
-					if id := batch.Messages[i].GetID(); id > known {
+					m := batch.Messages[i]
+					if id := m.GetID(); id > known {
 						ids = append(ids, id)
+						if o, ok := m.(interface{ GetOut() bool }); ok && o.GetOut() {
+							markOutgoing(alias, id)
+						}
 					}
 				}
 				n, err := appendNewer(path, ids)
@@ -153,7 +157,11 @@ func appendNewer(path string, ids []int) (int, error) {
 	if len(fresh) == 0 {
 		return 0, nil
 	}
-	return len(fresh), appendIDs(path, fresh)
+	if err := appendIDs(path, fresh); err != nil {
+		return 0, err
+	}
+	pokeSubs()
+	return len(fresh), nil
 }
 
 // ruleMarkedID — id чата из белого списка в формате Bot API (0 — пока неизвестен).
@@ -177,7 +185,7 @@ func ruleMarkedID(rule config.ChatRule, c *tgc.Conn) int64 {
 // FeedOnMessage — обработчик новых сообщений для службы: дописать id в ленту
 // разрешённого чата сразу, как Telegram прислал сообщение.
 func FeedOnMessage(loader func() (*config.Settings, error)) tgc.OnMessage {
-	return func(ctx context.Context, c *tgc.Conn, peer tg.PeerClass, msgID int) {
+	return func(ctx context.Context, c *tgc.Conn, peer tg.PeerClass, msgID int, out bool) {
 		s, err := loader()
 		if err != nil {
 			return
@@ -187,6 +195,9 @@ func FeedOnMessage(loader func() (*config.Settings, error)) tgc.OnMessage {
 			if !rule.Read || ruleMarkedID(rule, c) != marked {
 				continue
 			}
+			if out {
+				markOutgoing(rule.Alias, msgID)
+			}
 			if _, err := appendNewer(FeedPath(s, rule.Alias), []int{msgID}); err != nil {
 				_ = audit.Log(s.AuditPath(), "feed_write_failed", "chat", rule.Alias, "error", err.Error())
 			}
@@ -195,9 +206,9 @@ func FeedOnMessage(loader func() (*config.Settings, error)) tgc.OnMessage {
 }
 
 // Watch печатает «alias id» на каждое новое сообщение — для Monitor в Claude
-// Code. Читает только локальные файлы лент, к Telegram не ходит. after > 0 —
-// сразу выдать и то, что пришло после этого id (подписку перезапустили, а
-// сообщения за перерыв терять нельзя).
+// Code (там, где tg_subscribe недоступен). Читает только локальные файлы
+// лент, к Telegram не ходит. after > 0 — сразу выдать и то, что пришло после
+// этого id (подписку перезапустили, а сообщения за перерыв терять нельзя).
 func Watch(ctx context.Context, s *config.Settings, aliases []string, after int, out io.Writer) error {
 	var rules []config.ChatRule
 	if len(aliases) > 0 {

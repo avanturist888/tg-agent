@@ -39,10 +39,14 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	done := make(chan struct{}, 3)
+	done := make(chan struct{}, 4)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		_ = srv.Serve(ctx)
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		core.RunNotifier(ctx, loader) // будить подписанные сессии агентов
 	}()
 	go func() {
 		defer func() { done <- struct{}{} }()
@@ -71,7 +75,7 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 		}
 	}
 	<-ctx.Done()
-	for range 3 {
+	for range 4 {
 		<-done
 	}
 	_ = audit.Log(s.AuditPath(), "service_stop")

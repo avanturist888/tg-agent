@@ -23,6 +23,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"tgagent/internal/config"
+	"tgagent/internal/inbox"
 	"tgagent/internal/mcpserver"
 	"tgagent/internal/service"
 	"tgagent/internal/svc"
@@ -62,6 +63,9 @@ type proxy struct {
 	names  map[string]bool
 	build  string    // сборка службы, с которой взят список
 	stamp  time.Time // время exe, с которого взят список (служба не запущена)
+	// agent — входящий канал нашей сессии Claude Code: по нему служба будит
+	// агента (tg_subscribe). Знаем его только мы — потомок сессии.
+	agent *inbox.Addr
 }
 
 // tools — список инструментов: у службы, а без неё — у свежего exe.
@@ -119,7 +123,7 @@ func (p *proxy) handler(name string) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := json.RawMessage(req.Params.Arguments)
 		var res mcp.CallToolResult
-		build, err := svc.Call(ctx, "tool", service.ToolArgs{Name: name, Args: args}, &res)
+		build, err := svc.Call(ctx, "tool", service.ToolArgs{Name: name, Args: args, Agent: p.agent}, &res)
 		if err == nil {
 			p.noticeBuild(build)
 			return &res, nil
@@ -171,6 +175,9 @@ func (p *proxy) watch(ctx context.Context) {
 		p.mu.Lock()
 		exeChanged := err == nil && !st.ModTime().Equal(p.stamp)
 		p.mu.Unlock()
+		if tick%12 == 0 {
+			p.hello(ctx)
+		}
 		if exeChanged || tick%12 == 0 {
 			var status service.Status
 			if build, err := svc.Call(ctx, "status", nil, &status); err == nil {
@@ -186,18 +193,28 @@ func (p *proxy) watch(ctx context.Context) {
 	}
 }
 
+// hello — напомнить службе адрес канала сессии: после возобновления сессии
+// или перезапуска службы подписки находят агента по нему.
+func (p *proxy) hello(ctx context.Context) {
+	if p.agent != nil {
+		_, _ = svc.Call(ctx, "hello", p.agent, nil)
+	}
+}
+
 // Run — обслуживать MCP по stdio.
 func Run(ctx context.Context) error {
 	p := &proxy{
 		server: mcp.NewServer(&mcp.Implementation{Name: "telegram", Version: "0.3.0"},
 			&mcp.ServerOptions{Instructions: mcpserver.Instructions()}),
 		names: map[string]bool{},
+		agent: inbox.FromEnv(),
 	}
 	if err := p.load(ctx); err != nil {
 		// ни службы, ни свежего exe — работаем своим кодом, чем ничем
 		fmt.Fprintln(os.Stderr, "mcp: прослойка не поднялась, работаю напрямую:", err)
 		return mcpserver.Run(ctx)
 	}
+	p.hello(ctx)
 	go p.watch(ctx)
 	return p.server.Run(ctx, &mcp.StdioTransport{})
 }
