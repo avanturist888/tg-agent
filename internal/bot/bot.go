@@ -437,6 +437,10 @@ type CallbackQuery struct {
 }
 
 func GetUpdates(ctx context.Context, s *config.Settings, offset int64, timeout int) ([]Update, error) {
+	// long poll отвечает через timeout секунд; дольше — соединение подвисло,
+	// и ждать общий таймаут Call (75 с) значит не видеть нажатий минуту
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout+10)*time.Second)
+	defer cancel()
 	var ups []Update
 	err := Call(ctx, s, "getUpdates", map[string]any{
 		"offset": offset, "timeout": timeout, "allowed_updates": []string{"callback_query"},

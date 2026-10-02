@@ -39,10 +39,14 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	done := make(chan struct{}, 5)
+	done := make(chan struct{}, 6)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		_ = srv.Serve(ctx)
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		core.RunAutoSend(ctx, loader) // автоотправка в срок, независимо от бота
 	}()
 	go func() {
 		defer func() { done <- struct{}{} }()
@@ -79,7 +83,7 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 		}
 	}
 	<-ctx.Done()
-	for range 5 {
+	for range 6 {
 		<-done
 	}
 	_ = audit.Log(s.AuditPath(), "service_stop")

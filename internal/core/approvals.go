@@ -18,6 +18,7 @@ import (
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
 	"tgagent/internal/svc"
+	"tgagent/internal/tgc"
 )
 
 // Подтверждение отправки кнопкой в боте.
@@ -273,9 +274,37 @@ func SendDue(ctx context.Context, s *config.Settings) {
 	}
 	for _, d := range due {
 		_ = audit.Log(s.AuditPath(), "approve", "draft_id", d.ID, "chat", d.Chat, "by", "auto_send")
-		card(ctx, s, d.BotMessageID, d, "⏳ **Отправляю…**")
 		summary := deliver(ctx, s, d.ID, "auto_send")
-		card(ctx, s, d.BotMessageID, d, summary)
+		// карточку — после отправки, а в службе ещё и в стороне: подвисший
+		// Bot API не должен задерживать ни это сообщение, ни следующие.
+		// Короткоживущий send-due обновляет её сам — иначе не успеет до выхода.
+		update := func() {
+			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+			defer cancel()
+			card(cctx, s, d.BotMessageID, d, summary)
+		}
+		if tgc.InService() {
+			go update()
+		} else {
+			update()
+		}
+	}
+}
+
+// RunAutoSend — служба: досылать автоотправку точно в срок. Отдельно от
+// разбора кнопок: getUpdates при подвисшей сети стоит до таймаута, и
+// автоотправка из его цикла опаздывала на минуту.
+func RunAutoSend(ctx context.Context, loader func() (*config.Settings, error)) {
+	for ctx.Err() == nil {
+		// черновик могут создать в любой момент — смотрим очередь дважды в секунду
+		sleepCtx(ctx, 500*time.Millisecond)
+		s, err := loader()
+		if err != nil {
+			continue
+		}
+		if next, err := outbox.New(s.OutboxPath()).NextDue(); err == nil && next != nil && !time.Now().Before(*next) {
+			SendDue(ctx, s)
+		}
 	}
 }
 
