@@ -329,10 +329,12 @@ func (c *Conn) resolveID(ctx context.Context, marked int64) (Target, error) {
 
 // Dialog — строка списка диалогов.
 type Dialog struct {
-	Peer     tg.PeerClass
-	Unread   int
-	Top      int
-	FolderID int
+	Peer       tg.PeerClass
+	Unread     int
+	Top        int
+	FolderID   int
+	Muted      bool // уведомления выключены (для правил папок)
+	UnreadMark bool // помечен непрочитанным вручную
 }
 
 // DialogPage — диалоги вместе с сущностями и последними сообщениями.
@@ -406,7 +408,9 @@ func (c *Conn) IterDialogs(ctx context.Context, limit int) (*DialogPage, error) 
 			}
 			seen[key] = true
 			folder, _ := dlg.GetFolderID()
-			page.Dialogs = append(page.Dialogs, Dialog{Peer: dlg.Peer, Unread: dlg.UnreadCount, Top: dlg.TopMessage, FolderID: folder})
+			muteUntil, _ := dlg.NotifySettings.GetMuteUntil()
+			page.Dialogs = append(page.Dialogs, Dialog{Peer: dlg.Peer, Unread: dlg.UnreadCount, Top: dlg.TopMessage,
+				FolderID: folder, Muted: muteUntil > int(time.Now().Unix()), UnreadMark: dlg.UnreadMark})
 			added++
 		}
 		if len(dialogs) < want || added == 0 || (total >= 0 && len(page.Dialogs) >= total) {

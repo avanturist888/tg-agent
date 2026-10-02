@@ -34,22 +34,50 @@ func isFinal(status string) bool {
 	return status == outbox.Sent || status == outbox.Cancelled || status == outbox.Expired
 }
 
+// botID — id бота из его токена (часть до двоеточия): номера апдейтов у
+// каждого бота свои, и смещение чужого бота съело бы все нажатия нового.
+func botID(s *config.Settings) string {
+	id, _, _ := strings.Cut(s.BotToken, ":")
+	return id
+}
+
 func readOffset(s *config.Settings) int64 {
 	raw, err := os.ReadFile(s.OffsetPath())
 	if err != nil {
 		return 0
 	}
 	var v struct {
-		Offset int64 `json:"offset"`
+		Offset int64  `json:"offset"`
+		Bot    string `json:"bot"`
 	}
 	if json.Unmarshal(raw, &v) != nil {
 		return 0
 	}
+	if v.Bot != "" && v.Bot != botID(s) {
+		return 0 // бот сменился — его апдейты с начала
+	}
 	return v.Offset
 }
 
+// tagOffset — старая запись смещения без id бота: подписать текущим ботом,
+// пока он не сменился (служба делает это при старте).
+func tagOffset(s *config.Settings) {
+	raw, err := os.ReadFile(s.OffsetPath())
+	if err != nil {
+		return
+	}
+	var v struct {
+		Offset int64  `json:"offset"`
+		Bot    string `json:"bot"`
+	}
+	if json.Unmarshal(raw, &v) == nil && v.Bot == "" {
+		writeOffset(s, v.Offset)
+	}
+}
+
 func writeOffset(s *config.Settings, offset int64) {
-	_ = os.WriteFile(s.OffsetPath(), []byte(fmt.Sprintf(`{"offset": %d}`, offset)), 0o600)
+	raw, _ := json.Marshal(map[string]any{"offset": offset, "bot": botID(s)})
+	_ = os.WriteFile(s.OffsetPath(), raw, 0o600)
 }
 
 // Notify показывает черновик в боте; 0 — бот молчит.
@@ -154,6 +182,14 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 	if q.From.ID != s.ApprovalChatID {
 		bot.AnswerCallback(ctx, s, q.ID, "Эта кнопка не для вас.")
 		_ = audit.Log(s.AuditPath(), "callback_rejected", "sender", q.From.ID, "data", data)
+		return
+	}
+	if strings.HasPrefix(data, "s:") {
+		handleAutoCallback(ctx, s, q) // переключатель автоотправки (/auto)
+		return
+	}
+	if strings.HasPrefix(data, "a:") {
+		handleAccessCallback(ctx, s, q) // запрос доступа к чату
 		return
 	}
 	if !strings.HasPrefix(data, "d:") {
@@ -388,6 +424,16 @@ func Pump(ctx context.Context, s *config.Settings, until time.Time, stop func() 
 					HandleCallback(ctx, s, u.CallbackQuery)
 				}()
 			}
+			if u.Message != nil {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							_ = audit.Log(s.AuditPath(), "command_failed", "error", fmt.Sprint(r))
+						}
+					}()
+					HandleMessage(ctx, s, u.Message)
+				}()
+			}
 		}
 	}
 }
@@ -512,6 +558,8 @@ func RunButtons(ctx context.Context, s *config.Settings, loader func() (*config.
 	}
 	defer updates.Release()
 
+	tagOffset(s)
+	setCommands(ctx, s)
 	RecoverInterrupted(ctx, s)
 	for ctx.Err() == nil {
 		updates.Touch() // иначе лок сочтут протухшим и перехватят

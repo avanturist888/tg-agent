@@ -119,6 +119,21 @@ type readChatIn struct {
 	IDs      []int  `json:"ids,omitempty" jsonschema:"конкретные сообщения по id (тогда limit, before_id, after_id не нужны)"`
 }
 
+type folderChatsIn struct {
+	Folder string `json:"folder" jsonschema:"id или название папки из tg_list_folders"`
+}
+
+type requestAccessIn struct {
+	ChatID int64  `json:"chat_id" jsonschema:"id чата из tg_folder_chats"`
+	Send   bool   `json:"send,omitempty" jsonschema:"нужна ещё и отправка (по умолчанию — только чтение)"`
+	Reason string `json:"reason" jsonschema:"зачем чат и для какого проекта — владелец решает по этому"`
+}
+
+type waitAccessIn struct {
+	RequestID  string `json:"request_id" jsonschema:"id запроса из tg_request_access"`
+	TimeoutSec int    `json:"timeout_sec,omitempty" jsonschema:"сколько ждать, секунд (по умолчанию 300)"`
+}
+
 type subscribeIn struct {
 	Chat    string `json:"chat" jsonschema:"alias из tg_list_chats"`
 	AfterID int    `json:"after_id,omitempty" jsonschema:"последний обработанный id: о более новых сообщат сразу"`
@@ -202,6 +217,61 @@ AGENTS.md, «Как следить за чатом»).`)},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in listChatsIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 				return core.ListChats(ctx, s, in.WithStatus)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_list_folders", Annotations: readOnly, Description: `Папки Telegram владельца (как в приложении: «Работа», «Личное»…).
+
+Нужно, чтобы найти чат, которого нет в tg_list_chats: смотришь папки,
+потом чаты папки (tg_folder_chats) и просишь доступ (tg_request_access).
+В ответе: id, title, сколько чатов добавлено в папку явно и правила папки
+(«группы», «контакты»…), если она собирает чаты по типу.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+			return run(ctx, time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.ListFolders(ctx, s)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_folder_chats", Annotations: readOnly, Description: `Чаты в папке Telegram владельца: название, тип, непрочитанные.
+
+Сообщений не показывает — только список. У каждого чата id и alias: alias
+= null — чата нет в белом списке, читать и писать туда нельзя, пока
+владелец не откроет (tg_request_access). access_request — по этому чату
+уже ждёт запрос.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in folderChatsIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.FolderChats(ctx, s, in.Folder)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_request_access", Description: `Попросить владельца открыть чат: карточка с кнопками уходит ему в бот.
+
+chat_id — id из tg_folder_chats; send=true — нужна и отправка (каждое
+сообщение всё равно пойдёт через черновик и подтверждение); reason —
+зачем чат и для какого проекта, коротко и честно: владелец решает по нему.
+Владелец может разрешить, разрешить только чтение или отказать. Разрешил —
+чат появится в tg_list_chats с alias, и в эту сессию придёт уведомление.
+Ждать явно — tg_wait_access(request_id). Не дублируй запрос и не проси
+снова после отказа без новой просьбы владельца. Просить доступ стоит,
+только когда чат действительно нужен для задачи владельца.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in requestAccessIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.RequestAccess(ctx, s, in.ChatID, true, in.Send, in.Reason)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_wait_access", Description: `Дождаться решения владельца по запросу доступа (tg_request_access).
+
+status: granted — чат открыт (alias, can_read, can_send внутри);
+denied — отказ, не проси снова без новой просьбы владельца;
+waiting — ещё не нажал: это не отказ, решение придёт уведомлением.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in waitAccessIn) (*mcp.CallToolResult, any, error) {
+			timeout := in.TimeoutSec
+			if timeout == 0 {
+				timeout = 300
+			}
+			return run(ctx, time.Duration(timeout+60)*time.Second, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.WaitAccess(ctx, s, in.RequestID, timeout)
 			})
 		})
 

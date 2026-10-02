@@ -686,31 +686,39 @@ func (c *Conn) ListDialogs(ctx context.Context, limit int) ([]DialogRow, error) 
 	}
 	rows := make([]DialogRow, 0, len(page.Dialogs))
 	for _, d := range page.Dialogs {
-		row := DialogRow{ID: MarkedPeerID(d.Peer), Unread: d.Unread, Archived: d.FolderID != 0}
-		switch p := d.Peer.(type) {
-		case *tg.PeerUser:
-			row.Kind = "user"
-			if u, ok := page.Users[p.UserID]; ok {
-				row.Title = strings.TrimSpace(strings.Join(nonEmpty(u.FirstName, u.LastName), " "))
-				row.Username = u.Username
-			}
-		case *tg.PeerChat:
-			row.Kind = "group"
-			if ch, ok := page.Chats[p.ChatID]; ok {
-				row.Title, _ = chatTitle(ch)
-			}
-		case *tg.PeerChannel:
-			row.Kind = "group"
-			if ch, ok := page.Chats[p.ChannelID]; ok {
-				row.Title, row.Username = chatTitle(ch)
-				if channel, ok := ch.(*tg.Channel); ok && channel.Broadcast {
-					row.Kind = "channel"
-				}
-			}
-		}
-		rows = append(rows, row)
+		rows = append(rows, dialogRow(d, page))
 	}
 	return rows, nil
+}
+
+// dialogRow — строка диалога: название, тип (user / bot / group / channel).
+func dialogRow(d Dialog, page *DialogPage) DialogRow {
+	row := DialogRow{ID: MarkedPeerID(d.Peer), Unread: d.Unread, Archived: d.FolderID != 0}
+	switch p := d.Peer.(type) {
+	case *tg.PeerUser:
+		row.Kind = "user"
+		if u, ok := page.Users[p.UserID]; ok {
+			row.Title = strings.TrimSpace(strings.Join(nonEmpty(u.FirstName, u.LastName), " "))
+			row.Username = u.Username
+			if u.Bot {
+				row.Kind = "bot"
+			}
+		}
+	case *tg.PeerChat:
+		row.Kind = "group"
+		if ch, ok := page.Chats[p.ChatID]; ok {
+			row.Title, _ = chatTitle(ch)
+		}
+	case *tg.PeerChannel:
+		row.Kind = "group"
+		if ch, ok := page.Chats[p.ChannelID]; ok {
+			row.Title, row.Username = chatTitle(ch)
+			if channel, ok := ch.(*tg.Channel); ok && channel.Broadcast {
+				row.Kind = "channel"
+			}
+		}
+	}
+	return row
 }
 
 func truncateRunes(s string, n int) string {

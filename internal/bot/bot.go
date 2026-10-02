@@ -419,10 +419,23 @@ func AnswerCallback(ctx context.Context, s *config.Settings, callbackID, text st
 	}, nil)
 }
 
-// Update — апдейт бота (нам нужны только нажатия кнопок).
+// Update — апдейт бота: нажатия кнопок и команды владельца.
 type Update struct {
 	UpdateID      int64          `json:"update_id"`
 	CallbackQuery *CallbackQuery `json:"callback_query"`
+	Message       *Message       `json:"message"`
+}
+
+// Message — сообщение боту (команды вроде /auto).
+type Message struct {
+	MessageID int64 `json:"message_id"`
+	From      struct {
+		ID int64 `json:"id"`
+	} `json:"from"`
+	Chat struct {
+		ID int64 `json:"id"`
+	} `json:"chat"`
+	Text string `json:"text"`
 }
 
 type CallbackQuery struct {
@@ -443,7 +456,7 @@ func GetUpdates(ctx context.Context, s *config.Settings, offset int64, timeout i
 	defer cancel()
 	var ups []Update
 	err := Call(ctx, s, "getUpdates", map[string]any{
-		"offset": offset, "timeout": timeout, "allowed_updates": []string{"callback_query"},
+		"offset": offset, "timeout": timeout, "allowed_updates": []string{"callback_query", "message"},
 	}, &ups)
 	return ups, err
 }
