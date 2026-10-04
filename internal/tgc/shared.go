@@ -172,11 +172,20 @@ func serviceUp(ctx context.Context) bool { return !InService() && svc.Up(ctx) }
 // out — исходящее, от владельца или агента).
 type OnMessage func(ctx context.Context, c *Conn, peer tg.PeerClass, msgID int, out bool)
 
+// Events — что служба делает с событиями чатов. Пустые поля — не нужно.
+type Events struct {
+	Message OnMessage // новое сообщение
+	Edit    OnMessage // видимая правка сообщения (не реакции и не служебные)
+	// Delete — сообщения удалены. peer == nil — лички и обычные группы:
+	// Telegram не говорит, где они были (id там общие на весь аккаунт).
+	Delete func(ctx context.Context, c *Conn, peer tg.PeerClass, ids []int)
+}
+
 // Serve — держать постоянное соединение, пока не отменят ctx. Переподключается
-// сам. onMessage получает каждое новое сообщение; onReady вызывается после
+// сам. ev получает новые, изменённые и удалённые сообщения; onReady вызывается после
 // каждого (пере)подключения с действующим входом — чтобы догнать пропущенное;
 // onNoLogin — один раз за раз, когда Telegram не принимает сессию (нужен вход).
-func Serve(ctx context.Context, s *config.Settings, onMessage OnMessage, onReady func(ctx context.Context, c *Conn), onNoLogin func(ctx context.Context)) error {
+func Serve(ctx context.Context, s *config.Settings, ev Events, onReady func(ctx context.Context, c *Conn), onNoLogin func(ctx context.Context)) error {
 	if shared == nil {
 		EnableService()
 	}
@@ -218,7 +227,7 @@ func Serve(ctx context.Context, s *config.Settings, onMessage OnMessage, onReady
 			shared.mu.Unlock()
 			cancel() // в памяти клиента уже новый ключ — начинаем с файла
 		})
-		err := serveOnce(octx, s, storage, onMessage, onReady, onNoLogin)
+		err := serveOnce(octx, s, storage, ev, onReady, onNoLogin)
 		cancel()
 		shared.set(nil, false)
 		if ctx.Err() != nil {
@@ -239,21 +248,47 @@ func Serve(ctx context.Context, s *config.Settings, onMessage OnMessage, onReady
 	return nil
 }
 
-func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage, onMessage OnMessage,
+func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage, ev Events,
 	onReady func(ctx context.Context, c *Conn), onNoLogin func(ctx context.Context)) error {
 	c := &Conn{Settings: s, hub: newUpdateHub(), Peers: LoadPeers(s.PeersPath())}
 	d := tg.NewUpdateDispatcher()
-	d.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
-		c.Peers.RememberEntities(e)
-		if peer := messagePeer(u.Message); peer != nil {
-			onMessage(ctx, c, peer, u.Message.GetID(), messageOut(u.Message))
+	message := func(handler OnMessage, e tg.Entities, m tg.MessageClass) func(ctx context.Context) {
+		return func(ctx context.Context) {
+			c.Peers.RememberEntities(e)
+			if peer := messagePeer(m); peer != nil && handler != nil {
+				handler(ctx, c, peer, m.GetID(), messageOut(m))
+			}
 		}
+	}
+	d.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
+		message(ev.Message, e, u.Message)(ctx)
 		return nil
 	})
 	d.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
-		c.Peers.RememberEntities(e)
-		if peer := messagePeer(u.Message); peer != nil {
-			onMessage(ctx, c, peer, u.Message.GetID(), messageOut(u.Message))
+		message(ev.Message, e, u.Message)(ctx)
+		return nil
+	})
+	d.OnEditMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateEditMessage) error {
+		if visibleEdit(u.Message) {
+			message(ev.Edit, e, u.Message)(ctx)
+		}
+		return nil
+	})
+	d.OnEditChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateEditChannelMessage) error {
+		if visibleEdit(u.Message) {
+			message(ev.Edit, e, u.Message)(ctx)
+		}
+		return nil
+	})
+	d.OnDeleteMessages(func(ctx context.Context, _ tg.Entities, u *tg.UpdateDeleteMessages) error {
+		if ev.Delete != nil {
+			ev.Delete(ctx, c, nil, u.Messages)
+		}
+		return nil
+	})
+	d.OnDeleteChannelMessages(func(ctx context.Context, _ tg.Entities, u *tg.UpdateDeleteChannelMessages) error {
+		if ev.Delete != nil {
+			ev.Delete(ctx, c, &tg.PeerChannel{ChannelID: u.ChannelID}, u.Messages)
 		}
 		return nil
 	})
@@ -379,6 +414,18 @@ func messagePeer(m tg.MessageClass) tg.PeerClass {
 		return v.PeerID
 	}
 	return nil
+}
+
+// visibleEdit — правка, которую видно человеку: Telegram шлёт «правки» и на
+// реакции, подгрузку превью ссылок и прочее — у них нет edit_date или стоит
+// edit_hide.
+func visibleEdit(m tg.MessageClass) bool {
+	msg, ok := m.(*tg.Message)
+	if !ok || msg.EditHide {
+		return false
+	}
+	date, ok := msg.GetEditDate()
+	return ok && date != 0
 }
 
 func messageOut(m tg.MessageClass) bool {

@@ -58,7 +58,8 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 	}()
 	go func() {
 		defer func() { done <- struct{}{} }()
-		if err := tgc.Serve(ctx, s, core.FeedOnMessage(loader), func(ctx context.Context, _ *tgc.Conn) {
+		if err := tgc.Serve(ctx, s, tgc.Events{Message: core.FeedOnMessage(loader),
+			Edit: core.FeedOnEdit(loader), Delete: core.FeedOnDelete(loader)}, func(ctx context.Context, _ *tgc.Conn) {
 			reconcile(ctx, loader) // догнать пропущенное, пока нас не было
 		}, func(ctx context.Context) {
 			noLogin(ctx, loader)

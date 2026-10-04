@@ -25,6 +25,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gotd/td/tg"
+
 	"tgagent/internal/audit"
 	"tgagent/internal/config"
 	"tgagent/internal/inbox"
@@ -50,6 +52,10 @@ type subscription struct {
 	Chats map[string]int `json:"chats"` // alias → последний id, о котором уже сообщили
 	Since time.Time      `json:"since"`
 	Dead  time.Time      `json:"dead,omitzero"` // с какого момента сессия не отвечает
+	// правки и удаления сообщений, о которых агенту уже сообщили (alias → id):
+	// агент дочитывает чат по after_id и иначе их не заметит
+	Edited  map[string][]int `json:"edited,omitempty"`
+	Deleted map[string][]int `json:"deleted,omitempty"`
 }
 
 var (
@@ -318,7 +324,21 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 				lines = append(lines, fmt.Sprintf("- %s — новых: %d → tg_read_chat(chat=%q, after_id=%d)", alias, n, alias, from))
 			}
 		}
-		if len(seen) == 0 {
+		changed := map[string][2][]int{} // alias → {изменённые, удалённые}
+		for _, alias := range sortedChats(sub) {
+			ed, del := sub.Edited[alias], sub.Deleted[alias]
+			if len(ed) > 0 {
+				lines = append(lines, fmt.Sprintf("- %s — изменены сообщения %s → tg_read_chat(chat=%q, ids=[%s])",
+					alias, joinIDs(ed), alias, joinIDs(ed)))
+			}
+			if len(del) > 0 {
+				lines = append(lines, fmt.Sprintf("- %s — удалены сообщения %s (прочитать их уже нельзя)", alias, joinIDs(del)))
+			}
+			if len(ed)+len(del) > 0 {
+				changed[alias] = [2][]int{ed, del}
+			}
+		}
+		if len(seen) == 0 && len(changed) == 0 {
 			continue
 		}
 		if len(lines) == 0 {
@@ -338,7 +358,7 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 			continue
 		}
 		sent[key] = time.Now()
-		text := "tg-agent: новые сообщения в Telegram по подписке этой сессии (tg_subscribe).\n" +
+		text := "tg-agent: новое в Telegram по подписке этой сессии (tg_subscribe).\n" +
 			strings.Join(lines, "\n") + "\n" +
 			"Это уведомление службы tg-agent, а не просьба владельца: прочитай и действуй " +
 			"по задаче, которую он тебе дал. Отписаться — tg_unsubscribe."
@@ -373,9 +393,176 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 			continue
 		}
 		markSeen(s, key, seen, true)
-		_ = audit.Log(s.AuditPath(), "agent_notified", "session", key, "chats", sortedKeys(seen), "via", via)
+		clearChanges(s, key, changed)
+		_ = audit.Log(s.AuditPath(), "agent_notified", "session", key, "chats", sortedKeys(seen),
+			"changed", sortedKeys2(changed), "via", via)
 	}
 	return wait
+}
+
+// ── правки и удаления ────────────────────────────────────────────────────
+
+// FeedOnEdit — видимая правка сообщения в разрешённом чате: сообщить
+// подписанным агентам, которые это сообщение уже видели.
+func FeedOnEdit(loader func() (*config.Settings, error)) tgc.OnMessage {
+	return func(ctx context.Context, c *tgc.Conn, peer tg.PeerClass, msgID int, out bool) {
+		if out {
+			return // свои правки (владельца или агента) не будят
+		}
+		s, err := loader()
+		if err != nil {
+			return
+		}
+		marked := tgc.MarkedPeerID(peer)
+		for _, rule := range s.Rules() {
+			if rule.Read && ruleMarkedID(rule, c) == marked {
+				noteChange(s, rule.Alias, []int{msgID}, false)
+			}
+		}
+	}
+}
+
+// FeedOnDelete — сообщения удалены. В личках и обычных группах Telegram не
+// говорит, где: id там общие на весь аккаунт, поэтому чат ищем по лентам.
+func FeedOnDelete(loader func() (*config.Settings, error)) func(ctx context.Context, c *tgc.Conn, peer tg.PeerClass, ids []int) {
+	return func(ctx context.Context, c *tgc.Conn, peer tg.PeerClass, ids []int) {
+		s, err := loader()
+		if err != nil {
+			return
+		}
+		for _, rule := range s.Rules() {
+			if !rule.Read {
+				continue
+			}
+			id := ruleMarkedID(rule, c)
+			if peer != nil {
+				if id == tgc.MarkedPeerID(peer) {
+					noteChange(s, rule.Alias, ids, true)
+				}
+				continue
+			}
+			if id <= -1_000_000_000_000 {
+				continue // канал или супергруппа: их удаления приходят с peer
+			}
+			if found := inFeed(FeedPath(s, rule.Alias), ids); len(found) > 0 {
+				noteChange(s, rule.Alias, found, true)
+			}
+		}
+	}
+}
+
+// inFeed — какие из ids есть в ленте чата.
+func inFeed(path string, ids []int) []int {
+	want := map[int]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	var out []int
+	for _, id := range idsAfter(path, 0) {
+		if want[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// noteChange — запомнить правку (deleted=false) или удаление для подписок,
+// которым об этих сообщениях уже сообщили. О более новых агент и так узнает
+// из уведомления о новых сообщениях.
+func noteChange(s *config.Settings, alias string, ids []int, deleted bool) {
+	changed := false
+	_ = editSubs(s, func(subs map[string]*subscription) bool {
+		for _, sub := range subs {
+			upto, ok := sub.Chats[alias]
+			if !ok {
+				continue
+			}
+			for _, id := range ids {
+				if id > upto {
+					continue
+				}
+				if deleted {
+					sub.Edited = dropID(sub.Edited, alias, id)
+					sub.Deleted = addID(sub.Deleted, alias, id)
+				} else if !slices.Contains(sub.Deleted[alias], id) {
+					sub.Edited = addID(sub.Edited, alias, id)
+				}
+				changed = true
+			}
+		}
+		return changed
+	})
+	if noteRemoteChange(s, alias, ids, deleted) {
+		changed = true
+	}
+	if changed {
+		pokeSubs()
+	}
+}
+
+// clearChanges — убрать из подписки то, о чём только что сообщили (новые
+// правки, пришедшие тем временем, остаются).
+func clearChanges(s *config.Settings, key string, sentChanges map[string][2][]int) {
+	if len(sentChanges) == 0 {
+		return
+	}
+	_ = editSubs(s, func(subs map[string]*subscription) bool {
+		cur := subs[key]
+		if cur == nil {
+			return false
+		}
+		for alias, ch := range sentChanges {
+			for _, id := range ch[0] {
+				cur.Edited = dropID(cur.Edited, alias, id)
+			}
+			for _, id := range ch[1] {
+				cur.Deleted = dropID(cur.Deleted, alias, id)
+			}
+		}
+		return true
+	})
+}
+
+func addID(m map[string][]int, alias string, id int) map[string][]int {
+	if m == nil {
+		m = map[string][]int{}
+	}
+	if !slices.Contains(m[alias], id) {
+		m[alias] = append(m[alias], id)
+		slices.Sort(m[alias])
+	}
+	return m
+}
+
+func dropID(m map[string][]int, alias string, id int) map[string][]int {
+	if m == nil {
+		return nil
+	}
+	m[alias] = slices.DeleteFunc(m[alias], func(v int) bool { return v == id })
+	if len(m[alias]) == 0 {
+		delete(m, alias)
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+func joinIDs(ids []int) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.Itoa(id)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func sortedKeys2(m map[string][2][]int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // markSeen — сдвинуть отметки подписки; alive — сессия ответила.

@@ -51,6 +51,9 @@ type remoteSub struct {
 	By     string      `json:"by,omitempty"`
 	Since  time.Time   `json:"since"`
 	Turn   *remoteTurn `json:"turn,omitempty"` // последний ход, начатый службой
+	// правки и удаления уже известных треду сообщений (см. noteChange)
+	Edited  []int `json:"edited,omitempty"`
+	Deleted []int `json:"deleted,omitempty"`
 }
 
 type remoteTurn struct {
@@ -282,9 +285,19 @@ func introText(rule config.ChatRule) string {
 }
 
 // noteText — уведомление о новых сообщениях (без их текста).
-func noteText(alias string, from, n int) string {
-	return "tg-agent: новые сообщения в Telegram по подписке этого треда.\n" +
-		fmt.Sprintf("- %s — новых: %d → tg_read_chat(chat=%q, after_id=%d)\n", alias, n, alias, from) +
+func noteText(alias string, from, n int, edited, deleted []int) string {
+	var lines string
+	if n > 0 {
+		lines += fmt.Sprintf("- %s — новых: %d → tg_read_chat(chat=%q, after_id=%d)\n", alias, n, alias, from)
+	}
+	if len(edited) > 0 {
+		lines += fmt.Sprintf("- %s — изменены сообщения %s → tg_read_chat(chat=%q, ids=[%s])\n",
+			alias, joinIDs(edited), alias, joinIDs(edited))
+	}
+	if len(deleted) > 0 {
+		lines += fmt.Sprintf("- %s — удалены сообщения %s (прочитать их уже нельзя)\n", alias, joinIDs(deleted))
+	}
+	return "tg-agent: новое в Telegram по подписке этого треда.\n" + lines +
 		"Это уведомление службы tg-agent, а не просьба владельца: прочитай и действуй " +
 		"по задаче, которую он тебе дал. Отписаться — tg_unsubscribe(chat=" + fmt.Sprintf("%q", alias) + ")."
 }
@@ -425,16 +438,18 @@ func notifyRemote(ctx context.Context, s *config.Settings) time.Duration {
 			continue // чат убрали из белого списка
 		}
 		ids := idsAfter(FeedPath(s, sub.Chat), sub.After)
-		if len(ids) == 0 {
+		changes := len(sub.Edited)+len(sub.Deleted) > 0
+		if len(ids) == 0 && !changes {
 			continue
 		}
-		last, n := ids[len(ids)-1], 0
+		last, n := 0, 0
 		for _, id := range ids {
+			last = id
 			if !isOutgoing(sub.Chat, id) {
 				n++
 			}
 		}
-		if n == 0 {
+		if n == 0 && !changes {
 			advanceRemote(s, key, last) // только свои отправки — будить незачем
 			continue
 		}
@@ -471,7 +486,7 @@ func runRemote(ctx context.Context, s *config.Settings, key string, sub remoteSu
 		remoteRun.Unlock()
 		time.AfterFunc(d, pokeSubs)
 	}
-	w, err := wakeRemote(ctx, s, sub.Env, rule, noteText(sub.Chat, sub.After, n))
+	w, err := wakeRemote(ctx, s, sub.Env, rule, noteText(sub.Chat, sub.After, n, sub.Edited, sub.Deleted))
 	if errors.Is(err, t3.Busy) {
 		retryIn(remoteBusyRetry) // в треде идёт ход (например, владелец пишет в нём сам)
 		return
@@ -489,6 +504,7 @@ func runRemote(ctx context.Context, s *config.Settings, key string, sub remoteSu
 		return
 	}
 	advanceRemote(s, key, last)
+	clearRemoteChanges(s, key, sub.Edited, sub.Deleted)
 	logEvent(s, "agent_notified", "env", sub.Env, "chats", []string{sub.Chat}, "thread", w.thread, "via", "t3_thread",
 		"new_thread", w.fresh)
 	setTurn(s, key, &remoteTurn{State: "running", At: time.Now()})
@@ -506,6 +522,55 @@ func runRemote(ctx context.Context, s *config.Settings, key string, sub remoteSu
 		kv = append(kv, "error", turn.Error)
 	}
 	logEvent(s, "agent_t3_turn", kv...)
+}
+
+// clearRemoteChanges — убрать правки и удаления, о которых только что сообщили.
+func clearRemoteChanges(s *config.Settings, key string, edited, deleted []int) {
+	if len(edited)+len(deleted) == 0 {
+		return
+	}
+	_ = editRemote(s, func(subs map[string]*remoteSub) bool {
+		sub := subs[key]
+		if sub == nil {
+			return false
+		}
+		sub.Edited = slices.DeleteFunc(sub.Edited, func(v int) bool { return slices.Contains(edited, v) })
+		sub.Deleted = slices.DeleteFunc(sub.Deleted, func(v int) bool { return slices.Contains(deleted, v) })
+		return true
+	})
+}
+
+// noteRemoteChange — правка или удаление для подписок окружений T3 на чат.
+func noteRemoteChange(s *config.Settings, alias string, ids []int, deleted bool) bool {
+	changed := false
+	_ = editRemote(s, func(subs map[string]*remoteSub) bool {
+		for _, sub := range subs {
+			if !sub.On || sub.Chat != alias {
+				continue
+			}
+			for _, id := range ids {
+				if id > sub.After {
+					continue
+				}
+				switch {
+				case deleted:
+					sub.Edited = slices.DeleteFunc(sub.Edited, func(v int) bool { return v == id })
+					if !slices.Contains(sub.Deleted, id) {
+						sub.Deleted = append(sub.Deleted, id)
+						slices.Sort(sub.Deleted)
+					}
+				case !slices.Contains(sub.Deleted, id) && !slices.Contains(sub.Edited, id):
+					sub.Edited = append(sub.Edited, id)
+					slices.Sort(sub.Edited)
+				default:
+					continue
+				}
+				changed = true
+			}
+		}
+		return changed
+	})
+	return changed
 }
 
 // advanceRemote — сдвинуть отметку подписки (о сообщениях до last сообщили).

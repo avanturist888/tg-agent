@@ -140,6 +140,20 @@ func TestRemoteSubscribeWakesGatewayThread(t *testing.T) {
 		t.Fatal("своё сообщение не должно будить тред")
 	}
 
+	// правка уже известного сообщения будит тред и после хода забывается
+	noteChange(s, "test", []int{12}, false)
+	noteChange(s, "test", []int{13}, true)
+	notifyRemote(ctx, s)
+	waitUntil(t, "ход о правке", func() bool { return len(f.Commands("thread.turn.start")) == 3 })
+	waitUntil(t, "конец хода о правке", idle(key))
+	if text := turnText(f.Last("thread.turn.start")); !strings.Contains(text, "изменены сообщения 12") ||
+		!strings.Contains(text, "удалены сообщения 13") || strings.Contains(text, "новых:") {
+		t.Fatalf("текст хода о правке:\n%s", text)
+	}
+	if sub := remoteSubOf(s, key); len(sub.Edited)+len(sub.Deleted) != 0 {
+		t.Fatalf("правки после хода: %+v", sub)
+	}
+
 	// аудит знает имя агента
 	raw, _ := os.ReadFile(s.AuditPath())
 	if !strings.Contains(string(raw), `"agent_subscribed"`) || !strings.Contains(string(raw), `"box-agent"`) ||

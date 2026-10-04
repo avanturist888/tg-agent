@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Microsoft/go-winio"
+	"github.com/gotd/td/tg"
 
 	"tgagent/internal/config"
 	"tgagent/internal/inbox"
@@ -204,5 +205,44 @@ func TestSubscribeWakesStoppedT3Session(t *testing.T) {
 	notifyOnce(ctx, s, sent)
 	if len(woken) != 1 {
 		t.Fatalf("лишнее пробуждение через T3: %d", len(woken))
+	}
+}
+
+func TestSubscribeReportsEditsAndDeletes(t *testing.T) {
+	s := watchEnv(t)
+	feed := FeedPath(s, "test")
+	appendNewer(feed, []int{10})
+	addr, got := fakeSession(t)
+	ctx := WithAgent(context.Background(), &addr)
+	if _, err := Subscribe(ctx, s, "test", 0); err != nil {
+		t.Fatal(err)
+	}
+	sent := map[string]time.Time{}
+	appendNewer(feed, []int{11, 12})
+	notifyOnce(ctx, s, sent)
+	expectNote(t, got, "новых: 2") // агент знает о 11 и 12
+
+	loader := func() (*config.Settings, error) { return s, nil }
+	edit := FeedOnEdit(loader)
+	edit(ctx, nil, &tg.PeerChat{ChatID: 100123}, 11, false) // правка уже известного
+	edit(ctx, nil, &tg.PeerChat{ChatID: 100123}, 12, true)  // своя правка — не будит
+	edit(ctx, nil, &tg.PeerChat{ChatID: 100123}, 99, false) // ещё не известное — придёт как новое
+	// удаление в обычной группе: Telegram не говорит где — находим по ленте
+	FeedOnDelete(loader)(ctx, nil, nil, []int{12, 5000})
+
+	sent[addr.Key()] = time.Time{}
+	notifyOnce(ctx, s, sent)
+	expectNote(t, got, "изменены сообщения 11", "ids=[11]", "удалены сообщения 12")
+	sub := loadSubs(subsPath(s))[addr.Key()]
+	if len(sub.Edited) != 0 || len(sub.Deleted) != 0 {
+		t.Fatalf("после уведомления правки сброшены: %+v %+v", sub.Edited, sub.Deleted)
+	}
+
+	// правка удалённого не воскрешает его
+	FeedOnDelete(loader)(ctx, nil, nil, []int{11})
+	edit(ctx, nil, &tg.PeerChat{ChatID: 100123}, 11, false)
+	sub = loadSubs(subsPath(s))[addr.Key()]
+	if len(sub.Edited) != 0 || len(sub.Deleted["test"]) != 1 {
+		t.Fatalf("удалённое не правится: %+v %+v", sub.Edited, sub.Deleted)
 	}
 }
