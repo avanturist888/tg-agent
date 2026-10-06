@@ -111,6 +111,15 @@
   его службе (`passCallback`, op `callback`). Заметки к аккаунтам
   (`core/notes.go`) — один файл на установку, `data/account_notes.json`
   основного профиля, под локом.
+- Темы форумов (`tgc/topics.go`): тема = id её служебного сообщения, General
+  = 1. Тема сообщения — `TopicOf` (forum_topic → reply_to_top_id или
+  reply_to_msg_id), настоящий ответ — `ReplyID` (в теме без top_id
+  reply_to_msg_id — сама тема, не ответ). Чтение темы — `messages.getReplies`
+  (General — отбор из общей ленты), отправка — `Target.Topic` → `replyTo`.
+  Черновик хранит тему (`Draft.Topic`), её берёт из `reply_to`, если не
+  задана. Подписка с темой (`subscription.Topics`) отбирает новые и правки
+  через `topicsOf` (запрос сообщений по id, память `topicMemo`). Белый список
+  — на чат целиком.
 - Папки и запросы доступа (`core/access.go`, `tgc/folders.go`): агент видит
   папки и названия чатов вне белого списка (только список, без сообщений) и
   просит доступ карточкой (callback `a:<id>:rw|r|no`). Белый список меняется

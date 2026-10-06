@@ -254,11 +254,21 @@ func heading(d *outbox.Draft) string {
 	return who + " просит отправить сообщение"
 }
 
+func topicLabel(d *outbox.Draft) string {
+	if d.TopicTitle != "" {
+		return d.TopicTitle
+	}
+	return fmt.Sprintf("#%d", d.Topic)
+}
+
 // CardMarkdown — карточка: шапка, разделитель, сам текст, отрисованный так, как уйдёт.
 func CardMarkdown(d *outbox.Draft, title, note, status string) string {
 	head := []string{
 		"🤖 **" + heading(d) + "**",
 		fmt.Sprintf("Чат: **%s** (`%s`)", MDEscape(title), d.Chat),
+	}
+	if d.Topic != 0 {
+		head = append(head, "Тема: **"+MDEscape(topicLabel(d))+"**")
 	}
 	if note != "" {
 		head = append(head, "Повод: "+MDEscape(note))
@@ -292,6 +302,9 @@ func CardHTML(d *outbox.Draft, title, note, status string) string {
 	head := []string{
 		"🤖 <b>" + heading(d) + "</b>",
 		fmt.Sprintf("Чат: <b>%s</b> (<code>%s</code>)", html.EscapeString(title), html.EscapeString(d.Chat)),
+	}
+	if d.Topic != 0 {
+		head = append(head, "Тема: <b>"+html.EscapeString(topicLabel(d))+"</b>")
 	}
 	if note != "" {
 		head = append(head, "Повод: "+html.EscapeString(note))

@@ -111,7 +111,7 @@ func PollOnce(ctx context.Context, s *config.Settings) (map[string]int, error) {
 				if topID <= known {
 					continue
 				}
-				batch, err := c.History(ctx, targets[alias], 200, 0, known, "")
+				batch, err := c.History(ctx, targets[alias], 200, 0, known, "", 0)
 				if err != nil {
 					return err
 				}

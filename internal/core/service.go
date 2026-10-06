@@ -113,6 +113,8 @@ type ReadOpts struct {
 	// IDs — конкретные сообщения по номерам (остальные параметры не нужны)
 	IDs        []int
 	Transcribe bool
+	// Topic — только эта тема форума (0 — все)
+	Topic int
 }
 
 // ReadChat — tg_read_chat / tg_search_chat.
@@ -129,11 +131,22 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 	if len(o.IDs) > s.MaxLimit {
 		return nil, &Bad{Msg: fmt.Sprintf("Не больше %d сообщений за раз.", s.MaxLimit)}
 	}
-	var messages []*omap.Map
+	var (
+		messages []*omap.Map
+		forum    bool
+		topic    *omap.Map
+	)
 	err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
 		t, err := c.Resolve(ctx, rule)
 		if err != nil {
 			return err
+		}
+		if o.Topic != 0 && len(o.IDs) == 0 {
+			title, err := topicTitle(ctx, c, t, rule, o.Topic)
+			if err != nil {
+				return err
+			}
+			topic = omap.New().Set("id", o.Topic).Set("title", title)
 		}
 		var batch *tgc.Batch
 		if len(o.IDs) > 0 {
@@ -142,11 +155,17 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 			if batch, err = c.Messages(ctx, t, ids); err != nil {
 				return err
 			}
+			if err := c.FillTopics(ctx, t, batch); err != nil {
+				return err
+			}
 			for _, m := range batch.Messages { // уже по возрастанию
 				messages = append(messages, c.Serialize(m, batch))
 			}
 		} else {
-			if batch, err = c.History(ctx, t, limit, o.BeforeID, o.AfterID, o.Search); err != nil {
+			if batch, err = c.History(ctx, t, limit, o.BeforeID, o.AfterID, o.Search, o.Topic); err != nil {
+				return err
+			}
+			if err := c.FillTopics(ctx, t, batch); err != nil {
 				return err
 			}
 			// хронологический порядок: старые сверху
@@ -154,6 +173,7 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 				messages = append(messages, c.Serialize(batch.Messages[i], batch))
 			}
 		}
+		forum = batch.Forum
 		parents, err := replyParents(ctx, c, t, messages)
 		if err != nil {
 			return err
@@ -175,6 +195,9 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 	if len(o.IDs) > 0 {
 		kv = append(kv, "ids", o.IDs)
 	}
+	if o.Topic != 0 {
+		kv = append(kv, "topic", o.Topic)
+	}
 	logEvent(s, "read", kv...)
 	var oldest, newest any
 	if len(messages) > 0 {
@@ -184,8 +207,149 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 	if messages == nil {
 		messages = []*omap.Map{}
 	}
-	return omap.New().Set("chat", s.Ref(rule.Alias)).Set("title", rule.Title).Set("count", len(messages)).
+	out := omap.New().Set("chat", s.Ref(rule.Alias)).Set("title", rule.Title)
+	if forum || topic != nil {
+		out.Set("forum", true)
+	}
+	if topic != nil {
+		out.Set("topic", topic)
+	}
+	return out.Set("count", len(messages)).
 		Set("oldest_id", oldest).Set("newest_id", newest).Set("messages", messages), nil
+}
+
+// topicTitle — название темы форума; ошибка, если чат не форум или темы нет.
+func topicTitle(ctx context.Context, c *tgc.Conn, t tgc.Target, rule config.ChatRule, topic int) (string, error) {
+	forum, err := c.IsForum(ctx, t)
+	if err != nil {
+		return "", err
+	}
+	if !forum {
+		return "", &Bad{Msg: fmt.Sprintf("Чат '%s' — не форум, тем в нём нет: topic не нужен.", rule.Alias)}
+	}
+	titles, err := c.TopicTitles(ctx, t, []int{topic})
+	if err != nil {
+		return "", err
+	}
+	title, ok := titles[topic]
+	if !ok {
+		return "", &Bad{Msg: fmt.Sprintf("В чате '%s' нет темы %d — список тем: tg_list_topics.", rule.Alias, topic)}
+	}
+	return title, nil
+}
+
+// ListTopics — tg_list_topics: темы форума.
+func ListTopics(ctx context.Context, s *config.Settings, chat string, limit int) (*omap.Map, error) {
+	rule, err := readable(s, chat)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	var topics []tgc.Topic
+	err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
+		t, err := c.Resolve(ctx, rule)
+		if err != nil {
+			return err
+		}
+		forum, err := c.IsForum(ctx, t)
+		if err != nil {
+			return err
+		}
+		if !forum {
+			return &Bad{Msg: fmt.Sprintf("Чат '%s' — не форум, тем в нём нет.", rule.Alias)}
+		}
+		topics, err = c.Topics(ctx, t, limit)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]*omap.Map, 0, len(topics))
+	for _, tp := range topics {
+		row := omap.New().Set("id", tp.ID).Set("title", tp.Title).Set("unread", tp.Unread).
+			Set("last_message_id", tp.TopMessage)
+		if tp.Closed {
+			row.Set("closed", true)
+		}
+		if tp.Pinned {
+			row.Set("pinned", true)
+		}
+		if tp.Hidden {
+			row.Set("hidden", true)
+		}
+		rows = append(rows, row)
+	}
+	logEvent(s, "list_topics", "chat", rule.Alias, "returned", len(rows))
+	return omap.New().Set("chat", s.Ref(rule.Alias)).Set("title", rule.Title).Set("topics", rows), nil
+}
+
+// draftTopic — в какую тему форума уйдёт черновик: явная topic, иначе тема
+// сообщения из reply_to, иначе General. Не форум — 0 (а topic — ошибка).
+func draftTopic(ctx context.Context, s *config.Settings, rule config.ChatRule, topic int, replyTo *int64) (int, string, error) {
+	notForum := &Bad{Msg: fmt.Sprintf("Чат '%s' — не форум, тем в нём нет: topic не нужен.", rule.Alias)}
+	if !maybeForum(rule) {
+		if topic != 0 {
+			return 0, "", notForum
+		}
+		return 0, "", nil
+	}
+	var title string
+	err := tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
+		t, err := c.Resolve(ctx, rule)
+		if err != nil {
+			return err
+		}
+		forum, err := c.IsForum(ctx, t)
+		if err != nil {
+			return err
+		}
+		if !forum {
+			if topic != 0 {
+				return notForum
+			}
+			return nil
+		}
+		if replyTo != nil {
+			m, _, err := c.Message(ctx, t, int(*replyTo))
+			if err != nil {
+				return err
+			}
+			if m == nil {
+				return &Bad{Msg: fmt.Sprintf("Сообщения %d в чате '%s' нет — отвечать не на что.", *replyTo, rule.Alias)}
+			}
+			of := tgc.TopicOf(m, true)
+			if topic != 0 && topic != of {
+				return &Bad{Msg: fmt.Sprintf("Сообщение %d — в теме %d, а не %d: ответ уходит в тему исходного "+
+					"сообщения, topic можно не указывать.", *replyTo, of, topic)}
+			}
+			topic = of
+		}
+		if topic == 0 {
+			topic = tgc.GeneralTopic
+		}
+		title, err = topicTitle(ctx, c, t, rule, topic)
+		return err
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	if title == "" {
+		topic = 0 // не форум
+	}
+	return topic, title, nil
+}
+
+// maybeForum — может ли чат быть форумом (только супергруппа); без сети.
+func maybeForum(rule config.ChatRule) bool {
+	switch p := rule.Peer.(type) {
+	case int64:
+		return p <= -1000000000000
+	case string:
+		return p != "me"
+	}
+	return true
 }
 
 // replyParents вкладывает в ответы исходные сообщения, которых нет в выдаче,
@@ -461,7 +625,7 @@ func sentAs(f outbox.FileSnap) string {
 // DraftMessage — tg_draft_message. Ничего не отправляет само; в чате с
 // автоотправкой ставит сообщение в очередь с окном на отмену.
 // asFiles — картинки тоже документами, без сжатия (иначе jpg/png уходят фото).
-func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, replyTo *int64, note, format string, files []string, asFiles bool) (*omap.Map, error) {
+func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, replyTo *int64, note, format string, files []string, asFiles bool, topic int) (*omap.Map, error) {
 	rule, err := sendable(s, chat)
 	if err != nil {
 		return nil, err
@@ -482,6 +646,10 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 	if s.Agent != nil && len(files) > 0 {
 		return nil, &Bad{Msg: remoteNoFiles}
 	}
+	topic, topicName, err := draftTopic(ctx, s, rule, topic, replyTo)
+	if err != nil {
+		return nil, err
+	}
 	id := outbox.NewID()
 	var snaps []outbox.FileSnap
 	if len(files) > 0 {
@@ -491,7 +659,7 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 		}
 	}
 	opts := outbox.CreateOpts{ID: id, Chat: rule.Alias, Text: text, ReplyTo: replyTo, TTLMin: s.DraftTTLMin,
-		Note: note, Fmt: format, Files: snaps, Origin: draftOrigin(s)}
+		Note: note, Fmt: format, Files: snaps, Origin: draftOrigin(s), Topic: topic, TopicTitle: topicName}
 	auto := rule.AutoSend()
 	if auto {
 		at := time.Now().Add(time.Duration(s.AutoSendDelaySec) * time.Second)
@@ -507,6 +675,9 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 		fileLog = append(fileLog, omap.New().Set("name", f.Name).Set("size", f.Size).Set("source", f.Source).Set("as", sentAs(f)))
 	}
 	kv := []any{"draft_id", d.ID, "chat", rule.Alias, "chars", len([]rune(text)), "files", fileLog}
+	if topic != 0 {
+		kv = append(kv, "topic", topic)
+	}
 	if auto {
 		kv = append(kv, "auto_send_at", *d.SendAt)
 	}
@@ -516,8 +687,11 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 	for _, f := range d.Files {
 		filesOut = append(filesOut, omap.New().Set("name", f.Name).Set("size", f.Size).Set("as", sentAs(f)))
 	}
-	out := omap.New().Set("draft_id", d.ID).Set("chat", s.Ref(rule.Alias)).Set("text", d.Text).
-		Set("reply_to", d.ReplyTo).Set("expires_at", d.ExpiresAt)
+	out := omap.New().Set("draft_id", d.ID).Set("chat", s.Ref(rule.Alias))
+	if topic != 0 {
+		out.Set("topic", omap.New().Set("id", topic).Set("title", topicName))
+	}
+	out.Set("text", d.Text).Set("reply_to", d.ReplyTo).Set("expires_at", d.ExpiresAt)
 
 	if auto {
 		card := s.BotReady() && Notify(ctx, s, d, rule.Title, note) != 0
@@ -607,6 +781,7 @@ func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string
 		if err != nil {
 			return err
 		}
+		t.Topic = d.Topic
 		if d.Text != "" {
 			r, err := c.SendMessage(ctx, t, d.Text, d.ReplyTo, d.Fmt)
 			if err != nil {
@@ -729,7 +904,11 @@ func ListDrafts(s *config.Settings, status string) (*omap.Map, error) {
 		if visibleDraft(s, d) != nil {
 			continue
 		}
-		row := omap.New().Set("id", d.ID).Set("chat", s.Ref(d.Chat)).Set("status", d.Status).Set("text", d.Text).
+		row := omap.New().Set("id", d.ID).Set("chat", s.Ref(d.Chat))
+		if d.Topic != 0 {
+			row.Set("topic", omap.New().Set("id", d.Topic).Set("title", d.TopicTitle))
+		}
+		row.Set("status", d.Status).Set("text", d.Text).
 			Set("created_at", d.CreatedAt).Set("expires_at", d.ExpiresAt).Set("message_id", d.MessageID)
 		if d.SendAt != nil {
 			row.Set("send_at", *d.SendAt)

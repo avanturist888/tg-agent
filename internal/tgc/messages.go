@@ -24,6 +24,9 @@ type Batch struct {
 	Messages []tg.MessageClass
 	Users    map[int64]*tg.User
 	Chats    map[int64]tg.ChatClass
+	// Forum и Topics заполняет FillTopics: чат с темами и названия тем
+	Forum  bool
+	Topics map[int]string
 }
 
 func (c *Conn) unpack(res tg.MessagesMessagesClass) *Batch {
@@ -39,6 +42,7 @@ func (c *Conn) unpack(res tg.MessagesMessagesClass) *Batch {
 		b.Messages, users, chats = r.Messages, r.Users, r.Chats
 	}
 	c.Peers.Remember(users, chats)
+	rememberForum(chats)
 	for _, u := range users {
 		if user, ok := u.(*tg.User); ok {
 			b.Users[user.ID] = user
@@ -51,22 +55,40 @@ func (c *Conn) unpack(res tg.MessagesMessagesClass) *Batch {
 }
 
 // History — сообщения чата (новые сверху, как отдаёт Telegram).
-// beforeID — только старше этого id, afterID — только новее.
-func (c *Conn) History(ctx context.Context, t Target, limit, beforeID, afterID int, search string) (*Batch, error) {
+// beforeID — только старше этого id, afterID — только новее; topic > 0 —
+// только эта тема форума (General — по общей ленте с отбором).
+func (c *Conn) History(ctx context.Context, t Target, limit, beforeID, afterID int, search string, topic int) (*Batch, error) {
 	all := &Batch{Users: map[int64]*tg.User{}, Chats: map[int64]tg.ChatClass{}}
 	offset := beforeID
+	pages := 0
 	for len(all.Messages) < limit {
+		pages++
+		if topic == GeneralTopic && pages > 30 {
+			break // General отбираем из общей ленты — не листаем её бесконечно
+		}
 		want := min(100, limit-len(all.Messages))
 		var (
 			res tg.MessagesMessagesClass
 			err error
 		)
-		if search != "" {
-			res, err = c.API.MessagesSearch(ctx, &tg.MessagesSearchRequest{
+		if topic == GeneralTopic {
+			want = 100
+		}
+		switch {
+		case search != "":
+			req := &tg.MessagesSearchRequest{
 				Peer: t.Input, Q: search, Filter: &tg.InputMessagesFilterEmpty{},
 				OffsetID: offset, Limit: want, MinID: afterID,
+			}
+			if topic > GeneralTopic {
+				req.TopMsgID = topic
+			}
+			res, err = c.API.MessagesSearch(ctx, req)
+		case topic > GeneralTopic:
+			res, err = c.API.MessagesGetReplies(ctx, &tg.MessagesGetRepliesRequest{
+				Peer: t.Input, MsgID: topic, OffsetID: offset, Limit: want, MinID: afterID,
 			})
-		} else {
+		default:
 			res, err = c.API.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
 				Peer: t.Input, OffsetID: offset, Limit: want, MinID: afterID,
 			})
@@ -89,9 +111,14 @@ func (c *Conn) History(ctx context.Context, t Target, limit, beforeID, afterID i
 			if afterID > 0 && m.GetID() <= afterID {
 				continue
 			}
-			all.Messages = append(all.Messages, m)
 			got++
 			offset = m.GetID()
+			if topic == GeneralTopic && TopicOf(m, true) != GeneralTopic {
+				continue
+			}
+			if len(all.Messages) < limit {
+				all.Messages = append(all.Messages, m)
+			}
 		}
 		if got == 0 || len(b.Messages) < want {
 			break
@@ -518,12 +545,14 @@ func (c *Conn) Serialize(m tg.MessageClass, b *Batch) *omap.Map {
 	case *tg.MessageService:
 		sid, kind := senderOf(m, v.PeerID, v.FromID, v.Out, self)
 		out := omap.New().Set("id", v.ID).Set("date", isoTime(v.Date)).Set("from", c.personOrStub(sid, kind, v.FromID, v.PeerID, b)).Set("text", "")
-		if h, ok := v.ReplyTo.(*tg.MessageReplyHeader); ok {
-			if id, ok := h.GetReplyToMsgID(); ok {
-				out.Set("reply_to", id)
-			}
+		if id := ReplyID(v); id != 0 {
+			out.Set("reply_to", id)
 		}
 		out.Set("service_action", typeName(v.Action))
+		if a, ok := v.Action.(*tg.MessageActionTopicCreate); ok {
+			out.Set("text", a.Title)
+		}
+		setTopic(out, m, b)
 		return out
 	case *tg.Message:
 		sid, kind := senderOf(m, v.PeerID, v.FromID, v.Out, self)
@@ -533,11 +562,10 @@ func (c *Conn) Serialize(m tg.MessageClass, b *Batch) *omap.Map {
 			out.Set("text", richtext.ToMarkdown(rich))
 			out.Set("rich", true)
 		}
-		if h, ok := v.ReplyTo.(*tg.MessageReplyHeader); ok {
-			if id, ok := h.GetReplyToMsgID(); ok {
-				out.Set("reply_to", id)
-			}
+		if id := ReplyID(v); id != 0 {
+			out.Set("reply_to", id)
 		}
+		setTopic(out, m, b)
 		label := MediaLabel(v)
 		if label != "" {
 			out.Set("media", label)
@@ -567,6 +595,19 @@ func (c *Conn) Serialize(m tg.MessageClass, b *Batch) *omap.Map {
 		return out
 	}
 	return omap.New().Set("id", m.GetID())
+}
+
+// setTopic — у сообщения форума: в какой оно теме.
+func setTopic(out *omap.Map, m tg.MessageClass, b *Batch) {
+	if b == nil || !b.Forum {
+		return
+	}
+	id := TopicOf(m, true)
+	var title any
+	if t, ok := b.Topics[id]; ok {
+		title = t
+	}
+	out.Set("topic", omap.New().Set("id", id).Set("title", title))
 }
 
 func (c *Conn) personOrStub(id int64, kind string, fromID, peerID tg.PeerClass, b *Batch) *omap.Map {

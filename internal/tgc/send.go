@@ -61,11 +61,22 @@ func sent(u tg.UpdatesClass, randomIDs []int64) (ids []int, date int) {
 	return ids, date
 }
 
-func replyTo(id *int64) tg.InputReplyToClass {
-	if id == nil || *id == 0 {
-		return nil
+// replyTo — ответ на id; в теме форума (topic > 1) — в этой теме: новое
+// сообщение — ответом на саму тему, ответ — с top_msg_id (см. topics.go).
+func replyTo(id *int64, topic int) tg.InputReplyToClass {
+	msg := 0
+	if id != nil {
+		msg = int(*id)
 	}
-	return &tg.InputReplyToMessage{ReplyToMsgID: int(*id)}
+	switch {
+	case topic > GeneralTopic && (msg == 0 || msg == topic):
+		return &tg.InputReplyToMessage{ReplyToMsgID: topic}
+	case topic > GeneralTopic:
+		return &tg.InputReplyToMessage{ReplyToMsgID: msg, TopMsgID: topic}
+	case msg != 0:
+		return &tg.InputReplyToMessage{ReplyToMsgID: msg}
+	}
+	return nil
 }
 
 // SendMessage — отправить от аккаунта владельца.
@@ -79,7 +90,7 @@ func (c *Conn) SendMessage(ctx context.Context, t Target, text string, reply *in
 		req.Peer = t.Input
 		req.RandomID = randomID()
 		req.NoWebpage = true
-		if r := replyTo(reply); r != nil {
+		if r := replyTo(reply, t.Topic); r != nil {
 			req.ReplyTo = r
 		}
 		res, err := c.API.MessagesSendMessage(ctx, req)
@@ -207,7 +218,7 @@ func (c *Conn) sendAlbum(ctx context.Context, t Target, paths []string, photo bo
 	}
 	if len(media) == 1 {
 		req := &tg.MessagesSendMediaRequest{Peer: t.Input, Media: media[0], RandomID: randomID()}
-		if r := replyTo(reply); r != nil {
+		if r := replyTo(reply, t.Topic); r != nil {
 			req.ReplyTo = r
 		}
 		res, err := c.API.MessagesSendMedia(ctx, req)
@@ -234,7 +245,7 @@ func (c *Conn) sendAlbum(ctx context.Context, t Target, paths []string, photo bo
 		single = append(single, tg.InputSingleMedia{Media: in, RandomID: r})
 	}
 	req := &tg.MessagesSendMultiMediaRequest{Peer: t.Input, MultiMedia: single}
-	if r := replyTo(reply); r != nil {
+	if r := replyTo(reply, t.Topic); r != nil {
 		req.ReplyTo = r
 	}
 	res, err := c.API.MessagesSendMultiMedia(ctx, req)

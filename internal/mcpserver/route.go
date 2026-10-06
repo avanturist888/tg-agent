@@ -55,7 +55,7 @@ type forwardArgs struct {
 
 var (
 	chatTools = set("tg_read_chat", "tg_view_media", "tg_download_file", "tg_transcribe", "tg_search_chat",
-		"tg_draft_message", "tg_react", "tg_subscribe", "tg_unsubscribe")
+		"tg_list_topics", "tg_draft_message", "tg_react", "tg_subscribe", "tg_unsubscribe")
 	accountTools = set("tg_list_folders", "tg_folder_chats", "tg_request_access")
 	idTools      = set("tg_wait_approval", "tg_send_draft", "tg_cancel_draft", "tg_wait_access")
 	everyTools   = set("tg_list_chats", "tg_list_drafts")

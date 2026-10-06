@@ -83,7 +83,7 @@ func TestRemoteSubscribeWakesGatewayThread(t *testing.T) {
 	appendNewer(feed, []int{10})
 	key := remoteKey("box", "test")
 
-	out, err := Subscribe(ctx, agent, "test", 0)
+	out, err := Subscribe(ctx, agent, "test", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestRemoteThreadDeletedIsRecreated(t *testing.T) {
 	ctx := context.Background()
 	feed := FeedPath(s, "test")
 	key := remoteKey("box", "test")
-	if _, err := Subscribe(ctx, agent, "test", 0); err != nil {
+	if _, err := Subscribe(ctx, agent, "test", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	appendNewer(feed, []int{1})
@@ -196,7 +196,7 @@ func TestRemoteWaitsForRunningTurn(t *testing.T) {
 	ctx := context.Background()
 	feed := FeedPath(s, "test")
 	key := remoteKey("box", "test")
-	if _, err := Subscribe(ctx, agent, "test", 0); err != nil {
+	if _, err := Subscribe(ctx, agent, "test", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	appendNewer(feed, []int{5})
@@ -227,7 +227,7 @@ func TestRemoteUnsubscribeKeepsThread(t *testing.T) {
 	ctx := context.Background()
 	feed := FeedPath(s, "test")
 	key := remoteKey("box", "test")
-	if _, err := Subscribe(ctx, agent, "test", 0); err != nil {
+	if _, err := Subscribe(ctx, agent, "test", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	appendNewer(feed, []int{1})
@@ -246,7 +246,7 @@ func TestRemoteUnsubscribeKeepsThread(t *testing.T) {
 		t.Fatal("после отписки тред не будим")
 	}
 	// снова подписались — тот же тред
-	if out, err := Subscribe(ctx, agent, "test", 0); err != nil {
+	if out, err := Subscribe(ctx, agent, "test", 0, 0); err != nil {
 		t.Fatal(err)
 	} else if got, _ := out.Get("thread"); got != thread {
 		t.Fatalf("тред шлюза должен сохраниться: %v", out)
@@ -258,7 +258,7 @@ func TestRemoteAgentScope(t *testing.T) {
 	ctx := context.Background()
 
 	// чужой чат из белого списка агенту не виден
-	if _, err := Subscribe(ctx, agent, "other", 0); err == nil {
+	if _, err := Subscribe(ctx, agent, "other", 0, 0); err == nil {
 		t.Fatal("подписка на чат вне списка агента")
 	}
 	if _, err := ReadChat(ctx, agent, "other", ReadOpts{}); err == nil {
@@ -273,7 +273,7 @@ func TestRemoteAgentScope(t *testing.T) {
 	}
 
 	// файлы с диска шлюза и скачивание на него — не для агента из контейнера
-	if _, err := DraftMessage(ctx, agent, "test", "x", nil, "", "", []string{"C:/secret.txt"}, false); err == nil ||
+	if _, err := DraftMessage(ctx, agent, "test", "x", nil, "", "", []string{"C:/secret.txt"}, false, 0); err == nil ||
 		!strings.Contains(err.Error(), "files недоступны") {
 		t.Fatalf("файлы от агента из контейнера: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestRemoteAgentScope(t *testing.T) {
 
 	// черновики чужих чатов агенту не видны
 	box := outbox.New(s.OutboxPath())
-	mine, err := DraftMessage(ctx, agent, "test", "привет", nil, "", "", nil, false)
+	mine, err := DraftMessage(ctx, agent, "test", "привет", nil, "", "", nil, false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

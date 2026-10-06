@@ -203,6 +203,8 @@ type Target struct {
 	Kind string
 	// ID — «сырой» id (без -100); у self — id владельца
 	ID int64
+	// Topic — тема форума, куда отправлять (0 — не форум или General)
+	Topic int
 }
 
 // MarkedID — id в формате Bot API: -100… для каналов, -… для групп.

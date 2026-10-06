@@ -122,6 +122,12 @@ type readChatIn struct {
 	BeforeID int    `json:"before_id,omitempty" jsonschema:"вернуть сообщения СТАРШЕ этого id"`
 	AfterID  int    `json:"after_id,omitempty" jsonschema:"вернуть сообщения НОВЕЕ этого id"`
 	IDs      []int  `json:"ids,omitempty" jsonschema:"конкретные сообщения по id (тогда limit, before_id, after_id не нужны)"`
+	Topic    int    `json:"topic,omitempty" jsonschema:"только эта тема форума (id из tg_list_topics; General — 1)"`
+}
+
+type topicsIn struct {
+	Chat  string `json:"chat" jsonschema:"alias из tg_list_chats"`
+	Limit int    `json:"limit,omitempty" jsonschema:"сколько тем (по умолчанию 100)"`
 }
 
 type foldersIn struct {
@@ -155,6 +161,7 @@ type waitAccessIn struct {
 type subscribeIn struct {
 	Chat    string `json:"chat" jsonschema:"alias из tg_list_chats"`
 	AfterID int    `json:"after_id,omitempty" jsonschema:"последний обработанный id: о более новых сообщат сразу"`
+	Topic   int    `json:"topic,omitempty" jsonschema:"только эта тема форума (0 — все темы)"`
 }
 
 type unsubscribeIn struct {
@@ -170,6 +177,7 @@ type searchIn struct {
 	Chat  string `json:"chat" jsonschema:"alias из tg_list_chats"`
 	Query string `json:"query" jsonschema:"что искать"`
 	Limit int    `json:"limit,omitempty" jsonschema:"сколько сообщений (по умолчанию 30)"`
+	Topic int    `json:"topic,omitempty" jsonschema:"искать только в этой теме форума"`
 }
 
 type draftIn struct {
@@ -180,6 +188,7 @@ type draftIn struct {
 	Format  string   `json:"format,omitempty" jsonschema:"markdown (по умолчанию) или plain"`
 	Files   []string `json:"files,omitempty" jsonschema:"локальные пути к файлам, до 10 штук"`
 	AsFiles bool     `json:"as_files,omitempty" jsonschema:"картинки тоже файлами, без сжатия (по умолчанию jpg/png уходят фото)"`
+	Topic   int      `json:"topic,omitempty" jsonschema:"тема форума, куда писать (id из tg_list_topics); при reply_to — по исходному сообщению"`
 }
 
 type reactIn struct {
@@ -347,6 +356,8 @@ tg_read_chat(chat, ids=[…]) или «удалены сообщения …»: 
 chat     — alias из tg_list_chats (нужно can_read)
 after_id — твой последний обработанный id: о том, что новее, сообщат
            сразу. Без него — только о сообщениях после подписки.
+topic    — в чате-форуме: будить только о сообщениях этой темы. Без него
+           уведомление скажет, в каких темах новое.
 
 Подписка живёт, пока жива сессия, и переживает перезапуск службы и
 возобновление сессии. Повторный вызов безопасен — он лишь переставляет
@@ -358,7 +369,7 @@ after_id. На несколько чатов — по вызову на кажд
 шлюза «TG: <чат>» в твоём окружении T3 — служба заводит его сама.`)},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in subscribeIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
-				return core.Subscribe(ctx, s, in.Chat, in.AfterID)
+				return core.Subscribe(ctx, s, in.Chat, in.AfterID, in.Topic)
 			})
 		})
 
@@ -378,6 +389,7 @@ limit     — сколько сообщений (по умолчанию 50, п�
 before_id — вернуть сообщения СТАРШЕ этого id (постраничная прокрутка назад)
 after_id  — вернуть сообщения НОВЕЕ этого id (что нового с прошлого раза)
 ids       — конкретные сообщения по id, например [3585092, 3585000]
+topic     — только эта тема форума (id из tg_list_topics; General — 1)
 
 Сообщения приходят в хронологическом порядке, старые сверху.
 Чтение не помечает чат прочитанным.
@@ -385,6 +397,11 @@ ids       — конкретные сообщения по id, например 
 Ответ на сообщение (reply_to), которого нет в выдаче, приходит вместе с ним:
 reply_to_message — само исходное сообщение (у голосового — с расшифровкой);
 null — оно удалено. Дальше по цепочке — через ids.
+
+Чат-форум (с темами): в ответе forum = true, у каждого сообщения topic —
+{id, title} темы, где оно лежит. Без topic приходят сообщения всех тем
+вперемешку. Отвечаешь в теме — пиши черновик с reply_to (тема определится
+сама) или с topic.
 
 Голосовые и кружки (media = voice / video_note) приходят с расшифровкой
 Telegram. transcript_status: done — transcript полный; pending — готово
@@ -394,7 +411,21 @@ tg_download_file и расшифруй своим STT.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in readChatIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 				return core.ReadChat(ctx, s, in.Chat, core.ReadOpts{Limit: in.Limit, BeforeID: in.BeforeID,
-					AfterID: in.AfterID, IDs: in.IDs, Transcribe: true})
+					AfterID: in.AfterID, IDs: in.IDs, Transcribe: true, Topic: in.Topic})
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_list_topics", Annotations: readOnly, Description: `Темы чата-форума (супергруппы с темами).
+
+Чаты, где у сообщений в tg_read_chat есть topic, — форумы. Возвращает темы
+с недавней активностью сверху: id (его передавай в topic у tg_read_chat,
+tg_search_chat, tg_draft_message, tg_subscribe), title, unread,
+last_message_id; closed — тема закрыта (писать туда может только админ),
+pinned, hidden. У General id = 1. Если чат добавлен в белый список, доступны
+все его темы.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in topicsIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.ListTopics(ctx, s, in.Chat, in.Limit)
 			})
 		})
 
@@ -463,7 +494,7 @@ MSG_VOICE_TOO_LONG) — тогда скачай tg_download_file и прогон
 				limit = 30
 			}
 			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
-				return core.ReadChat(ctx, s, in.Chat, core.ReadOpts{Limit: limit, Search: in.Query, Transcribe: true})
+				return core.ReadChat(ctx, s, in.Chat, core.ReadOpts{Limit: limit, Search: in.Query, Transcribe: true, Topic: in.Topic})
 			})
 		})
 
@@ -502,11 +533,15 @@ as_files=true. Картинку не надо выкладывать по ссы
 note — зачем это сообщение и из какого проекта; показывается в карточке,
 помогает человеку решить, не переспрашивая.
 reply_to — id сообщения, на которое отвечаем (из tg_read_chat).
+topic — в чате-форуме: тема, куда писать (id из tg_list_topics). С reply_to
+указывать не нужно: ответ уходит в тему исходного сообщения. Без того и
+другого сообщение форума уходит в General. В ответе — topic {id, title}:
+проверь, что тема та.
 
 В режимах human_approval / agent_confirm смотри поле next_step из ответа.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in draftIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 10*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
-				return core.DraftMessage(ctx, s, in.Chat, in.Text, in.ReplyTo, in.Note, in.Format, in.Files, in.AsFiles)
+				return core.DraftMessage(ctx, s, in.Chat, in.Text, in.ReplyTo, in.Note, in.Format, in.Files, in.AsFiles, in.Topic)
 			})
 		})
 

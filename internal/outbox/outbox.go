@@ -80,6 +80,9 @@ type Draft struct {
 	Note         string
 	History      []json.RawMessage
 	SendAt       *string // только у scheduled
+	// Topic — тема форума, куда уйдёт сообщение (0 — не форум), TopicTitle — её название
+	Topic      int
+	TopicTitle string
 
 	extra *omap.Map // поля от других версий — возвращаем при записи как есть
 }
@@ -88,7 +91,7 @@ var known = map[string]bool{
 	"id": true, "chat": true, "text": true, "reply_to": true, "created_at": true, "expires_at": true,
 	"status": true, "origin": true, "approved_at": true, "sent_at": true, "message_id": true,
 	"bot_message_id": true, "fmt": true, "files": true, "send_error": true, "note": true,
-	"history": true, "send_at": true,
+	"history": true, "send_at": true, "topic": true, "topic_title": true,
 }
 
 func (d *Draft) MarshalJSON() ([]byte, error) {
@@ -111,6 +114,9 @@ func (d *Draft) MarshalJSON() ([]byte, error) {
 		Set("files", files).Set("send_error", d.SendError).Set("note", d.Note).Set("history", history)
 	if d.SendAt != nil {
 		m.Set("send_at", d.SendAt)
+	}
+	if d.Topic != 0 {
+		m.Set("topic", d.Topic).Set("topic_title", d.TopicTitle)
 	}
 	return m.MarshalJSON()
 }
@@ -139,6 +145,8 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		Note         string            `json:"note"`
 		History      []json.RawMessage `json:"history"`
 		SendAt       *string           `json:"send_at"`
+		Topic        int               `json:"topic"`
+		TopicTitle   string            `json:"topic_title"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
@@ -148,6 +156,7 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		ExpiresAt: aux.ExpiresAt, Status: aux.Status, Origin: aux.Origin, ApprovedAt: aux.ApprovedAt,
 		SentAt: aux.SentAt, MessageID: aux.MessageID, BotMessageID: aux.BotMessageID, Fmt: aux.Fmt,
 		Files: aux.Files, SendError: aux.SendError, Note: aux.Note, History: aux.History, SendAt: aux.SendAt,
+		Topic: aux.Topic, TopicTitle: aux.TopicTitle,
 	}
 	if d.Status == "" {
 		d.Status = Pending
@@ -305,6 +314,9 @@ type CreateOpts struct {
 	SendAt *time.Time
 	// Origin — кто создал: "" — местный агент, "agent:<имя>" — агент из контейнера
 	Origin string
+	// Topic, TopicTitle — тема форума (0 — не форум)
+	Topic      int
+	TopicTitle string
 }
 
 func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
@@ -318,17 +330,19 @@ func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
 		fmtName = "markdown"
 	}
 	d := &Draft{
-		ID:        id,
-		Chat:      opts.Chat,
-		Text:      opts.Text,
-		ReplyTo:   opts.ReplyTo,
-		CreatedAt: audit.FormatTime(now),
-		ExpiresAt: audit.FormatTime(now.Add(time.Duration(opts.TTLMin) * time.Minute)),
-		Status:    Pending,
-		Origin:    cmpOr(opts.Origin, "agent"),
-		Fmt:       fmtName,
-		Files:     opts.Files,
-		Note:      opts.Note,
+		ID:         id,
+		Chat:       opts.Chat,
+		Text:       opts.Text,
+		ReplyTo:    opts.ReplyTo,
+		CreatedAt:  audit.FormatTime(now),
+		ExpiresAt:  audit.FormatTime(now.Add(time.Duration(opts.TTLMin) * time.Minute)),
+		Status:     Pending,
+		Origin:     cmpOr(opts.Origin, "agent"),
+		Fmt:        fmtName,
+		Files:      opts.Files,
+		Note:       opts.Note,
+		Topic:      opts.Topic,
+		TopicTitle: opts.TopicTitle,
 	}
 	if opts.SendAt != nil {
 		at := audit.FormatTime(*opts.SendAt)

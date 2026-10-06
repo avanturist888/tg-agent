@@ -56,6 +56,149 @@ type subscription struct {
 	// агент дочитывает чат по after_id и иначе их не заметит
 	Edited  map[string][]int `json:"edited,omitempty"`
 	Deleted map[string][]int `json:"deleted,omitempty"`
+	// Topics — чат-форум: будить только о сообщениях этой темы (alias → id темы)
+	Topics map[string]int `json:"topics,omitempty"`
+}
+
+// ── темы форумов в уведомлениях ──────────────────────────────────────────
+
+type topicRef struct {
+	ID    int
+	Title string
+}
+
+// topicMemo — в какой теме какое сообщение (alias → id → тема): правки и
+// удаления потом фильтруются без запросов, а удалённое уже не спросишь.
+var topicMemo = struct {
+	sync.Mutex
+	m map[string]map[int]topicRef
+}{m: map[string]map[int]topicRef{}}
+
+func memoTopics(alias string, found map[int]topicRef) {
+	topicMemo.Lock()
+	defer topicMemo.Unlock()
+	m := topicMemo.m[alias]
+	if m == nil || len(m) > 5000 {
+		m = map[int]topicRef{}
+		topicMemo.m[alias] = m
+	}
+	for id, r := range found {
+		m[id] = r
+	}
+}
+
+func memoTopic(alias string, id int) (topicRef, bool) {
+	topicMemo.Lock()
+	defer topicMemo.Unlock()
+	r, ok := topicMemo.m[alias][id]
+	return r, ok
+}
+
+// topicsOf — темы сообщений чата-форума (nil — не форум или не вышло узнать).
+var topicsOf = func(ctx context.Context, s *config.Settings, rule config.ChatRule, ids []int) map[int]topicRef {
+	if !maybeForum(rule) || len(ids) == 0 {
+		return nil
+	}
+	out := map[int]topicRef{}
+	var missing []int
+	for _, id := range ids {
+		if r, ok := memoTopic(rule.Alias, id); ok {
+			out[id] = r
+		} else {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == 0 {
+		return out
+	}
+	forum := false
+	found := map[int]topicRef{}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	err := tgc.Run(cctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
+		t, err := c.Resolve(ctx, rule)
+		if err != nil {
+			return err
+		}
+		if forum, err = c.IsForum(ctx, t); err != nil || !forum {
+			return err
+		}
+		b, err := c.Messages(ctx, t, missing)
+		if err != nil {
+			return err
+		}
+		var tids []int
+		for _, m := range b.Messages {
+			tids = append(tids, tgc.TopicOf(m, true))
+		}
+		titles, err := c.TopicTitles(ctx, t, tids)
+		if err != nil {
+			return err
+		}
+		for i, m := range b.Messages {
+			found[m.GetID()] = topicRef{ID: tids[i], Title: titles[tids[i]]}
+		}
+		return nil
+	})
+	if err != nil || !forum {
+		return nil
+	}
+	memoTopics(rule.Alias, found)
+	for id, r := range found {
+		out[id] = r
+	}
+	return out
+}
+
+// checkTopic — есть ли такая тема в чате; вернёт её название.
+var checkTopic = func(ctx context.Context, s *config.Settings, rule config.ChatRule, topic int) (string, error) {
+	var title string
+	err := tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
+		t, err := c.Resolve(ctx, rule)
+		if err != nil {
+			return err
+		}
+		title, err = topicTitle(ctx, c, t, rule, topic)
+		return err
+	})
+	return title, err
+}
+
+func topicLabel(r topicRef) string {
+	if r.Title == "" {
+		return fmt.Sprintf("#%d", r.ID)
+	}
+	return fmt.Sprintf("«%s» (topic=%d)", r.Title, r.ID)
+}
+
+// topicBreakdown — «в темах: «Заказы» (topic=5) — 2, «General» (topic=1) — 1».
+func topicBreakdown(ids []int, topics map[int]topicRef) string {
+	if topics == nil {
+		return ""
+	}
+	var order []topicRef
+	count := map[int]int{}
+	for _, id := range ids {
+		r, ok := topics[id]
+		if !ok {
+			continue
+		}
+		if count[r.ID] == 0 {
+			order = append(order, r)
+		}
+		count[r.ID]++
+	}
+	if len(order) == 0 {
+		return ""
+	}
+	parts := make([]string, len(order))
+	for i, r := range order {
+		parts[i] = fmt.Sprintf("%s — %d", topicLabel(r), count[r.ID])
+	}
+	if len(parts) == 1 {
+		return "в теме " + parts[0]
+	}
+	return "в темах: " + strings.Join(parts, ", ")
 }
 
 var (
@@ -147,8 +290,11 @@ const noInbox = "Сессия не передала адрес своего вх
 // ── инструменты ──────────────────────────────────────────────────────────
 
 // Subscribe — tg_subscribe: будить эту сессию при новых сообщениях в чате.
-func Subscribe(ctx context.Context, s *config.Settings, chat string, after int) (*omap.Map, error) {
+func Subscribe(ctx context.Context, s *config.Settings, chat string, after, topic int) (*omap.Map, error) {
 	if s.Agent != nil {
+		if topic != 0 {
+			return nil, &Bad{Msg: "Агенту из контейнера подписка на одну тему недоступна — подпишись на весь чат."}
+		}
 		// агент из контейнера: будим не его сессию, а тред шлюза в его окружении
 		if s.Agent.Env == "" {
 			return nil, &Bad{Msg: "У агента " + s.Agent.Name + " не задано окружение T3 (env в config/agents.toml): будить некого."}
@@ -162,6 +308,12 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, after int) 
 	a := agentFrom(ctx)
 	if a == nil {
 		return nil, &Bad{Msg: noInbox}
+	}
+	var topicName string
+	if topic != 0 {
+		if topicName, err = checkTopic(ctx, s, rule, topic); err != nil {
+			return nil, err
+		}
 	}
 	last := LastID(FeedPath(s, rule.Alias))
 	from := last
@@ -177,16 +329,28 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, after int) 
 		}
 		sub.Agent, sub.Dead = *a, time.Time{}
 		sub.Chats[rule.Alias] = from
+		if topic != 0 {
+			if sub.Topics == nil {
+				sub.Topics = map[string]int{}
+			}
+			sub.Topics[rule.Alias] = topic
+		} else {
+			delete(sub.Topics, rule.Alias)
+		}
 		chats = refs(s, sortedChats(sub))
 		return true
 	})
 	if err != nil {
 		return nil, err
 	}
-	_ = audit.Log(s.AuditPath(), "agent_subscribed", "chat", rule.Alias, "session", a.Key(), "after_id", from)
+	_ = audit.Log(s.AuditPath(), "agent_subscribed", "chat", rule.Alias, "session", a.Key(), "after_id", from,
+		"topic", topic)
 	pokeSubs()
-	out := omap.New().Set("chat", s.Ref(rule.Alias)).Set("subscribed", true).
-		Set("after_id", from).Set("feed_last_id", last).Set("subscriptions", chats)
+	out := omap.New().Set("chat", s.Ref(rule.Alias)).Set("subscribed", true)
+	if topic != 0 {
+		out.Set("topic", omap.New().Set("id", topic).Set("title", topicName))
+	}
+	out.Set("after_id", from).Set("feed_last_id", last).Set("subscriptions", chats)
 	switch {
 	case !tgc.InService():
 		out.Set("note", "Служба tg-agent сейчас не запущена: уведомления пойдут, когда она поднимется.")
@@ -224,8 +388,10 @@ func Unsubscribe(ctx context.Context, s *config.Settings, chat string) (*omap.Ma
 		}
 		if alias == "" {
 			clear(sub.Chats)
+			clear(sub.Topics)
 		} else {
 			delete(sub.Chats, alias)
+			delete(sub.Topics, alias)
 		}
 		if len(sub.Chats) == 0 {
 			delete(subs, a.Key())
@@ -326,20 +492,56 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 				continue
 			}
 			seen[alias] = ids[len(ids)-1]
-			n := 0
+			var incoming []int
 			for _, id := range ids {
 				if !isOutgoing(alias, id) {
-					n++
+					incoming = append(incoming, id)
 				}
 			}
-			if n > 0 {
+			var topics map[int]topicRef
+			if rule, ok := s.Chats[alias]; ok && len(incoming) > 0 {
+				topics = topicsOf(ctx, s, rule, incoming)
+			}
+			filter := sub.Topics[alias]
+			if filter != 0 && topics != nil {
+				kept := incoming[:0:0]
+				for _, id := range incoming {
+					if r, ok := topics[id]; !ok || r.ID == filter {
+						kept = append(kept, id)
+					}
+				}
+				incoming = kept
+			}
+			if n := len(incoming); n > 0 {
 				ref := s.Ref(alias)
-				lines = append(lines, fmt.Sprintf("- %s — новых: %d → tg_read_chat(chat=%q, after_id=%d)", ref, n, ref, from))
+				if filter != 0 {
+					label := topicLabel(topicRef{ID: filter})
+					for _, r := range topics {
+						if r.ID == filter {
+							label = topicLabel(r)
+							break
+						}
+					}
+					lines = append(lines, fmt.Sprintf("- %s, тема %s — новых: %d → tg_read_chat(chat=%q, topic=%d, after_id=%d)",
+						ref, label, n, ref, filter, from))
+				} else {
+					line := fmt.Sprintf("- %s — новых: %d", ref, n)
+					if br := topicBreakdown(incoming, topics); br != "" {
+						line += " (" + br + ")"
+					}
+					lines = append(lines, line+fmt.Sprintf(" → tg_read_chat(chat=%q, after_id=%d)", ref, from))
+				}
 			}
 		}
 		changed := map[string][2][]int{} // alias → {изменённые, удалённые}
 		for _, alias := range sortedChats(sub) {
 			ed, del := sub.Edited[alias], sub.Deleted[alias]
+			if len(ed)+len(del) > 0 {
+				changed[alias] = [2][]int{ed, del}
+			}
+			if filter := sub.Topics[alias]; filter != 0 {
+				ed, del = sameTopic(ctx, s, alias, filter, ed, del)
+			}
 			if len(ed) > 0 {
 				lines = append(lines, fmt.Sprintf("- %s — изменены сообщения %s → tg_read_chat(chat=%q, ids=[%s])",
 					s.Ref(alias), joinIDs(ed), s.Ref(alias), joinIDs(ed)))
@@ -347,16 +549,14 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 			if len(del) > 0 {
 				lines = append(lines, fmt.Sprintf("- %s — удалены сообщения %s (прочитать их уже нельзя)", s.Ref(alias), joinIDs(del)))
 			}
-			if len(ed)+len(del) > 0 {
-				changed[alias] = [2][]int{ed, del}
-			}
 		}
 		if len(seen) == 0 && len(changed) == 0 {
 			continue
 		}
 		if len(lines) == 0 {
-			// только свои отправки — будить незачем
+			// только свои отправки или другие темы — будить незачем
 			markSeen(s, key, seen, false)
+			clearChanges(s, key, changed)
 			continue
 		}
 		if !sub.Dead.IsZero() && time.Since(sub.Dead) > deadAfter {
@@ -411,6 +611,29 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 			"changed", sortedKeys2(changed), "via", via)
 	}
 	return wait
+}
+
+// sameTopic — из правок и удалений только сообщения темы filter (тема
+// неизвестна — оставляем: лучше лишнее уведомление, чем пропуск).
+func sameTopic(ctx context.Context, s *config.Settings, alias string, filter int, ed, del []int) ([]int, []int) {
+	var topics map[int]topicRef
+	if rule, ok := s.Chats[alias]; ok && len(ed) > 0 {
+		topics = topicsOf(ctx, s, rule, ed)
+	}
+	keep := func(ids []int) []int {
+		var out []int
+		for _, id := range ids {
+			r, ok := topics[id]
+			if !ok {
+				r, ok = memoTopic(alias, id)
+			}
+			if !ok || r.ID == filter {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+	return keep(ed), keep(del)
 }
 
 // ── правки и удаления ────────────────────────────────────────────────────

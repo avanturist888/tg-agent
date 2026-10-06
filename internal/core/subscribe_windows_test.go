@@ -90,7 +90,7 @@ func TestSubscribeNotifies(t *testing.T) {
 	addr, got := fakeSession(t)
 	ctx := WithAgent(context.Background(), &addr)
 
-	if _, err := Subscribe(ctx, s, "test", 0); err != nil {
+	if _, err := Subscribe(ctx, s, "test", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	sent := map[string]time.Time{}
@@ -123,7 +123,7 @@ func TestSubscribeAfterCatchesUp(t *testing.T) {
 	appendNewer(FeedPath(s, "test"), []int{10, 11, 12})
 	addr, got := fakeSession(t)
 	ctx := WithAgent(context.Background(), &addr)
-	if _, err := Subscribe(ctx, s, "test", 10); err != nil {
+	if _, err := Subscribe(ctx, s, "test", 10, 0); err != nil {
 		t.Fatal(err)
 	}
 	notifyOnce(ctx, s, map[string]time.Time{})
@@ -138,7 +138,7 @@ func TestSubscribeFollowsResumedSession(t *testing.T) {
 	gone := addr
 	gone.Socket += "-closed" // канала нет: сессия закрыта
 	ctx := WithAgent(context.Background(), &gone)
-	if _, err := Subscribe(ctx, s, "test", 0); err != nil {
+	if _, err := Subscribe(ctx, s, "test", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	appendNewer(feed, []int{11})
@@ -162,11 +162,11 @@ func TestSubscribeFollowsResumedSession(t *testing.T) {
 
 func TestSubscribeNeedsSessionAndReadableChat(t *testing.T) {
 	s := watchEnv(t)
-	if _, err := Subscribe(WithAgent(context.Background(), nil), s, "test", 0); err == nil {
+	if _, err := Subscribe(WithAgent(context.Background(), nil), s, "test", 0, 0); err == nil {
 		t.Fatal("без канала сессии подписка невозможна")
 	}
 	addr, _ := fakeSession(t)
-	if _, err := Subscribe(WithAgent(context.Background(), &addr), s, "nope", 0); err == nil {
+	if _, err := Subscribe(WithAgent(context.Background(), &addr), s, "nope", 0, 0); err == nil {
 		t.Fatal("чат вне списка")
 	}
 	if _, err := Unsubscribe(WithAgent(context.Background(), &addr), s, ""); err != nil {
@@ -181,7 +181,7 @@ func TestSubscribeWakesStoppedT3Session(t *testing.T) {
 	addr, _ := fakeSession(t)
 	addr.Socket += "-closed" // T3 Code остановил процесс сессии
 	ctx := WithAgent(context.Background(), &addr)
-	if _, err := Subscribe(ctx, s, "test", 0); err != nil {
+	if _, err := Subscribe(ctx, s, "test", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	var woken []string
@@ -214,7 +214,7 @@ func TestSubscribeReportsEditsAndDeletes(t *testing.T) {
 	appendNewer(feed, []int{10})
 	addr, got := fakeSession(t)
 	ctx := WithAgent(context.Background(), &addr)
-	if _, err := Subscribe(ctx, s, "test", 0); err != nil {
+	if _, err := Subscribe(ctx, s, "test", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	sent := map[string]time.Time{}
@@ -244,5 +244,72 @@ func TestSubscribeReportsEditsAndDeletes(t *testing.T) {
 	sub = loadSubs(subsPath(s))[addr.Key()]
 	if len(sub.Edited) != 0 || len(sub.Deleted["test"]) != 1 {
 		t.Fatalf("удалённое не правится: %+v %+v", sub.Edited, sub.Deleted)
+	}
+}
+
+func TestSubscribeTopics(t *testing.T) {
+	s := watchEnv(t)
+	feed := FeedPath(s, "test")
+	appendNewer(feed, []int{10})
+	addr, got := fakeSession(t)
+	ctx := WithAgent(context.Background(), &addr)
+	// форум: 11 и 13 — в теме «Заказы» (5), 12 — в General
+	where := map[int]topicRef{11: {5, "Заказы"}, 12: {1, "General"}, 13: {5, "Заказы"}, 14: {1, "General"}}
+	oldOf, oldCheck := topicsOf, checkTopic
+	t.Cleanup(func() { topicsOf, checkTopic = oldOf, oldCheck })
+	topicsOf = func(_ context.Context, _ *config.Settings, _ config.ChatRule, ids []int) map[int]topicRef {
+		out := map[int]topicRef{}
+		for _, id := range ids {
+			out[id] = where[id]
+		}
+		memoTopics("test", out)
+		return out
+	}
+	checkTopic = func(_ context.Context, _ *config.Settings, _ config.ChatRule, topic int) (string, error) {
+		if topic != 5 {
+			return "", &Bad{Msg: "нет темы"}
+		}
+		return "Заказы", nil
+	}
+
+	if _, err := Subscribe(ctx, s, "test", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	sent := map[string]time.Time{}
+	appendNewer(feed, []int{11, 12, 13})
+	notifyOnce(ctx, s, sent)
+	expectNote(t, got, "новых: 3", "«Заказы» (topic=5) — 2", "«General» (topic=1) — 1")
+
+	// подписка на одну тему: General не будит, правки чужой темы — тоже
+	if _, err := Subscribe(ctx, s, "test", 0, 7); err == nil {
+		t.Fatal("несуществующая тема")
+	}
+	out, err := Subscribe(ctx, s, "test", 0, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := out.Get("topic"); v == nil {
+		t.Fatal("в ответе подписки нет темы")
+	}
+	sent[addr.Key()] = time.Time{}
+	appendNewer(feed, []int{14})
+	FeedOnEdit(func() (*config.Settings, error) { return s, nil })(ctx, nil, &tg.PeerChat{ChatID: 100123}, 12, false)
+	notifyOnce(ctx, s, sent)
+	expectSilence(t, got)
+	if sub := loadSubs(subsPath(s))[addr.Key()]; sub.Chats["test"] != 14 || len(sub.Edited) != 0 {
+		t.Fatalf("чужая тема: отметка сдвигается, правка сбрасывается: %+v", sub)
+	}
+	appendNewer(feed, []int{15})
+	where[15] = topicRef{5, "Заказы"}
+	sent[addr.Key()] = time.Time{}
+	notifyOnce(ctx, s, sent)
+	expectNote(t, got, "тема «Заказы» (topic=5) — новых: 1", "topic=5, after_id=14")
+
+	// отписка от чата снимает и тему
+	if _, err := Unsubscribe(ctx, s, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if sub := loadSubs(subsPath(s))[addr.Key()]; sub != nil {
+		t.Fatalf("подписка осталась: %+v", sub)
 	}
 }
