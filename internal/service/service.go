@@ -75,13 +75,16 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 			reconcile(ctx, loader)
 		}
 	}()
-	if s.BotReady() {
+	// у общего бота нажатия разбирает основная служба и передаёт нам (op callback)
+	if s.BotReady() && !s.SharedBot {
 		buttonsActive.Store(true)
 		err = core.RunButtons(ctx, s, loader)
 		buttonsActive.Store(false)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			_ = audit.Log(s.AuditPath(), "buttons_failed", "error", err.Error())
 		}
+	} else if s.SharedBot {
+		core.RecoverInterrupted(ctx, s) // у своего бота это делает RunButtons
 	}
 	<-ctx.Done()
 	for range 6 {
@@ -119,10 +122,17 @@ func noLogin(ctx context.Context, loader func() (*config.Settings, error)) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
+	who, login := "", "`tg login`"
+	if config.Multi() {
+		who = " (аккаунт " + config.AccountName() + ")"
+	}
+	if config.Profile() != "" {
+		login = "`tg --profile " + config.Profile() + " login`"
+	}
 	err = bot.Call(ctx, s, "sendMessage", map[string]any{
 		"chat_id": s.ApprovalChatID,
-		"text": "⚠️ tg-agent: Telegram не принимает сессию — у агентов нет доступа к чатам.\n" +
-			"Войди заново: ярлык tg-agent → вкладка «Состояние» (или `tg login`).",
+		"text": "⚠️ tg-agent" + who + ": Telegram не принимает сессию — у агентов нет доступа к чатам.\n" +
+			"Войди заново: ярлык tg-agent → вкладка «Состояние» (или " + login + ").",
 	}, nil)
 	if err != nil {
 		_ = audit.Log(s.AuditPath(), "notify_failed", "error", err.Error())

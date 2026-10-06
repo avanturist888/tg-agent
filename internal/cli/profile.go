@@ -51,12 +51,16 @@ func cmdInit(ctx context.Context, args []string) int {
 		}
 		b.WriteString("\n# Номер аккаунта профиля; пусто — login спросит.\n")
 		fmt.Fprintf(&b, "TG_PHONE=%s\n", strings.TrimSpace(*phone))
-		b.WriteString("\n# Подтверждение отправки. Бот основного профиля сюда не годится: его кнопки\n")
-		b.WriteString("# слушает основная служба. Пока черновики подтверждаются командой\n")
-		fmt.Fprintf(&b, "#   %s approve <id> --send   (или в окне: tgw.exe --profile %s gui)\n", tg, prof)
-		b.WriteString("# Свои кнопки: создать бота у @BotFather, вписать TG_BOT_TOKEN и\n")
-		b.WriteString("# TG_APPROVAL_CHAT_ID (свой id в Telegram) и поставить TG_SEND_POLICY=bot_approval.\n")
-		b.WriteString("TG_SEND_POLICY=human_approval\n")
+		b.WriteString("\n# Подтверждение отправки. Без своего TG_BOT_TOKEN карточки приходят в бот\n")
+		b.WriteString("# основного профиля с пометкой аккаунта, а нажатия основная служба передаёт\n")
+		b.WriteString("# службе этого профиля. Свой бот — TG_BOT_TOKEN и TG_APPROVAL_CHAT_ID здесь.\n")
+		if config.MainHasBot() {
+			b.WriteString("TG_SEND_POLICY=bot_approval\n")
+		} else {
+			b.WriteString("# У основного профиля бота нет — пока подтверждение командой\n")
+			fmt.Fprintf(&b, "#   %s approve <id> --send   (или в окне: tgw.exe --profile %s gui)\n", tg, prof)
+			b.WriteString("TG_SEND_POLICY=human_approval\n")
+		}
 		if err := os.WriteFile(config.EnvPath(), []byte(b.String()), 0o600); err != nil {
 			return fail(err)
 		}

@@ -3,7 +3,6 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -83,14 +82,20 @@ func TestProfileOwnSettingsAndBot(t *testing.T) {
 		t.Fatalf("бот и номер основного профиля в профиль не попадают: бот %q, номер %q", s.BotToken, s.Phone)
 	}
 
-	// тот же бот, что у основного, — отказ: его кнопки слушает основная служба
+	// без своего бота при bot_approval — бот основного, нажатия через основную службу
+	write(t, filepath.Join(home, ".env"), "TG_API_ID=1\nTG_API_HASH=main\n")
+	if s, err := Load(); err != nil || !s.SharedBot || s.BotToken != "main-bot" || s.ApprovalChatID != 42 ||
+		s.CallbackPrefix() != "@work|" {
+		t.Fatalf("общий бот: %v %+v", err, s)
+	}
+	// тот же токен явно — тоже общий бот, а не второй слушатель
 	write(t, filepath.Join(home, ".env"), "TG_API_ID=1\nTG_API_HASH=main\nTG_BOT_TOKEN=main-bot\nTG_APPROVAL_CHAT_ID=42\n")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "тот же бот") {
-		t.Fatalf("общий бот: %v", err)
+	if s, err := Load(); err != nil || !s.SharedBot {
+		t.Fatalf("тот же бот: %v", err)
 	}
 	// свой бот — можно
 	write(t, filepath.Join(home, ".env"), "TG_API_ID=1\nTG_API_HASH=main\nTG_BOT_TOKEN=work-bot\nTG_APPROVAL_CHAT_ID=42\n")
-	if s, err := Load(); err != nil || s.BotToken != "work-bot" {
+	if s, err := Load(); err != nil || s.BotToken != "work-bot" || s.SharedBot || s.CallbackPrefix() != "" {
 		t.Fatalf("свой бот профиля: %v", err)
 	}
 
@@ -102,7 +107,7 @@ func TestProfileOwnSettingsAndBot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s.Chats["personal"]; !ok || s.BotToken != "main-bot" || s.SessionPath != filepath.Join(root, "data", "session.json") {
+	if _, ok := s.Chats["personal"]; !ok || s.BotToken != "main-bot" || s.SharedBot || s.SessionPath != filepath.Join(root, "data", "session.json") {
 		t.Fatalf("основной профиль: чаты %v, бот %q, сессия %s", s.ChatOrder, s.BotToken, s.SessionPath)
 	}
 }

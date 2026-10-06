@@ -8,6 +8,7 @@ package omap
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 )
 
 type entry struct {
@@ -109,4 +110,31 @@ func Pretty(v any) string {
 func quote(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// Decode — объект JSON с сохранением порядка ключей; значения остаются
+// сырыми (json.RawMessage).
+func Decode(raw []byte) (*Map, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, fmt.Errorf("ожидался объект JSON")
+	}
+	m := New()
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, _ := tok.(string)
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return nil, err
+		}
+		m.Set(key, v)
+	}
+	return m, nil
 }

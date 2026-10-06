@@ -99,6 +99,7 @@
   <nav>
     <button data-tab="chats" class="active">Чаты</button>
     <button data-tab="drafts">Черновики <span id="pending-count" class="count" hidden></span></button>
+    <button data-tab="notes">Заметки</button>
     <button data-tab="settings">Настройки</button>
     <button data-tab="state">Состояние</button>
     <button data-tab="audit">Журнал</button>
@@ -141,6 +142,15 @@
       <span class="hint">Обновляется само каждые 3 секунды.</span>
     </div>
     <div id="draft-list"></div>
+  </section>
+
+  <!-- ЗАМЕТКИ -->
+  <section id="notes">
+    <div class="panel">
+      <h2>Заметки к аккаунтам</h2>
+      <p class="hint">Агенты видят их рядом со списком чатов (tg_list_chats): чей аккаунт, от чьего имени и каким тоном там писать. Агенты тоже могут их оставлять. Заметки общие для всех профилей.</p>
+      <div id="note-accounts"></div>
+    </div>
   </section>
 
   <!-- НАСТРОЙКИ -->
@@ -215,7 +225,7 @@ function toast(msg, err) {
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   document.querySelectorAll("nav button").forEach(x => x.classList.toggle("active", x === b));
   document.querySelectorAll("section").forEach(s => s.classList.toggle("active", s.id === b.dataset.tab));
-  ({chats: loadChats, drafts: loadDrafts, settings: loadSettings, state: loadState, audit: loadAudit})[b.dataset.tab]();
+  ({chats: loadChats, drafts: loadDrafts, notes: loadNotes, settings: loadSettings, state: loadState, audit: loadAudit})[b.dataset.tab]();
 });
 
 
@@ -322,6 +332,37 @@ async function loadChats() {
         try { await api("DELETE", "/api/chats/" + encodeURIComponent(tr.dataset.alias)); toast("Доступ закрыт"); loadChats(); }
         catch (e) { toast(e.message, true); }
       };
+    });
+  } catch (e) { toast(e.message, true); }
+}
+
+// ── заметки ──
+async function loadNotes() {
+  try {
+    const accts = await api("GET", "/api/notes");
+    $("#note-accounts").innerHTML = accts.map(a => `
+      <div class="note-acct" data-account="${esc(a.account)}" style="margin-bottom:18px">
+        <h3 style="margin:8px 0">${esc(a.account)}${a.user ? ` <span class="hint">— ${esc(a.user)}</span>` : ""}${a.own ? ` <span class="hint">(этот профиль)</span>` : ""}</h3>
+        <table><tbody>${a.notes.map(n => `
+          <tr data-id="${esc(n.id)}"><td style="white-space:pre-wrap">${esc(n.text)}</td>
+            <td class="hint" style="white-space:nowrap">${esc(n.by)}, ${fmtTime(n.at)}</td>
+            <td><button class="btn danger remove" title="Убрать">✕</button></td></tr>`).join("") || `<tr><td class="empty">Заметок нет.</td></tr>`}
+        </tbody></table>
+        <div class="row" style="margin-top:6px"><textarea class="note-text" rows="2" style="flex:1" placeholder="Новая заметка: чей аккаунт, от чьего имени и как писать…"></textarea>
+          <button class="btn primary add">Добавить</button></div>
+      </div>`).join("");
+    document.querySelectorAll(".note-acct").forEach(box => {
+      box.querySelector(".add").onclick = async () => {
+        const text = box.querySelector(".note-text").value.trim();
+        if (!text) return;
+        try { await api("POST", "/api/notes", {account: box.dataset.account, text}); toast("Заметка добавлена"); loadNotes(); }
+        catch (e) { toast(e.message, true); }
+      };
+      box.querySelectorAll("tr[data-id] .remove").forEach(btn => btn.onclick = async () => {
+        if (!confirm("Убрать заметку?")) return;
+        try { await api("DELETE", "/api/notes/" + encodeURIComponent(btn.closest("tr").dataset.id)); toast("Убрано"); loadNotes(); }
+        catch (e) { toast(e.message, true); }
+      });
     });
   } catch (e) { toast(e.message, true); }
 }

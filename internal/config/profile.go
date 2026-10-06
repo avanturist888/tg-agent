@@ -10,9 +10,11 @@ package config
 //
 // У каждого профиля своя служба (задача Планировщика tg-agent-<имя>) со
 // своим именованным каналом: имя канала считается от каталога профиля.
-// Бот подтверждений у профиля свой: апдейты одного бота может слушать только
-// одна служба, поэтому чужой config.env (cc-telegram-notify) профиль не берёт,
-// а тот же бот, что у основного, не принимает.
+// Бот подтверждений: апдейты одного бота может слушать только одна служба.
+// Профиль без своего бота (TG_SEND_POLICY=bot_approval, TG_BOT_TOKEN пуст)
+// берёт бот основного профиля (Settings.SharedBot): карточки шлёт сам, а
+// нажатия принимает основная служба и по метке в callback_data передаёт его
+// службе. Чужой config.env (cc-telegram-notify) профиль не берёт.
 
 import (
 	"fmt"
@@ -28,7 +30,7 @@ var profile = normProfile(os.Getenv(ProfileEnv))
 
 func normProfile(name string) string {
 	name = strings.TrimSpace(name)
-	if strings.EqualFold(name, "default") {
+	if strings.EqualFold(name, "default") || strings.EqualFold(name, MainAccount) {
 		return ""
 	}
 	return name

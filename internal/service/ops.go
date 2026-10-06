@@ -16,6 +16,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"tgagent/internal/accounts"
 	"tgagent/internal/audit"
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
@@ -34,6 +35,9 @@ type ToolArgs struct {
 	Args json.RawMessage `json:"args,omitempty"`
 	// Agent — входящий канал сессии Claude Code, от которой вызов (для tg_subscribe)
 	Agent *inbox.Addr `json:"agent,omitempty"`
+	// Local — вызов передала служба другого аккаунта: выполнить у себя, не
+	// маршрутизируя дальше (mcpserver/route.go)
+	Local bool `json:"local,omitempty"`
 }
 
 type LimitArgs struct {
@@ -123,10 +127,23 @@ func init() {
 			if err != nil {
 				return nil, &core.Bad{Msg: "аргументы: " + err.Error()}
 			}
-			return mcpserver.CallTool(core.WithAgent(ctx, a.Agent), a.Name, a.Args)
+			ctx = core.WithAgent(ctx, a.Agent)
+			if a.Local {
+				ctx = mcpserver.WithoutRouting(ctx)
+			}
+			return mcpserver.CallTool(ctx, a.Name, a.Args)
 		}},
 		"hello": {fn: withSettings(func(ctx context.Context, s *config.Settings, a inbox.Addr) (any, error) {
+			helloOthers(a) // подписки на чаты других аккаунтов живут в их службах
 			return map[string]bool{"ok": true}, core.Hello(s, a)
+		})},
+		"hello_peer": {fn: withSettings(func(ctx context.Context, s *config.Settings, a inbox.Addr) (any, error) {
+			return map[string]bool{"ok": true}, core.Hello(s, a)
+		})},
+		// нажатие кнопки общего бота: основная служба передаёт его аккаунту
+		"callback": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, q bot.CallbackQuery) (any, error) {
+			core.HandleCallback(ctx, s, &q)
+			return map[string]bool{"ok": true}, nil
 		})},
 		"self": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, _ struct{}) (any, error) {
 			var me Self
@@ -189,6 +206,24 @@ func init() {
 			_ = audit.Log(s.AuditPath(), "logout")
 			return map[string]bool{"ok": true}, nil
 		})},
+	}
+}
+
+// helloOthers — передать адрес сессии службам остальных аккаунтов (без
+// запуска процессов: нет службы — нет и её подписок в работе).
+func helloOthers(a inbox.Addr) {
+	if !config.Multi() {
+		return
+	}
+	for _, acct := range config.Accounts() {
+		if config.IsOwnAccount(acct) {
+			continue
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = accounts.Service(ctx, acct, "hello_peer", a, nil)
+		}()
 	}
 }
 

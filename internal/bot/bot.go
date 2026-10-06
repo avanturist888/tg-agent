@@ -315,16 +315,18 @@ func CardHTML(d *outbox.Draft, title, note, status string) string {
 
 // Keyboard — кнопки под карточкой. У автоотправки — «Отправить сейчас»
 // (не ждать окна) и «Отменить».
-func Keyboard(d *outbox.Draft) map[string]any {
+// У профиля с общим ботом в callback_data — метка аккаунта (CallbackPrefix).
+func Keyboard(s *config.Settings, d *outbox.Draft) map[string]any {
+	p := s.CallbackPrefix() + "d:" + d.ID
 	if d.Status == outbox.Scheduled {
 		return map[string]any{"inline_keyboard": [][]map[string]string{{
-			{"text": "✅ Отправить сейчас", "callback_data": "d:" + d.ID + ":ok"},
-			{"text": "✋ Отменить", "callback_data": "d:" + d.ID + ":no"},
+			{"text": "✅ Отправить сейчас", "callback_data": p + ":ok"},
+			{"text": "✋ Отменить", "callback_data": p + ":no"},
 		}}}
 	}
 	return map[string]any{"inline_keyboard": [][]map[string]string{{
-		{"text": "✅ Отправить", "callback_data": "d:" + d.ID + ":ok"},
-		{"text": "✋ Отклонить", "callback_data": "d:" + d.ID + ":no"},
+		{"text": "✅ Отправить", "callback_data": p + ":ok"},
+		{"text": "✋ Отклонить", "callback_data": p + ":no"},
 	}}}
 }
 
@@ -364,7 +366,7 @@ func SendDraftCard(ctx context.Context, s *config.Settings, d *outbox.Draft, tit
 	}
 	err := Call(ctx, s, "sendRichMessage", map[string]any{
 		"chat_id":      s.ApprovalChatID,
-		"reply_markup": Keyboard(d),
+		"reply_markup": Keyboard(s, d),
 		"rich_message": map[string]string{"markdown": CardMarkdown(d, title, note, status)},
 	}, &msg)
 	if err != nil {
@@ -372,7 +374,7 @@ func SendDraftCard(ctx context.Context, s *config.Settings, d *outbox.Draft, tit
 		_ = audit.Log(s.AuditPath(), "card_rich_failed", "draft_id", d.ID, "error", err.Error())
 		err = Call(ctx, s, "sendMessage", map[string]any{
 			"chat_id":                  s.ApprovalChatID,
-			"reply_markup":             Keyboard(d),
+			"reply_markup":             Keyboard(s, d),
 			"text":                     CardHTML(d, title, note, status),
 			"parse_mode":               "HTML",
 			"disable_web_page_preview": true,
@@ -489,7 +491,7 @@ func RefreshCard(ctx context.Context, s *config.Settings, messageID int64, d *ou
 		"chat_id":      s.ApprovalChatID,
 		"message_id":   messageID,
 		"rich_message": map[string]string{"markdown": CardMarkdown(d, title, note, status)},
-		"reply_markup": Keyboard(d),
+		"reply_markup": Keyboard(s, d),
 	}, nil)
 	if err == nil {
 		return nil
@@ -500,6 +502,6 @@ func RefreshCard(ctx context.Context, s *config.Settings, messageID int64, d *ou
 		"text":                     truncate(CardHTML(d, title, note, status), 4000),
 		"parse_mode":               "HTML",
 		"disable_web_page_preview": true,
-		"reply_markup":             Keyboard(d),
+		"reply_markup":             Keyboard(s, d),
 	}, nil)
 }

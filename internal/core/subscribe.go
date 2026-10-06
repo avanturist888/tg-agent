@@ -128,6 +128,9 @@ func WithAgent(ctx context.Context, a *inbox.Addr) context.Context {
 	return context.WithValue(ctx, agentKey{}, a)
 }
 
+// AgentOf — сессия, от которой вызов (для передачи в службу другого аккаунта).
+func AgentOf(ctx context.Context) *inbox.Addr { return agentFrom(ctx) }
+
 // agentFrom — сессия, от которой вызов. Служба знает её из WithAgent; `tg
 // tool-call` без службы — потомок прослойки и видит канал сессии в окружении.
 func agentFrom(ctx context.Context) *inbox.Addr {
@@ -174,7 +177,7 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, after int) 
 		}
 		sub.Agent, sub.Dead = *a, time.Time{}
 		sub.Chats[rule.Alias] = from
-		chats = sortedChats(sub)
+		chats = refs(s, sortedChats(sub))
 		return true
 	})
 	if err != nil {
@@ -182,7 +185,7 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, after int) 
 	}
 	_ = audit.Log(s.AuditPath(), "agent_subscribed", "chat", rule.Alias, "session", a.Key(), "after_id", from)
 	pokeSubs()
-	out := omap.New().Set("chat", rule.Alias).Set("subscribed", true).
+	out := omap.New().Set("chat", s.Ref(rule.Alias)).Set("subscribed", true).
 		Set("after_id", from).Set("feed_last_id", last).Set("subscriptions", chats)
 	switch {
 	case !tgc.InService():
@@ -227,7 +230,7 @@ func Unsubscribe(ctx context.Context, s *config.Settings, chat string) (*omap.Ma
 		if len(sub.Chats) == 0 {
 			delete(subs, a.Key())
 		} else {
-			chats = sortedChats(sub)
+			chats = refs(s, sortedChats(sub))
 		}
 		return true
 	})
@@ -257,6 +260,15 @@ func Hello(s *config.Settings, a inbox.Addr) error {
 		pokeSubs()
 	}
 	return err
+}
+
+// refs — alias'ы как их называет агент (с аккаунтом, если он не основной).
+func refs(s *config.Settings, aliases []string) []string {
+	out := make([]string, len(aliases))
+	for i, a := range aliases {
+		out[i] = s.Ref(a)
+	}
+	return out
 }
 
 func sortedChats(sub *subscription) []string {
@@ -321,7 +333,8 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 				}
 			}
 			if n > 0 {
-				lines = append(lines, fmt.Sprintf("- %s — новых: %d → tg_read_chat(chat=%q, after_id=%d)", alias, n, alias, from))
+				ref := s.Ref(alias)
+				lines = append(lines, fmt.Sprintf("- %s — новых: %d → tg_read_chat(chat=%q, after_id=%d)", ref, n, ref, from))
 			}
 		}
 		changed := map[string][2][]int{} // alias → {изменённые, удалённые}
@@ -329,10 +342,10 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 			ed, del := sub.Edited[alias], sub.Deleted[alias]
 			if len(ed) > 0 {
 				lines = append(lines, fmt.Sprintf("- %s — изменены сообщения %s → tg_read_chat(chat=%q, ids=[%s])",
-					alias, joinIDs(ed), alias, joinIDs(ed)))
+					s.Ref(alias), joinIDs(ed), s.Ref(alias), joinIDs(ed)))
 			}
 			if len(del) > 0 {
-				lines = append(lines, fmt.Sprintf("- %s — удалены сообщения %s (прочитать их уже нельзя)", alias, joinIDs(del)))
+				lines = append(lines, fmt.Sprintf("- %s — удалены сообщения %s (прочитать их уже нельзя)", s.Ref(alias), joinIDs(del)))
 			}
 			if len(ed)+len(del) > 0 {
 				changed[alias] = [2][]int{ed, del}

@@ -57,12 +57,15 @@ func TestInitProfile(t *testing.T) {
 	env, _ := os.ReadFile(config.EnvPath())
 	text := string(env)
 	if !strings.Contains(text, "TG_API_ID=12345") || !strings.Contains(text, "TG_PHONE=+7222") ||
-		strings.Contains(text, "main-bot") || strings.Contains(text, "+7111") || !strings.Contains(text, "TG_SEND_POLICY=human_approval") {
+		strings.Contains(text, "main-bot") || strings.Contains(text, "+7111") || !strings.Contains(text, "TG_SEND_POLICY=bot_approval") {
 		t.Fatalf(".env профиля:\n%s", text)
 	}
 	s, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !s.SharedBot || s.BotToken != "main-bot" || s.CallbackPrefix() != "@work|" {
+		t.Fatalf("профиль без своего бота берёт бот основного: shared=%v prefix=%q", s.SharedBot, s.CallbackPrefix())
 	}
 	if _, ok := s.Chats["saved"]; !ok || s.Phone != "+7222" || !strings.HasPrefix(s.SessionPath, config.Home()) {
 		t.Fatalf("профиль после init: чаты %v, номер %q, сессия %s", s.ChatOrder, s.Phone, s.SessionPath)

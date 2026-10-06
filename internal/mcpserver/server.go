@@ -17,6 +17,7 @@ import (
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
+	"tgagent/internal/svc"
 	"tgagent/internal/tgc"
 )
 
@@ -46,15 +47,19 @@ func ErrorKind(err error) string {
 		attBad    *attach.Bad
 		badState  *outbox.BadState
 		busy      *lock.Busy
+		coreNF    *core.NotFound
+		remote    *svc.Error
 	)
 	switch {
+	case errors.As(err, &remote) && remote.Kind != "":
+		return remote.Kind // из службы другого аккаунта — как назвала она
 	case errors.As(err, &cfgErr):
 		return "config"
 	case errors.As(err, &cfgDenied), errors.As(err, &denied), errors.As(err, &refused):
 		return "denied"
 	case errors.As(err, &notLogged):
 		return "not_logged_in"
-	case errors.As(err, &notFound):
+	case errors.As(err, &notFound), errors.As(err, &coreNF):
 		return "not_found"
 	case errors.As(err, &bad), errors.As(err, &tgBad), errors.As(err, &attBad), errors.As(err, &badState):
 		return "bad_request"
@@ -119,14 +124,27 @@ type readChatIn struct {
 	IDs      []int  `json:"ids,omitempty" jsonschema:"конкретные сообщения по id (тогда limit, before_id, after_id не нужны)"`
 }
 
+type foldersIn struct {
+	Account string `json:"account,omitempty" jsonschema:"аккаунт из tg_list_chats, если их несколько (по умолчанию основной)"`
+}
+
 type folderChatsIn struct {
-	Folder string `json:"folder" jsonschema:"id или название папки из tg_list_folders"`
+	Folder  string `json:"folder" jsonschema:"id или название папки из tg_list_folders"`
+	Account string `json:"account,omitempty" jsonschema:"аккаунт, чьи папки (по умолчанию основной)"`
+}
+
+type accountNoteIn struct {
+	Account  string `json:"account,omitempty" jsonschema:"аккаунт из tg_list_chats (по умолчанию основной)"`
+	Text     string `json:"text,omitempty" jsonschema:"текст заметки"`
+	From     string `json:"from,omitempty" jsonschema:"подпись: из какого ты проекта или задачи"`
+	DeleteID string `json:"delete_id,omitempty" jsonschema:"убрать свою заметку с этим id (тогда text не нужен)"`
 }
 
 type requestAccessIn struct {
-	ChatID int64  `json:"chat_id" jsonschema:"id чата из tg_folder_chats"`
-	Send   bool   `json:"send,omitempty" jsonschema:"нужна ещё и отправка (по умолчанию — только чтение)"`
-	Reason string `json:"reason" jsonschema:"зачем чат и для какого проекта — владелец решает по этому"`
+	Account string `json:"account,omitempty" jsonschema:"аккаунт, чей чат (по умолчанию основной)"`
+	ChatID  int64  `json:"chat_id" jsonschema:"id чата из tg_folder_chats"`
+	Send    bool   `json:"send,omitempty" jsonschema:"нужна ещё и отправка (по умолчанию — только чтение)"`
+	Reason  string `json:"reason" jsonschema:"зачем чат и для какого проекта — владелец решает по этому"`
 }
 
 type waitAccessIn struct {
@@ -192,6 +210,7 @@ type draftIDIn struct {
 // New собирает сервер со всеми инструментами.
 func New() *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "telegram", Version: "0.2.0"}, &mcp.ServerOptions{Instructions: instructions})
+	server.AddReceivingMiddleware(route) // вызовы к чатам другого аккаунта — в его службу
 
 	mcp.AddTool(server, &mcp.Tool{Name: "tg_list_chats", Annotations: readOnly, Description: localPaths(`Список чатов Telegram, к которым у тебя есть доступ (белый список).
 
@@ -213,10 +232,37 @@ with_status=true дополнительно тянет число непрочи
 
 Чтобы узнавать о новых сообщениях сразу, подпишись: tg_subscribe — служба
 сама разбудит эту сессию, когда в чате появится сообщение (подробно в
-AGENTS.md, «Как следить за чатом»).`)},
+AGENTS.md, «Как следить за чатом»).
+
+Если аккаунтов Telegram у владельца несколько, ответ разбит по ним:
+accounts[] — у каждого account (имя), user (чей это аккаунт в Telegram),
+notes (заметки владельца и агентов об аккаунте: от чьего имени там пишут,
+каким тоном — учитывай их) и его chats. Чаты не основного аккаунта
+называются «<аккаунт>/<alias>» — так и передавай их в chat остальных
+инструментов. Черновики, подписки и запросы доступа работают так же.
+Пока аккаунт один, ответ прежний; заметки к нему — в account_notes.`)},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in listChatsIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 				return core.ListChats(ctx, s, in.WithStatus)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_account_note", Description: `Оставить заметку к аккаунту Telegram владельца (или убрать свою).
+
+Заметки видны всем агентам в tg_list_chats (notes у аккаунта) и владельцу
+в боте и окне управления. Пиши туда то, что пригодится другим агентам,
+работающим с этим аккаунтом: чей он, от чьего имени и каким тоном там
+пишут, о чём договорились с владельцем. Не пиши туда тексты переписки,
+пароли и прочие секреты. Коротко и по делу; не дублируй уже записанное.
+
+account   — имя аккаунта из tg_list_chats (по умолчанию основной)
+text      — текст заметки
+from      — подпись: из какого ты проекта или задачи
+delete_id — убрать заметку с этим id (только заметки агентов; заметки
+            владельца убирает он сам)`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in accountNoteIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.AccountNoteTool(ctx, s, in.Account, in.Text, in.DeleteID, in.From)
 			})
 		})
 
@@ -224,10 +270,15 @@ AGENTS.md, «Как следить за чатом»).`)},
 
 Нужно, чтобы найти чат, которого нет в tg_list_chats: смотришь папки,
 потом чаты папки (tg_folder_chats) и просишь доступ (tg_request_access).
+Аккаунтов несколько — account выбирает, чьи папки (по умолчанию основной);
+тот же account передавай и в tg_folder_chats, и в tg_request_access.
 В ответе: id, title, сколько чатов добавлено в папку явно и правила папки
 («группы», «контакты»…), если она собирает чаты по типу.`},
-		func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		func(ctx context.Context, _ *mcp.CallToolRequest, in foldersIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				if err := checkAccount(in.Account); err != nil {
+					return nil, err
+				}
 				return core.ListFolders(ctx, s)
 			})
 		})
@@ -240,6 +291,9 @@ AGENTS.md, «Как следить за чатом»).`)},
 уже ждёт запрос.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in folderChatsIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				if err := checkAccount(in.Account); err != nil {
+					return nil, err
+				}
 				return core.FolderChats(ctx, s, in.Folder)
 			})
 		})
@@ -256,6 +310,9 @@ chat_id — id из tg_folder_chats; send=true — нужна и отправк�
 только когда чат действительно нужен для задачи владельца.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in requestAccessIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				if err := checkAccount(in.Account); err != nil {
+					return nil, err
+				}
 				return core.RequestAccess(ctx, s, in.ChatID, true, in.Send, in.Reason)
 			})
 		})

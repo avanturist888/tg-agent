@@ -54,8 +54,11 @@ type response struct {
 
 // Address — имя канала: своё для каждой установки и профиля (по пути к
 // каталогу профиля; у основного это корень установки — имя прежнее).
-func Address() string {
-	sum := sha256.Sum256([]byte(strings.ToLower(config.Home())))
+func Address() string { return AddressOf(config.Home()) }
+
+// AddressOf — канал службы профиля с каталогом home (другого аккаунта).
+func AddressOf(home string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(home)))
 	return address(hex.EncodeToString(sum[:6]))
 }
 
@@ -173,8 +176,13 @@ func Up(ctx context.Context) bool {
 // Call выполняет операцию в службе. out — куда разобрать результат (может быть nil).
 // Возвращает сборку службы (для прослойки: сменилась — перечитать инструменты).
 func Call(ctx context.Context, op string, args, out any) (string, error) {
+	return CallAt(ctx, Address(), op, args, out)
+}
+
+// CallAt — то же в службе с каналом addr (служба другого аккаунта).
+func CallAt(ctx context.Context, addr, op string, args, out any) (string, error) {
 	dctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	conn, err := dial(dctx, Address())
+	conn, err := dial(dctx, addr)
 	cancel()
 	if err != nil {
 		return "", Unavailable

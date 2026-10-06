@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"tgagent/internal/accounts"
 	"tgagent/internal/attach"
 	"tgagent/internal/audit"
 	"tgagent/internal/bot"
@@ -96,10 +97,19 @@ func Notify(ctx context.Context, s *config.Settings, d *outbox.Draft, title, not
 }
 
 func title(s *config.Settings, d *outbox.Draft) string {
+	t := d.Chat
 	if rule, ok := s.Chats[d.Chat]; ok {
-		return rule.Title
+		t = rule.Title
 	}
-	return d.Chat
+	return t + accountMark()
+}
+
+// accountMark — у кого из аккаунтов чат (в карточках, пока аккаунтов несколько).
+func accountMark() string {
+	if !config.Multi() {
+		return ""
+	}
+	return " · аккаунт " + config.AccountName()
 }
 
 // card переписывает карточку итогом (строка статуса — в markdown).
@@ -176,6 +186,10 @@ func errName(err error) string {
 	return "Error"
 }
 
+// ownsUpdates — этот аккаунт сам разбирает апдейты своего бота. У общего бота
+// их разбирает основная служба: второй getUpdates сорвал бы её.
+func ownsUpdates(s *config.Settings) bool { return s.BotReady() && !s.SharedBot }
+
 // HandleCallback — нажатие кнопки под карточкой.
 func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) {
 	data := q.Data
@@ -184,12 +198,25 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		_ = audit.Log(s.AuditPath(), "callback_rejected", "sender", q.From.ID, "data", data)
 		return
 	}
+	// «@work|…» — кнопка аккаунта work под общим ботом: решает его служба
+	if acct, rest := config.SplitCallback(data); acct != "" {
+		if !config.IsOwnAccount(acct) {
+			passCallback(ctx, s, q, acct)
+			return
+		}
+		data = rest
+		q.Data = rest
+	}
 	if strings.HasPrefix(data, "s:") {
 		handleAutoCallback(ctx, s, q) // переключатель автоотправки (/auto)
 		return
 	}
 	if strings.HasPrefix(data, "a:") {
 		handleAccessCallback(ctx, s, q) // запрос доступа к чату
+		return
+	}
+	if strings.HasPrefix(data, "n:") {
+		handleNotesCallback(ctx, s, q) // заметки к аккаунтам (/notes)
 		return
 	}
 	if !strings.HasPrefix(data, "d:") {
@@ -268,6 +295,22 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		summary = "✋ **Отклонено** — сообщение не ушло."
 	}
 	card(ctx, s, cardID, d, summary)
+}
+
+// passCallback — отдать нажатие службе аккаунта acct (без неё — дочернему
+// процессу того аккаунта).
+func passCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery, acct string) {
+	name := config.FindAccount(acct)
+	if name == "" {
+		bot.AnswerCallback(ctx, s, q.ID, "Аккаунта "+acct+" больше нет.")
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Minute) // «Отправить» ждёт отправки
+	defer cancel()
+	if err := accounts.Call(cctx, name, "callback", q, nil); err != nil {
+		bot.AnswerCallback(ctx, s, q.ID, "Аккаунт "+name+": "+err.Error())
+		_ = audit.Log(s.AuditPath(), "callback_pass_failed", "account", name, "error", err.Error())
+	}
 }
 
 func samePtr(a, b *int64) bool {
@@ -386,6 +429,9 @@ func SendDueLoop(ctx context.Context, loader func() (*config.Settings, error)) e
 // Вызывается только тем, кто держит лок на getUpdates. Попутно отправляет
 // запланированные черновики, чьё время пришло.
 func Pump(ctx context.Context, s *config.Settings, until time.Time, stop func() bool) {
+	if s.SharedBot {
+		return // апдейты общего бота — забота основной службы
+	}
 	offset := readOffset(s)
 	for time.Now().Before(until) {
 		if ctx.Err() != nil {
@@ -459,7 +505,7 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 		return isFinal(d.Status) || (d.Status == outbox.Approved && d.SendError != nil)
 	}
 	updates := lock.New(s.UpdatesLockPath(), 500*time.Millisecond)
-	if s.BotReady() && updates.Acquire(ctx) == nil {
+	if ownsUpdates(s) && updates.Acquire(ctx) == nil {
 		// службы нет — качаем апдейты бота сами, пока ждём
 		Pump(ctx, s, deadline, resolved)
 		updates.Release()
@@ -480,18 +526,18 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 		return nil, err
 	}
 	if d.Status == outbox.Approved && d.SendError != nil {
-		return omap.New().Set("draft_id", draftID).Set("chat", d.Chat).Set("status", "send_failed").
+		return omap.New().Set("draft_id", draftID).Set("chat", s.Ref(d.Chat)).Set("status", "send_failed").
 			Set("error", *d.SendError).Set("hint",
 			"Владелец НАЖАЛ «Отправить», но отправка сорвалась (см. error). Черновик "+
 				"одобрен — повтори отправку через tg_send_draft(draft_id), новое "+
 				"подтверждение не нужно. Если снова не выйдет, скажи владельцу."), nil
 	}
 	if d.Status == outbox.Approved {
-		return omap.New().Set("draft_id", draftID).Set("chat", d.Chat).Set("status", "sending").
+		return omap.New().Set("draft_id", draftID).Set("chat", s.Ref(d.Chat)).Set("status", "sending").
 			Set("hint", "Владелец нажал «Отправить», отправка идёт — проверь через tg_list_drafts чуть позже."), nil
 	}
 	if d.Status == outbox.Scheduled {
-		return omap.New().Set("draft_id", draftID).Set("chat", d.Chat).Set("status", "scheduled").
+		return omap.New().Set("draft_id", draftID).Set("chat", s.Ref(d.Chat)).Set("status", "scheduled").
 			Set("send_at", d.SendAt).
 			Set("hint", "Черновик на автоотправке, время ещё не пришло. Отменить — tg_cancel_draft."), nil
 	}
@@ -510,7 +556,7 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 	default:
 		hint = "Человек пока не нажал кнопку. Карточка в боте жива: сообщи об этом и займись другим."
 	}
-	return omap.New().Set("draft_id", draftID).Set("chat", d.Chat).Set("status", status).
+	return omap.New().Set("draft_id", draftID).Set("chat", s.Ref(d.Chat)).Set("status", status).
 		Set("message_id", d.MessageID).Set("hint", hint), nil
 }
 
@@ -573,6 +619,9 @@ func RunButtons(ctx context.Context, s *config.Settings, loader func() (*config.
 
 // SweepOnce — разобрать накопившиеся нажатия и выйти, если демон не крутится.
 func SweepOnce(ctx context.Context, s *config.Settings) (int64, error) {
+	if s.SharedBot {
+		return 0, &Bad{Msg: "Бот общий с основным профилем: нажатия разбирает основная служба."}
+	}
 	before := readOffset(s)
 	err := lock.With(ctx, s.UpdatesLockPath(), 5*time.Second, func() error {
 		Pump(ctx, s, time.Now().Add(3*time.Second), nil)

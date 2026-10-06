@@ -140,7 +140,7 @@ func FolderChats(ctx context.Context, s *config.Settings, folder string) (*omap.
 		}
 		item.Set("unread", r.Unread)
 		if rule, ok := known[r.ID]; ok {
-			item.Set("alias", rule.Alias).Set("can_read", rule.Read).Set("can_send", rule.Send)
+			item.Set("alias", s.Ref(rule.Alias)).Set("can_read", rule.Read).Set("can_send", rule.Send)
 		} else {
 			item.Set("alias", nil)
 		}
@@ -263,7 +263,7 @@ func RequestAccess(ctx context.Context, s *config.Settings, chatID int64, read, 
 	}
 	out := omap.New().Set("chat_id", chatID).Set("title", info.Title)
 	if existing != nil && (existing.Read || !read) && (existing.Send || !send) {
-		return out.Set("status", "already_allowed").Set("alias", existing.Alias).
+		return out.Set("status", "already_allowed").Set("alias", s.Ref(existing.Alias)).
 			Set("can_read", existing.Read).Set("can_send", existing.Send), nil
 	}
 	// такой же запрос ещё ждёт кнопки — вторую карточку не шлём
@@ -330,16 +330,17 @@ func accessCardMarkdown(r *accessRequest, existing *config.ChatRule, status stri
 	return b.String()
 }
 
-func accessKeyboard(r *accessRequest) map[string]any {
+func accessKeyboard(s *config.Settings, r *accessRequest) map[string]any {
 	grant := "r"
 	if r.Send {
 		grant = "rw"
 	}
-	rows := [][]map[string]string{{{"text": "✅ Разрешить", "callback_data": "a:" + r.ID + ":" + grant}}}
+	p := s.CallbackPrefix() + "a:" + r.ID + ":"
+	rows := [][]map[string]string{{{"text": "✅ Разрешить", "callback_data": p + grant}}}
 	if r.Send && r.Read {
-		rows = append(rows, []map[string]string{{"text": "👁 Только чтение", "callback_data": "a:" + r.ID + ":r"}})
+		rows = append(rows, []map[string]string{{"text": "👁 Только чтение", "callback_data": p + "r"}})
 	}
-	rows = append(rows, []map[string]string{{"text": "✋ Отказать", "callback_data": "a:" + r.ID + ":no"}})
+	rows = append(rows, []map[string]string{{"text": "✋ Отказать", "callback_data": p + "no"}})
 	return map[string]any{"inline_keyboard": rows}
 }
 
@@ -349,7 +350,7 @@ func sendAccessCard(ctx context.Context, s *config.Settings, r *accessRequest, e
 	}
 	err := bot.Call(ctx, s, "sendRichMessage", map[string]any{
 		"chat_id":      s.ApprovalChatID,
-		"reply_markup": accessKeyboard(r),
+		"reply_markup": accessKeyboard(s, r),
 		"rich_message": map[string]string{"markdown": accessCardMarkdown(r, existing, "")},
 	}, &msg)
 	return msg.MessageID, err
@@ -467,7 +468,7 @@ func afterAccess(ctx context.Context, r *accessRequest) {
 	text := fmt.Sprintf("tg-agent: владелец отказал в доступе к чату «%s» (запрос %s). Не проси снова без новой просьбы владельца.", r.Title, r.ID)
 	if r.Status == accessGranted {
 		text = fmt.Sprintf("tg-agent: владелец открыл чат «%s» (запрос %s): alias %q, %s. "+
-			"Обращайся к нему по alias, правила — в tg_list_chats.", r.Title, r.ID, r.Alias, rights(r.CanRead, r.CanSend))
+			"Обращайся к нему по alias, правила — в tg_list_chats.", r.Title, r.ID, s.Ref(r.Alias), rights(r.CanRead, r.CanSend))
 	}
 	if err := inbox.Send(ctx, *r.Agent, "tg-agent", text); err != nil && r.Agent.Session != "" {
 		_ = wakeT3(ctx, s, r.Agent.Session, text) // сессию остановил T3 Code
@@ -480,7 +481,7 @@ func WaitAccess(ctx context.Context, s *config.Settings, id string, timeoutSec i
 		return nil, err
 	}
 	if loadAccess(accessPath(s))[id] == nil {
-		return nil, &Bad{Msg: "Запроса " + id + " нет."}
+		return nil, &NotFound{Msg: "Запроса " + id + " нет."}
 	}
 	limit := s.ApprovalTimeoutSec
 	if timeoutSec > 0 && timeoutSec < limit {
@@ -492,7 +493,7 @@ func WaitAccess(ctx context.Context, s *config.Settings, id string, timeoutSec i
 		return r == nil || r.Status != accessPending
 	}
 	updates := lock.New(s.UpdatesLockPath(), 500*time.Millisecond)
-	if !tgc.InService() && s.BotReady() && updates.Acquire(ctx) == nil {
+	if !tgc.InService() && ownsUpdates(s) && updates.Acquire(ctx) == nil {
 		// службы нет — качаем апдейты бота сами, пока ждём
 		Pump(ctx, s, deadline, resolved)
 		updates.Release()
@@ -508,7 +509,7 @@ func WaitAccess(ctx context.Context, s *config.Settings, id string, timeoutSec i
 	out := omap.New().Set("request_id", id).Set("chat_id", r.Peer).Set("title", r.Title).Set("status", r.Status)
 	switch r.Status {
 	case accessGranted:
-		out.Set("alias", r.Alias).Set("can_read", r.CanRead).Set("can_send", r.CanSend).
+		out.Set("alias", s.Ref(r.Alias)).Set("can_read", r.CanRead).Set("can_send", r.CanSend).
 			Set("hint", "Чат в белом списке — обращайся к нему по alias.")
 	case accessDenied:
 		out.Set("hint", "Владелец отказал. Не проси снова без его новой просьбы.")

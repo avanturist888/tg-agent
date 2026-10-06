@@ -4,6 +4,7 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/term"
 
+	"tgagent/internal/accounts"
 	"tgagent/internal/audit"
 	"tgagent/internal/chatsfile"
 	"tgagent/internal/config"
@@ -28,6 +30,7 @@ import (
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
 	"tgagent/internal/service"
+	"tgagent/internal/svc"
 	"tgagent/internal/tgc"
 )
 
@@ -97,6 +100,7 @@ func init() {
 		{name: "tool-list", run: cmdToolList},
 		{name: "tool-call", run: cmdToolCall},
 		{name: "send-due", run: cmdSendDue},
+		{name: "op", run: cmdOp},
 	}
 }
 
@@ -771,6 +775,28 @@ func cmdToolCall(ctx context.Context, args []string) int {
 		res = *mcpserver.Failed(err)
 	}
 	return writeJSON(&res)
+}
+
+// cmdOp — операция службы на месте: так её вызывает служба другого
+// аккаунта, когда службы этого аккаунта нет (internal/accounts).
+func cmdOp(ctx context.Context, args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "Использование: tg op <операция> < аргументы.json")
+		return 2
+	}
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return fail(err)
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		raw = []byte("null")
+	}
+	var rep accounts.Reply
+	if err := service.Do(ctx, args[0], json.RawMessage(raw), &rep.Result); err != nil {
+		rep.Result = nil
+		rep.Error = &svc.Error{Kind: mcpserver.ErrorKind(err), Message: err.Error()}
+	}
+	return writeJSON(&rep)
 }
 
 // cmdSendDue — дослать автоотправку в срок, когда службы нет.

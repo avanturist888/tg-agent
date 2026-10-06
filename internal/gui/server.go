@@ -127,6 +127,53 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/login/start", s.loginStart)
 	mux.HandleFunc("GET /api/login/state", s.loginState)
 	mux.HandleFunc("POST /api/login/answer", s.loginAnswer)
+	mux.HandleFunc("GET /api/notes", s.notes)
+	mux.HandleFunc("POST /api/notes", s.addNote)
+	mux.HandleFunc("DELETE /api/notes/{id}", s.deleteNote)
+}
+
+// ── заметки к аккаунтам (общие для всех профилей: core/notes.go) ─────────
+
+func (s *Server) notes(w http.ResponseWriter, r *http.Request) {
+	out := []*omap.Map{}
+	for _, acct := range config.Accounts() {
+		notes := []*omap.Map{}
+		for _, n := range core.NotesOf(acct) {
+			notes = append(notes, omap.New().Set("id", n.ID).Set("text", n.Text).Set("by", n.Author()).Set("at", n.At))
+		}
+		out = append(out, omap.New().Set("account", acct).Set("user", core.AccountLabel(acct)).
+			Set("own", config.IsOwnAccount(acct)).Set("notes", notes))
+	}
+	writeJSON(w, out)
+}
+
+func (s *Server) addNote(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Account string `json:"account"`
+		Text    string `json:"text"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	n, err := core.AddNote(in.Account, in.Text, "owner", "")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	logGUI("account_note_added", "account", in.Account, "note_id", n.ID, "by", "owner_gui", "chars", len([]rune(n.Text)))
+	writeJSON(w, omap.New().Set("ok", true).Set("id", n.ID))
+}
+
+func (s *Server) deleteNote(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	acct, err := core.DeleteNote(id, false)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	logGUI("account_note_deleted", "account", acct, "note_id", id, "by", "owner_gui")
+	writeJSON(w, omap.New().Set("ok", true))
 }
 
 // ── состояние ────────────────────────────────────────────────────────────

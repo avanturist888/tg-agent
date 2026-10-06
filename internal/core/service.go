@@ -64,7 +64,7 @@ func sendable(s *config.Settings, chat string) (config.ChatRule, error) {
 func ListChats(ctx context.Context, s *config.Settings, withStatus bool) (*omap.Map, error) {
 	var chats []*omap.Map
 	for _, rule := range s.Rules() {
-		item := rule.AsMap()
+		item := rule.AsMap().Set("alias", s.Ref(rule.Alias))
 		if rule.Read {
 			path := FeedPath(s, rule.Alias)
 			feed := omap.New().Set("path", path).Set("last_id", LastID(path))
@@ -85,15 +85,23 @@ func ListChats(ctx context.Context, s *config.Settings, withStatus bool) (*omap.
 		if err != nil {
 			return nil, err
 		}
-		for _, item := range chats {
-			alias, _ := item.Get("alias")
-			item.Merge(status[alias.(string)])
+		for i, rule := range s.Rules() {
+			chats[i].Merge(status[rule.Alias])
 		}
 	}
 	if chats == nil {
 		chats = []*omap.Map{}
 	}
-	return omap.New().Set("send_policy", s.SendPolicy).Set("chats", chats), nil
+	out := omap.New()
+	notes := NotesOf(config.AccountName())
+	switch {
+	case s.Agent != nil: // агенту из контейнера — только его чаты, про аккаунты ни к чему
+	case config.Multi():
+		out.Set("account", config.AccountName()).Set("user", selfLabel(ctx, s)).Set("notes", notesView(notes))
+	case len(notes) > 0:
+		out.Set("account_notes", notesView(notes))
+	}
+	return out.Set("send_policy", s.SendPolicy).Set("chats", chats), nil
 }
 
 // ReadOpts — что читать.
@@ -176,7 +184,7 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 	if messages == nil {
 		messages = []*omap.Map{}
 	}
-	return omap.New().Set("chat", rule.Alias).Set("title", rule.Title).Set("count", len(messages)).
+	return omap.New().Set("chat", s.Ref(rule.Alias)).Set("title", rule.Title).Set("count", len(messages)).
 		Set("oldest_id", oldest).Set("newest_id", newest).Set("messages", messages), nil
 }
 
@@ -265,7 +273,7 @@ func DownloadFile(ctx context.Context, s *config.Settings, chat string, messageI
 	if got.Duration != nil {
 		dur = *got.Duration
 	}
-	return omap.New().Set("chat", rule.Alias).Set("message_id", messageID).Set("path", got.Path).
+	return omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("path", got.Path).
 		Set("name", got.Name).Set("mime_type", got.MIME).Set("size", got.Size).Set("duration", dur).
 		Set("cached", got.Cached), nil
 }
@@ -281,6 +289,12 @@ var reactionHints = map[string]string{
 type Bad struct{ Msg string }
 
 func (e *Bad) Error() string { return e.Msg }
+
+// NotFound — нет такого запроса или заметки (у агента — not_found: может
+// быть, он у другого аккаунта).
+type NotFound struct{ Msg string }
+
+func (e *NotFound) Error() string { return e.Msg }
 
 // React — реакция сразу, без карточки: эмодзи на чужое сообщение ничего не
 // может унести из контекста, а кнопка на каждый 👍 была бы пыткой.
@@ -327,7 +341,7 @@ func React(ctx context.Context, s *config.Settings, chat string, messageID int, 
 	if reactions != nil {
 		now = reactions
 	}
-	return omap.New().Set("chat", rule.Alias).Set("message_id", messageID).Set("emoji", emojiVal).Set("reactions_now", now), nil
+	return omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("emoji", emojiVal).Set("reactions_now", now), nil
 }
 
 // ViewMedia — изображение из разрешённого чата, для показа модели.
@@ -349,7 +363,7 @@ func ViewMedia(ctx context.Context, s *config.Settings, chat string, messageID i
 		return nil, nil, err
 	}
 	logEvent(s, "view_media", "chat", rule.Alias, "message_id", messageID, "kind", img.Kind)
-	meta := omap.New().Set("chat", rule.Alias).Set("message_id", messageID).Set("kind", img.Kind).
+	meta := omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("kind", img.Kind).
 		Set("caption", img.Caption).Set("bytes", len(img.Data))
 	return meta, img, nil
 }
@@ -365,7 +379,7 @@ func TranscribeMessage(ctx context.Context, s *config.Settings, chat string, mes
 	cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
 	key := fmt.Sprintf("%s:%d", rule.Alias, messageID)
 	if cached, ok := cache.Get(key); ok {
-		return omap.New().Set("chat", rule.Alias).Set("message_id", messageID).Set("transcript_status", "done").
+		return omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("transcript_status", "done").
 			Set("transcript", cached).Set("cached", true), nil
 	}
 	var (
@@ -406,7 +420,7 @@ func TranscribeMessage(ctx context.Context, s *config.Settings, chat string, mes
 		}
 		if rpcErr != nil {
 			logEvent(s, "transcribe", "chat", rule.Alias, "message_id", messageID, "error", rpcErr.Error())
-			return omap.New().Set("chat", rule.Alias).Set("message_id", messageID).Set("duration", durVal(duration)).
+			return omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("duration", durVal(duration)).
 				Set("transcript_status", "error").Set("transcript", nil).
 				Set("transcript_error", tgc.RPCErrorText(rpcErr)).
 				Set("transcript_hint", "Telegram не расшифровал — "+tgc.STTHint), nil
@@ -424,7 +438,7 @@ func TranscribeMessage(ctx context.Context, s *config.Settings, chat string, mes
 		cache.Put(key, got.Text)
 	}
 	logEvent(s, "transcribe", "chat", rule.Alias, "message_id", messageID, "status", got.Status)
-	out := omap.New().Set("chat", rule.Alias).Set("message_id", messageID).Set("duration", durVal(duration)).Set("cached", false)
+	out := omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("duration", durVal(duration)).Set("cached", false)
 	tgc.ApplyTranscript(out, got)
 	return out, nil
 }
@@ -502,7 +516,7 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 	for _, f := range d.Files {
 		filesOut = append(filesOut, omap.New().Set("name", f.Name).Set("size", f.Size).Set("as", sentAs(f)))
 	}
-	out := omap.New().Set("draft_id", d.ID).Set("chat", rule.Alias).Set("text", d.Text).
+	out := omap.New().Set("draft_id", d.ID).Set("chat", s.Ref(rule.Alias)).Set("text", d.Text).
 		Set("reply_to", d.ReplyTo).Set("expires_at", d.ExpiresAt)
 
 	if auto {
@@ -639,7 +653,7 @@ func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string
 	reason, _ := result.Get("fallback_reason")
 	logEvent(s, "send", "draft_id", draftID, "chat", rule.Alias, "message_id", msgID,
 		"format", format, "fallback_reason", reason, "approved_by", by, "text", d.Text, "files", names)
-	return omap.New().Set("draft_id", draftID).Set("chat", rule.Alias).Set("sent", true).Merge(result), nil
+	return omap.New().Set("draft_id", draftID).Set("chat", s.Ref(rule.Alias)).Set("sent", true).Merge(result), nil
 }
 
 func toInt64(v any) int64 {
@@ -715,7 +729,7 @@ func ListDrafts(s *config.Settings, status string) (*omap.Map, error) {
 		if visibleDraft(s, d) != nil {
 			continue
 		}
-		row := omap.New().Set("id", d.ID).Set("chat", d.Chat).Set("status", d.Status).Set("text", d.Text).
+		row := omap.New().Set("id", d.ID).Set("chat", s.Ref(d.Chat)).Set("status", d.Status).Set("text", d.Text).
 			Set("created_at", d.CreatedAt).Set("expires_at", d.ExpiresAt).Set("message_id", d.MessageID)
 		if d.SendAt != nil {
 			row.Set("send_at", *d.SendAt)
@@ -725,7 +739,11 @@ func ListDrafts(s *config.Settings, status string) (*omap.Map, error) {
 		}
 		rows = append(rows, row)
 	}
-	return omap.New().Set("send_policy", s.SendPolicy).Set("drafts", rows), nil
+	out := omap.New()
+	if s.Agent == nil && config.Multi() {
+		out.Set("account", config.AccountName())
+	}
+	return out.Set("send_policy", s.SendPolicy).Set("drafts", rows), nil
 }
 
 // CancelDraft — tg_cancel_draft / tg reject.

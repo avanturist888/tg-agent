@@ -139,6 +139,9 @@ type Settings struct {
 	// Agent — вызов от агента из контейнера (HTTP): Chats уже урезаны до его
 	// чатов (Restrict). nil — местный агент или владелец.
 	Agent *Agent
+	// SharedBot — у профиля нет своего бота: карточки идут ботом основного
+	// профиля, а нажатия принимает основная служба (CallbackPrefix).
+	SharedBot bool
 }
 
 func (s *Settings) DataDir() string         { return DataPath() }
@@ -164,25 +167,22 @@ func (s *Settings) Rules() []ChatRule {
 }
 
 // Resolve — найти чат в белом списке по alias, id или username. Иначе — отказ.
+// Ссылка с именем своего аккаунта («work/team» в профиле work) — тоже своя.
 func (s *Settings) Resolve(chat string) (ChatRule, error) {
 	key := strings.TrimSpace(chat)
 	if key == "" {
 		return ChatRule{}, &Denied{"Не указан чат."}
 	}
-	low := strings.ToLower(key)
-	for _, a := range s.ChatOrder {
-		if strings.ToLower(a) == low {
-			return s.Chats[a], nil
-		}
+	if acct, alias, ok := SplitRef(key); ok && IsOwnAccount(acct) {
+		key = alias
 	}
-	for _, a := range s.ChatOrder {
-		rule := s.Chats[a]
-		peer := strings.ToLower(rule.PeerString())
-		if low == peer || strings.TrimLeft(low, "@") == strings.TrimLeft(peer, "@") {
-			return rule, nil
-		}
+	if rule, ok := FindChat(s.Chats, s.ChatOrder, key); ok {
+		return rule, nil
 	}
-	known := append([]string(nil), s.ChatOrder...)
+	known := make([]string, 0, len(s.ChatOrder))
+	for _, a := range s.ChatOrder {
+		known = append(known, s.Ref(a))
+	}
 	sort.Strings(known)
 	list := strings.Join(known, ", ")
 	if list == "" {
@@ -310,19 +310,10 @@ func defaultDonor() string {
 	return filepath.Join(home, ".local", "share", "cc-telegram-notify", "config.env")
 }
 
-// mainBotToken — токен бота основного профиля (из его .env или донора), не
-// трогая окружение процесса: профилю тот же бот брать нельзя.
+// mainBotToken — токен бота основного профиля.
 func mainBotToken() string {
-	values, _ := godotenv.Read(filepath.Join(Root, ".env"))
-	if tok := strings.TrimSpace(values["TG_BOT_TOKEN"]); tok != "" {
-		return tok
-	}
-	donor := values["TG_BOT_ENV_FILE"]
-	if donor == "" {
-		donor = defaultDonor()
-	}
-	d, _ := godotenv.Read(donor)
-	return strings.TrimSpace(d["NOTIFICATIONS_BOT_TOKEN"])
+	tok, _ := mainBot()
+	return tok
 }
 
 func parseProxy(raw string) (*url.URL, error) {
@@ -404,10 +395,13 @@ func load(requireCredentials bool) (*Settings, error) {
 	}
 
 	token, chatID := botCredentials()
-	if profile != "" && token != "" && token == mainBotToken() {
-		return nil, cfgErr("Профиль %s: тот же бот подтверждений, что у основного профиля, а апдейты бота "+
-			"слушает только одна служба. Заведи профилю своего бота (@BotFather) или убери TG_BOT_TOKEN из %s "+
-			"и поставь TG_SEND_POLICY=human_approval.", profile, EnvPath())
+	shared := false
+	if profile != "" && policy == "bot_approval" {
+		// своего бота нет (или он тот же) — бот основного профиля: карточки
+		// шлём сами, нажатия разбирает основная служба и передаёт нам
+		if mainTok, mainChat := mainBot(); mainTok != "" && (token == "" || token == mainTok) {
+			token, chatID, shared = mainTok, mainChat, true
+		}
 	}
 	if policy == "bot_approval" && (token == "" || chatID == 0) {
 		return nil, cfgErr("TG_SEND_POLICY=bot_approval, но не найден бот для подтверждений. " +
@@ -442,6 +436,7 @@ func load(requireCredentials bool) (*Settings, error) {
 		AutoSendDelaySec:   envInt("TG_AUTO_SEND_DELAY_SEC", 30),
 		Chats:              chats,
 		ChatOrder:          order,
+		SharedBot:          shared,
 	}, nil
 }
 
