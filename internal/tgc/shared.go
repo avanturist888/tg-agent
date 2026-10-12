@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -203,6 +204,13 @@ func Serve(ctx context.Context, s *config.Settings, ev Events, onReady func(ctx 
 		}
 	}()
 
+	// отметка обновлений и даты правок на диске: после перезапуска служба
+	// догоняет пропущенное за время простоя (updstate.go, edits.go)
+	upd := openUpdState(filepath.Join(s.DataDir(), "updates_state.json"))
+	edits.open(filepath.Join(s.DataDir(), "edit_dates.json"))
+	go upd.keep(ctx)
+	go edits.keep(ctx)
+
 	backoff := 2 * time.Second
 	for ctx.Err() == nil {
 		shared.mu.Lock()
@@ -213,6 +221,7 @@ func Serve(ctx context.Context, s *config.Settings, ev Events, onReady func(ctx 
 			// после выхода ключ отозван — новая сессия с чистого листа
 			_ = os.Remove(s.SessionPath)
 			_ = os.Remove(s.SessionPath + ".keyloss")
+			upd.reset()
 		}
 		started := time.Now()
 		octx, cancel := context.WithCancel(ctx)
@@ -227,7 +236,7 @@ func Serve(ctx context.Context, s *config.Settings, ev Events, onReady func(ctx 
 			shared.mu.Unlock()
 			cancel() // в памяти клиента уже новый ключ — начинаем с файла
 		})
-		err := serveOnce(octx, s, storage, ev, onReady, onNoLogin)
+		err := serveOnce(octx, s, storage, upd, ev, onReady, onNoLogin)
 		cancel()
 		shared.set(nil, false)
 		if ctx.Err() != nil {
@@ -248,7 +257,7 @@ func Serve(ctx context.Context, s *config.Settings, ev Events, onReady func(ctx 
 	return nil
 }
 
-func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage, ev Events,
+func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage, upd *updState, ev Events,
 	onReady func(ctx context.Context, c *Conn), onNoLogin func(ctx context.Context)) error {
 	c := &Conn{Settings: s, hub: newUpdateHub(), Peers: LoadPeers(s.PeersPath())}
 	d := tg.NewUpdateDispatcher()
@@ -296,7 +305,12 @@ func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage,
 		c.hub.transcribed(u)
 		return nil
 	})
-	gaps := updates.New(updates.Config{Handler: d})
+	gaps := updates.New(updates.Config{Handler: d, Storage: upd, AccessHasher: upd,
+		OnTooLong: func() {
+			// простой дольше, чем Telegram готов восполнить: новые сообщения
+			// догонит сверка лент, правки и удаления за это время потеряны
+			_ = audit.Log(s.AuditPath(), "updates_too_long")
+		}})
 	client, err := newClient(s, gaps, storage)
 	if err != nil {
 		return err

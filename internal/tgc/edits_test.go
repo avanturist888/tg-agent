@@ -1,6 +1,7 @@
 package tgc
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -40,5 +41,29 @@ func TestEditIsNotReaction(t *testing.T) {
 	hidden.EditHide = true
 	if tr.isNew(hidden, now) {
 		t.Fatal("скрытая правка (edit_hide) не будит")
+	}
+}
+
+func TestEditsSurviveRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "edit_dates.json")
+	stop := time.Unix(1_800_000_000, 0)
+	first := &editTracker{seen: map[string]int{}}
+	first.open(path)
+	if !first.isNew(edited(1, int(stop.Add(-5*time.Minute).Unix())), stop) {
+		t.Fatal("свежая правка")
+	}
+	first.save(stop) // служба остановилась
+
+	restart := stop.Add(3 * time.Hour)
+	again := &editTracker{seen: map[string]int{}}
+	again.open(path)
+	if again.isNew(edited(1, int(stop.Add(-5*time.Minute).Unix())), restart) {
+		t.Fatal("та же дата правки после перезапуска — реакция")
+	}
+	if !again.isNew(edited(2, int(stop.Add(time.Hour).Unix())), restart) {
+		t.Fatal("правка, сделанная пока служба не работала, должна прийти")
+	}
+	if again.isNew(edited(3, int(stop.Add(-48*time.Hour).Unix())), restart) {
+		t.Fatal("давняя правка (до остановки) без известной даты — реакция")
 	}
 }
