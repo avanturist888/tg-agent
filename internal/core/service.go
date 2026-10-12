@@ -731,9 +731,8 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 	if s.Agent != nil && len(files) > 0 {
 		return nil, &Bad{Msg: remoteNoFiles}
 	}
-	if names := fakeMentions(text); len(names) > 0 {
-		return nil, mentionError(ctx, s, rule, names)
-	}
+	// «@Имя» без username — в упоминание по id, где человек однозначен
+	text, mentionNotes := fixMentions(ctx, s, rule, text, format)
 	topic, topicName, err := draftTopic(ctx, s, rule, topic, replyTo)
 	if err != nil {
 		return nil, err
@@ -780,6 +779,9 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 		out.Set("topic", omap.New().Set("id", topic).Set("title", topicName))
 	}
 	out.Set("text", d.Text).Set("reply_to", d.ReplyTo).Set("expires_at", d.ExpiresAt)
+	if mentionNotes != nil {
+		out.Set("mentions", mentionNotes) // что из «@Имя» стало упоминанием, а что нет
+	}
 
 	if auto {
 		card := s.BotReady() && Notify(ctx, s, d, rule.Title, note) != 0
