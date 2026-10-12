@@ -173,6 +173,12 @@ type msgIn struct {
 	MessageID int    `json:"message_id" jsonschema:"id сообщения из tg_read_chat"`
 }
 
+type transcribeIn struct {
+	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
+	MessageID int    `json:"message_id" jsonschema:"id сообщения из tg_read_chat"`
+	Engine    string `json:"engine,omitempty" jsonschema:"auto (по умолчанию): русская речь — GigaAM, другая — Telegram; gigaam или telegram — принудительно"`
+}
+
 type searchIn struct {
 	Chat  string `json:"chat" jsonschema:"alias из tg_list_chats"`
 	Query string `json:"query" jsonschema:"что искать"`
@@ -398,16 +404,22 @@ topic     — только эта тема форума (id из tg_list_topics;
 reply_to_message — само исходное сообщение (у голосового — с расшифровкой);
 null — оно удалено. Дальше по цепочке — через ids.
 
+Пересланное сообщение — с forwarded_from: from тогда — тот, кто переслал,
+а автор оригинала — forwarded_from.from (или только имя —
+forwarded_from.name, если он скрыл аккаунт), forwarded_from.date — дата
+оригинала. Не приписывай пересланное собеседнику.
+
 Чат-форум (с темами): в ответе forum = true, у каждого сообщения topic —
 {id, title} темы, где оно лежит. Без topic приходят сообщения всех тем
 вперемешку. Отвечаешь в теме — пиши черновик с reply_to (тема определится
 сама) или с topic.
 
-Голосовые и кружки (media = voice / video_note) приходят с расшифровкой
-Telegram. transcript_status: done — transcript полный; pending — готово
-только начало (transcript_partial), дожми через tg_transcribe;
-not_requested — вызови tg_transcribe; error — скачай через
-tg_download_file и расшифруй своим STT.`},
+Голосовые и кружки (media = voice / video_note) приходят с расшифровкой:
+русская речь — GigaAM на машине владельца, другая — Telegram; чем именно —
+transcript_engine, язык — transcript_language. transcript_status: done —
+transcript полный; pending — готово только начало (transcript_partial),
+дожми через tg_transcribe; not_requested — вызови tg_transcribe; error —
+скачай через tg_download_file и расшифруй своим STT.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in readChatIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 				return core.ReadChat(ctx, s, in.Chat, core.ReadOpts{Limit: in.Limit, BeforeID: in.BeforeID,
@@ -473,16 +485,20 @@ pinned, hidden. У General id = 1. Если чат добавлен в белы�
 
 	mcp.AddTool(server, &mcp.Tool{Name: "tg_transcribe", Annotations: readOnly, Description: `Расшифровать голосовое или кружок из разрешённого чата.
 
-Использует встроенную расшифровку Telegram (как кнопка «→A» в
-приложении) и ждёт ПОЛНЫЙ текст — Telegram отдаёт его частями, до
-финала может пройти до пары минут на длинной записи. Нужен, когда в
-tg_read_chat transcript_status = pending или not_requested.
-Записи от ~5 минут Telegram не расшифровывает (status = error,
-MSG_VOICE_TOO_LONG) — тогда скачай tg_download_file и прогони через STT.
+Русскую речь расшифровывает GigaAM на машине владельца (если установлен):
+точнее Telegram, с пунктуацией, без ограничения длины. Язык определяется
+сам; другой язык — встроенная расшифровка Telegram (кнопка «→A»), она
+ждёт ПОЛНЫЙ текст (до пары минут на длинной записи). Чем расшифровано —
+transcript_engine (gigaam-… или telegram), язык — transcript_language.
+
+Нужен, когда в tg_read_chat transcript_status = pending или
+not_requested, или когда расшифровка вышла странной: engine = gigaam —
+речь точно русская, без определения языка; engine = telegram — силами
+Telegram (записи от ~5 минут он не берёт: MSG_VOICE_TOO_LONG).
 Расшифровка автоматическая: имена, термины и цифры могут быть искажены.`},
-		func(ctx context.Context, _ *mcp.CallToolRequest, in msgIn) (*mcp.CallToolResult, any, error) {
+		func(ctx context.Context, _ *mcp.CallToolRequest, in transcribeIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 7*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
-				return core.TranscribeMessage(ctx, s, in.Chat, in.MessageID)
+				return core.TranscribeMessage(ctx, s, in.Chat, in.MessageID, in.Engine)
 			})
 		})
 

@@ -269,13 +269,13 @@ func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage,
 		return nil
 	})
 	d.OnEditMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateEditMessage) error {
-		if visibleEdit(u.Message) {
+		if edits.isNew(u.Message, time.Now()) { // не реакция и не повтор той же правки
 			message(ev.Edit, e, u.Message)(ctx)
 		}
 		return nil
 	})
 	d.OnEditChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateEditChannelMessage) error {
-		if visibleEdit(u.Message) {
+		if edits.isNew(u.Message, time.Now()) { // не реакция и не повтор той же правки
 			message(ev.Edit, e, u.Message)(ctx)
 		}
 		return nil

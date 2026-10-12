@@ -33,10 +33,36 @@ try {
     go build -ldflags "-H=windowsgui $ldBuild" -o bin\tgw.new.exe ./cmd/tg
     if ($LASTEXITCODE -ne 0) { throw 'Сборка tgw.exe не удалась.' }
 
+    # tgstt.exe — расшифровка голосовых (stt\, sherpa-onnx через cgo): нужен
+    # gcc (MinGW). Без него голосовые расшифровывает только Telegram.
+    $names = @('tg', 'tgw')
+    if (Get-Command gcc -ErrorAction SilentlyContinue) {
+        $env:CGO_ENABLED = '1'
+        go build -C stt -o ..\bin\tgstt.new.exe .
+        $code = $LASTEXITCODE
+        Remove-Item Env:CGO_ENABLED
+        if ($code -ne 0) { throw 'Сборка tgstt.exe не удалась.' }
+        $names += 'tgstt'
+    } else {
+        Write-Warning 'gcc (MinGW) не найден — tgstt.exe не собран: голосовые расшифровывает только Telegram.'
+    }
+
     # прежние сборки, которые уже никто не держит, — убрать
     Get-ChildItem bin -Filter '*.old*.exe' | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+    Get-ChildItem bin -Filter '*.old-*.dll' | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    foreach ($name in 'tg', 'tgw') {
+    if ($names -contains 'tgstt') {
+        # библиотеки sherpa-onnx и onnxruntime — рядом с tgstt.exe; занятую
+        # запущенным tgstt не перезаписать — переименовываем, как exe
+        $lib = Join-Path (go list -C stt -m -f '{{.Dir}}' github.com/k2-fsa/sherpa-onnx-go-windows) 'lib\x86_64-pc-windows-gnu'
+        foreach ($dll in Get-ChildItem $lib -Filter '*.dll') {
+            $dst = "bin\$($dll.Name)"
+            if ((Test-Path $dst) -and (Get-FileHash $dst).Hash -eq (Get-FileHash $dll.FullName).Hash) { continue }
+            if (Test-Path $dst) { Move-Item $dst "bin\$($dll.BaseName).old-$stamp.dll" -Force }
+            Copy-Item $dll.FullName $dst
+        }
+    }
+    foreach ($name in $names) {
         $new = "bin\$name.new.exe"; $cur = "bin\$name.exe"
         # запущенный exe нельзя удалить, но можно переименовать; имя уникальное,
         # потому что прошлую «старую» сборку тоже может кто-то держать

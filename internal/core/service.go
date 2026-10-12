@@ -18,6 +18,7 @@ import (
 	"tgagent/internal/config"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
+	"tgagent/internal/stt"
 	"tgagent/internal/tgc"
 )
 
@@ -180,7 +181,7 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 		}
 		if o.Transcribe {
 			cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
-			c.AttachTranscripts(ctx, t, rule, append(messages, parents...), cache, s.TranscribePerCall)
+			c.AttachTranscripts(ctx, t, rule, append(messages, parents...), cache, s.TranscribePerCall, localSTT(s, rule))
 		}
 		return nil
 	})
@@ -535,42 +536,90 @@ func ViewMedia(ctx context.Context, s *config.Settings, chat string, messageID i
 // TranscribeMessage — расшифровать одно голосовое или кружок. Ждёт ПОЛНЫЙ
 // текст, но сессию между заходами отпускает: пока Telegram расшифровывает
 // длинную запись, остальные (отправка, чтение) не стоят.
-func TranscribeMessage(ctx context.Context, s *config.Settings, chat string, messageID int) (*omap.Map, error) {
+func TranscribeMessage(ctx context.Context, s *config.Settings, chat string, messageID int, engine string) (*omap.Map, error) {
 	rule, err := readable(s, chat)
 	if err != nil {
 		return nil, err
 	}
+	switch engine {
+	case "", "auto", "gigaam", tgc.EngineTelegram:
+	default:
+		return nil, &Bad{Msg: "engine: auto, gigaam или telegram."}
+	}
+	local := localSTT(s, rule)
+	if engine == "gigaam" {
+		if local.Local == nil {
+			return nil, &Bad{Msg: "GigaAM на этой машине не установлен (scripts\\install-stt.ps1) — только engine=telegram."}
+		}
+		local.Local = forcedRussian
+	}
+	if engine == tgc.EngineTelegram {
+		local.Local = nil
+	}
 	cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
 	key := fmt.Sprintf("%s:%d", rule.Alias, messageID)
-	if cached, ok := cache.Get(key); ok {
-		return omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("transcript_status", "done").
-			Set("transcript", cached).Set("cached", true), nil
+	if cached, ok := cache.Get(key); ok && !cached.Stale(local) &&
+		(engine == "" || engine == "auto" || strings.HasPrefix(cached.Engine, engine)) {
+		out := omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("cached", true)
+		tgc.ApplyTranscript(out, cached)
+		return out, nil
 	}
 	var (
 		duration *float64
 		deadline time.Time
+		path     string
 		got      = tgc.Transcript{Status: "pending"}
 		rpcErr   error
+		tried    tgc.Transcript // что сказала своя расшифровка, если дело дошло до Telegram
 	)
+	// своя расшифровка: скачать голосовое, а модель гонять уже без сессии Telegram
+	err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
+		t, err := c.Resolve(ctx, rule)
+		if err != nil {
+			return err
+		}
+		m, _, err := c.Message(ctx, t, messageID)
+		if err != nil {
+			return err
+		}
+		msg, ok := m.(*tgc.MessageT)
+		if !ok || m == nil || !(tgc.IsVoice(msg) || tgc.IsVideoNote(msg)) {
+			return &Bad{fmt.Sprintf("Сообщение %d — не голосовое и не кружок.", messageID)}
+		}
+		if f := tgc.File(msg); f != nil {
+			duration = f.Duration
+		}
+		if local.Local != nil {
+			file, err := c.DownloadFile(ctx, t, messageID, local.Dir, local.MaxBytes)
+			if err != nil {
+				tried.LocalError = "голосовое не скачалось: " + err.Error()
+			} else {
+				path = file.Path
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if path != "" {
+		done, ok := tgc.LocalFile(ctx, path, local)
+		if ok {
+			cache.Put(key, done)
+			logEvent(s, "transcribe", "chat", rule.Alias, "message_id", messageID, "status", "done", "engine", done.Engine)
+			out := omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("duration", durVal(duration)).
+				Set("cached", false)
+			tgc.ApplyTranscript(out, done)
+			return out, nil
+		}
+		tried = done
+	}
+	deadline = time.Now().Add(tgc.TranscribeTimeout(duration))
 	for {
 		err := tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
 			t, err := c.Resolve(ctx, rule)
 			if err != nil {
 				return err
-			}
-			if deadline.IsZero() {
-				m, _, err := c.Message(ctx, t, messageID)
-				if err != nil {
-					return err
-				}
-				msg, ok := m.(*tgc.MessageT)
-				if !ok || m == nil || !(tgc.IsVoice(msg) || tgc.IsVideoNote(msg)) {
-					return &Bad{fmt.Sprintf("Сообщение %d — не голосовое и не кружок.", messageID)}
-				}
-				if f := tgc.File(msg); f != nil {
-					duration = f.Duration
-				}
-				deadline = time.Now().Add(tgc.TranscribeTimeout(duration))
 			}
 			got, err = c.Transcribe(ctx, t, messageID, 8*time.Second)
 			if tgc.RPCMessage(err) != "" {
@@ -584,10 +633,18 @@ func TranscribeMessage(ctx context.Context, s *config.Settings, chat string, mes
 		}
 		if rpcErr != nil {
 			logEvent(s, "transcribe", "chat", rule.Alias, "message_id", messageID, "error", rpcErr.Error())
-			return omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("duration", durVal(duration)).
+			out := omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("duration", durVal(duration)).
 				Set("transcript_status", "error").Set("transcript", nil).
 				Set("transcript_error", tgc.RPCErrorText(rpcErr)).
-				Set("transcript_hint", "Telegram не расшифровал — "+tgc.STTHint), nil
+				Set("transcript_hint", "Telegram не расшифровал — "+tgc.STTHint).
+				Set("transcript_engine", tgc.EngineTelegram)
+			if tried.Language != "" {
+				out.Set("transcript_language", tried.Language)
+			}
+			if tried.LocalError != "" {
+				out.Set("transcript_local_error", tried.LocalError)
+			}
+			return out, nil
 		}
 		if got.Status == "done" || !time.Now().Before(deadline) {
 			break
@@ -598,13 +655,41 @@ func TranscribeMessage(ctx context.Context, s *config.Settings, chat string, mes
 		case <-time.After(4 * time.Second):
 		}
 	}
+	got.Engine, got.Language, got.LocalError = tgc.EngineTelegram, tried.Language, tried.LocalError
 	if got.Status == "done" {
-		cache.Put(key, got.Text)
+		cache.Put(key, got)
 	}
-	logEvent(s, "transcribe", "chat", rule.Alias, "message_id", messageID, "status", got.Status)
+	logEvent(s, "transcribe", "chat", rule.Alias, "message_id", messageID, "status", got.Status, "engine", got.Engine)
 	out := omap.New().Set("chat", s.Ref(rule.Alias)).Set("message_id", messageID).Set("duration", durVal(duration)).Set("cached", false)
 	tgc.ApplyTranscript(out, got)
 	return out, nil
+}
+
+// localSTT — своя расшифровка (GigaAM), если она установлена: русскую речь
+// расшифровывает она, остальное — Telegram.
+func localSTT(s *config.Settings, rule config.ChatRule) tgc.STT {
+	if !stt.Enabled() {
+		return tgc.STT{}
+	}
+	return tgc.STT{
+		Local: func(ctx context.Context, path string) (tgc.LocalResult, error) {
+			return sttResult(stt.Transcribe(ctx, path, "auto"))
+		},
+		Dir:      filepath.Join(s.DownloadsDir(), rule.Alias),
+		MaxBytes: int64(s.MaxDownloadMB) * 1024 * 1024,
+	}
+}
+
+// forcedRussian — GigaAM без определения языка (агент знает, что речь русская).
+func forcedRussian(ctx context.Context, path string) (tgc.LocalResult, error) {
+	return sttResult(stt.Transcribe(ctx, path, "ru"))
+}
+
+func sttResult(r stt.Result, err error) (tgc.LocalResult, error) {
+	if err != nil {
+		return tgc.LocalResult{}, err
+	}
+	return tgc.LocalResult{Done: r.Done(), Text: r.Text, Engine: r.Label(), Language: r.Language, Speech: r.Speech}, nil
 }
 
 func durVal(d *float64) any {

@@ -15,26 +15,50 @@ import (
 )
 
 // TranscriptCache — расшифровки по ключу «чат:сообщение» в data/transcripts.json.
-// Голосовое не меняется, поэтому готовый текст храним навсегда.
+// Голосовое не меняется, поэтому готовый текст храним навсегда. Запись —
+// {text, engine, language}; старые записи — просто текст Telegram.
 type TranscriptCache struct{ Path string }
 
-func (c TranscriptCache) load() map[string]string {
-	data := map[string]string{}
+type cachedTranscript struct {
+	Text     string `json:"text"`
+	Engine   string `json:"engine"`
+	Language string `json:"language,omitempty"`
+}
+
+func (c TranscriptCache) load() map[string]json.RawMessage {
+	data := map[string]json.RawMessage{}
 	if raw, err := os.ReadFile(c.Path); err == nil {
 		_ = json.Unmarshal(raw, &data)
 	}
 	return data
 }
 
-func (c TranscriptCache) Get(key string) (string, bool) {
-	v, ok := c.load()[key]
-	return v, ok
+// Get — готовая расшифровка из кэша.
+func (c TranscriptCache) Get(key string) (Transcript, bool) {
+	raw, ok := c.load()[key]
+	if !ok {
+		return Transcript{}, false
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return Transcript{Status: "done", Text: text, Engine: EngineTelegram}, true
+	}
+	var v cachedTranscript
+	if json.Unmarshal(raw, &v) != nil {
+		return Transcript{}, false
+	}
+	return Transcript{Status: "done", Text: v.Text, Engine: v.Engine, Language: v.Language}, true
 }
 
-func (c TranscriptCache) Put(key, text string) {
+// Put — запомнить готовую расшифровку.
+func (c TranscriptCache) Put(key string, got Transcript) {
 	_ = lock.With(context.Background(), c.Path, 45*time.Second, func() error {
 		data := c.load()
-		data[key] = text
+		entry, err := json.Marshal(cachedTranscript{Text: got.Text, Engine: got.Engine, Language: got.Language})
+		if err != nil {
+			return err
+		}
+		data[key] = entry
 		raw, err := omap.Marshal(data)
 		if err != nil {
 			return err
@@ -60,11 +84,70 @@ func TranscribeTimeout(duration *float64) time.Duration {
 	return time.Duration(min(300.0, 30.0+0.3*d) * float64(time.Second))
 }
 
+// EngineTelegram — встроенная расшифровка Telegram.
+const EngineTelegram = "telegram"
+
 // Transcript — результат расшифровки.
 type Transcript struct {
 	Status  string // done / pending
 	Text    string
 	Partial string
+	// Engine — чем расшифровано: telegram или gigaam-<модель>
+	Engine string
+	// Language — язык речи, если его определяли (детектор перед GigaAM)
+	Language string
+	// NoSpeech — речи не слышно (текст пустой не по ошибке)
+	NoSpeech bool
+	// LocalError — своя расшифровка сорвалась, поэтому Telegram
+	LocalError string
+}
+
+// Stale — расшифровку стоит переделать: это Telegram, а язык речи никто не
+// проверял (запись до своей расшифровки), и теперь есть GigaAM.
+func (t Transcript) Stale(o STT) bool {
+	return o.Local != nil && t.Engine == EngineTelegram && t.Language == ""
+}
+
+// LocalResult — ответ своей расшифровки (GigaAM).
+type LocalResult struct {
+	Done     bool // расшифровано; false — речь не русская, это дело Telegram
+	Text     string
+	Engine   string
+	Language string
+	Speech   bool
+}
+
+// STT — своя расшифровка перед Telegram: голосовое скачивается в Dir и
+// уходит в Local. Local == nil — только Telegram.
+type STT struct {
+	Local    func(ctx context.Context, path string) (LocalResult, error)
+	Dir      string
+	MaxBytes int64
+}
+
+// Local — расшифровать своими силами. ok = false — дальше Telegram
+// (got.Language/LocalError — почему).
+func (c *Conn) Local(ctx context.Context, t Target, msgID int, o STT) (got Transcript, ok bool) {
+	if o.Local == nil {
+		return Transcript{}, false
+	}
+	file, err := c.DownloadFile(ctx, t, msgID, o.Dir, o.MaxBytes)
+	if err != nil {
+		return Transcript{LocalError: "голосовое не скачалось: " + err.Error()}, false
+	}
+	return LocalFile(ctx, file.Path, o)
+}
+
+// LocalFile — то же для уже скачанного файла.
+func LocalFile(ctx context.Context, path string, o STT) (Transcript, bool) {
+	r, err := o.Local(ctx, path)
+	if err != nil {
+		return Transcript{LocalError: err.Error()}, false
+	}
+	if !r.Done {
+		return Transcript{Language: r.Language}, false
+	}
+	return Transcript{Status: "done", Text: r.Text, Engine: r.Engine, Language: r.Language, NoSpeech: !r.Speech}, true
 }
 
 // Transcribe — встроенная расшифровка Telegram (кнопка «→A»).
@@ -122,6 +205,7 @@ func ApplyTranscript(msg *omap.Map, got Transcript) {
 	} else {
 		msg.Set("transcript", nil)
 	}
+	applyEngine(msg, got)
 	if got.Status == "pending" {
 		msg.Set("transcript_partial", got.Partial)
 		msg.Set("transcript_hint", "расшифровка ещё не закончена, transcript_partial — только начало. "+
@@ -129,11 +213,31 @@ func ApplyTranscript(msg *omap.Map, got Transcript) {
 	}
 }
 
+// applyEngine — чем расшифровано и на каком языке речь.
+func applyEngine(msg *omap.Map, got Transcript) {
+	if got.Engine != "" {
+		msg.Set("transcript_engine", got.Engine)
+	}
+	if got.Language != "" {
+		msg.Set("transcript_language", got.Language)
+	}
+	if got.NoSpeech {
+		msg.Set("transcript_hint", "речи в записи не слышно")
+	}
+	if got.LocalError != "" {
+		msg.Set("transcript_local_error", got.LocalError)
+	}
+}
+
 // AttachTranscripts дописывает расшифровку к голосовым и кружкам. Чтение
 // чата не должно висеть минутами: ждём в пределах общего бюджета, остальное
 // агент доводит через tg_transcribe.
-func (c *Conn) AttachTranscripts(ctx context.Context, t Target, rule config.ChatRule, msgs []*omap.Map, cache TranscriptCache, budget int) {
-	deadline := time.Now().Add(20 * time.Second)
+func (c *Conn) AttachTranscripts(ctx context.Context, t Target, rule config.ChatRule, msgs []*omap.Map, cache TranscriptCache, budget int, o STT) {
+	window := 20 * time.Second
+	if o.Local != nil {
+		window = time.Minute // своя расшифровка: скачать и прогнать модель
+	}
+	deadline := time.Now().Add(window)
 	for _, msg := range msgs {
 		media, _ := msg.Get("media")
 		if media != "voice" && media != "video_note" {
@@ -142,8 +246,8 @@ func (c *Conn) AttachTranscripts(ctx context.Context, t Target, rule config.Chat
 		idv, _ := msg.Get("id")
 		id, _ := idv.(int)
 		key := fmt.Sprintf("%s:%d", rule.Alias, id)
-		if cached, ok := cache.Get(key); ok {
-			ApplyTranscript(msg, Transcript{Status: "done", Text: cached})
+		if cached, ok := cache.Get(key); ok && !cached.Stale(o) {
+			ApplyTranscript(msg, cached)
 			continue
 		}
 		left := time.Until(deadline)
@@ -160,17 +264,27 @@ func (c *Conn) AttachTranscripts(ctx context.Context, t Target, rule config.Chat
 				dur = &f
 			}
 		}
-		got, err := c.Transcribe(ctx, t, id, min(left, TranscribeTimeout(dur)))
+		lctx, cancel := context.WithDeadline(ctx, deadline)
+		local, ok := c.Local(lctx, t, id, o)
+		cancel()
+		if ok {
+			ApplyTranscript(msg, local)
+			cache.Put(key, local)
+			continue
+		}
+		got, err := c.Transcribe(ctx, t, id, max(time.Second, min(time.Until(deadline), TranscribeTimeout(dur))))
+		got.Engine, got.Language, got.LocalError = EngineTelegram, local.Language, local.LocalError
 		if err != nil {
 			msg.Set("transcript", nil)
 			msg.Set("transcript_status", "error")
 			msg.Set("transcript_error", RPCErrorText(err))
 			msg.Set("transcript_hint", "Telegram не расшифровал — "+STTHint)
+			applyEngine(msg, got)
 			continue
 		}
 		ApplyTranscript(msg, got)
 		if got.Status == "done" {
-			cache.Put(key, got.Text)
+			cache.Put(key, got)
 		}
 	}
 }

@@ -5,3 +5,6 @@ config/chats.toml
 profiles/
 config/t3.toml
 config/agents.toml
+
+# модели расшифровки голосовых (scripts\install-stt.ps1)
+stt/models/

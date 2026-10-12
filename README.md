@@ -37,8 +37,9 @@
   чатами, данными и службой (`tg --profile work …`, см. «Профили»). Агенты
   видят все аккаунты через один MCP-сервер `telegram`, карточки всех
   аккаунтов приходят в один бот; к аккаунтам можно оставлять заметки.
-- Голосовые и кружки агент получает расшифрованными — встроенной функцией
-  Telegram (Premium), с кэшем в `data/transcripts.json`.
+- Голосовые и кружки агент получает расшифрованными: русскую речь — моделью
+  GigaAM на этом компьютере (см. «Расшифровка голосовых»), остальное —
+  встроенной функцией Telegram (Premium); кэш — `data/transcripts.json`.
 - Сессия Telegram лежит локально в `data/session.json`, аудит всех действий —
   в `data/audit.jsonl`.
 - Инструкция для агентов: [AGENTS.md](AGENTS.md).
@@ -209,6 +210,31 @@ powershell -ExecutionPolicy Bypass -File <tg-agent>\scripts\build.ps1
 Прогоняет тесты, собирает и перезапускает службу. Агентов останавливать не
 нужно: их MCP-прослойка замечает новую сборку сама. Открытое окно управления
 открыть заново.
+
+### Расшифровка голосовых (GigaAM)
+
+Встроенная расшифровка Telegram на русском ошибается часто, поэтому русскую
+речь расшифровывает [GigaAM](https://github.com/salute-developers/GigaAM)
+v3 (Сбер, с пунктуацией) прямо на этом компьютере — через
+[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), на процессоре, без
+Python. Перед ней whisper base (только детектор языка) слушает до 29 с
+речи: русская — GigaAM, другая — Telegram. Длинные записи режутся по
+паузам (Silero VAD) на куски до 22 с — предела длины нет. 37 секунд
+голосового — около полутора секунд.
+
+```powershell
+# модели (≈ 380 МБ) в stt\models и проверка
+powershell -ExecutionPolicy Bypass -File scripts\install-stt.ps1
+```
+
+Программа — `bin\tgstt.exe` (исходники в `stt\`, свой Go-модуль: sherpa-onnx
+подключается через cgo), рядом её библиотеки `sherpa-onnx-c-api.dll` и
+`onnxruntime.dll`. Её собирает `scripts\build.ps1`, если есть gcc (MinGW);
+без gcc сборка проходит, а голосовые расшифровывает только Telegram. Нужен
+ffmpeg в PATH. Служба запускает tgstt при первом голосовом и закрывает после
+15 минут простоя; его вывод — в `data\service.log`. Агент видит, чем
+расшифровано: `transcript_engine` (`gigaam-v3_e2e_rnnt` или `telegram`) и
+`transcript_language`. `TG_STT=off` в `.env` — только Telegram.
 
 ## Команды владельца
 

@@ -562,6 +562,9 @@ func (c *Conn) Serialize(m tg.MessageClass, b *Batch) *omap.Map {
 			out.Set("text", richtext.ToMarkdown(rich))
 			out.Set("rich", true)
 		}
+		if fwd := forwardedFrom(v, b); fwd != nil {
+			out.Set("forwarded_from", fwd) // from — тот, кто переслал
+		}
 		if id := ReplyID(v); id != 0 {
 			out.Set("reply_to", id)
 		}
