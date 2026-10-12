@@ -562,6 +562,12 @@ func (c *Conn) Serialize(m tg.MessageClass, b *Batch) *omap.Map {
 			out.Set("text", richtext.ToMarkdown(rich))
 			out.Set("rich", true)
 		}
+		if v.Mentioned {
+			out.Set("mentioned", true) // упомянули владельца аккаунта
+		}
+		if ms := mentions(v, b); ms != nil {
+			out.Set("mentions", ms) // кого упомянули, в том числе людей без username
+		}
 		if fwd := forwardedFrom(v, b); fwd != nil {
 			out.Set("forwarded_from", fwd) // from — тот, кто переслал
 		}
@@ -679,7 +685,8 @@ func (c *Conn) ChatStatus(ctx context.Context, rules []config.ChatRule) (map[str
 					preview = truncateRunes(msg.Message, 160)
 				}
 			}
-			status[w.alias] = omap.New().Set("unread", dlg.UnreadCount).Set("last_message_at", at).Set("last_message_preview", preview)
+			status[w.alias] = omap.New().Set("unread", dlg.UnreadCount).Set("unread_mentions", dlg.UnreadMentionsCount).
+				Set("last_message_at", at).Set("last_message_preview", preview)
 		}
 	}
 	c.Peers.Save()

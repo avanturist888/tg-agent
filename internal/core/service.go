@@ -731,6 +731,9 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 	if s.Agent != nil && len(files) > 0 {
 		return nil, &Bad{Msg: remoteNoFiles}
 	}
+	if names := fakeMentions(text); len(names) > 0 {
+		return nil, mentionError(ctx, s, rule, names)
+	}
 	topic, topicName, err := draftTopic(ctx, s, rule, topic, replyTo)
 	if err != nil {
 		return nil, err

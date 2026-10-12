@@ -59,6 +59,10 @@ func Text(node tg.RichTextClass) string {
 		return fmt.Sprintf("[%s](tel:%s)", Text(n.Text), n.Phone)
 	case *tg.TextImage:
 		return ""
+	case *tg.TextMentionName: // упоминание человека без username — по id
+		return fmt.Sprintf("[%s](tg://user?id=%d)", Text(n.Text), n.UserID)
+	case *tg.TextMention:
+		return Text(n.Text)
 	}
 	// незнакомый тип из будущих слоёв: берём, что похоже на текст
 	return fallbackText(node)

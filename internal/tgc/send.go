@@ -123,6 +123,9 @@ func (c *Conn) SendMessage(ctx context.Context, t Target, text string, reply *in
 		}
 		reason := RPCErrorText(err)
 		plain, entities := ParseMarkdown(text)
+		for i, e := range entities {
+			entities[i] = c.mentionEntity(e) // [Имя](tg://user?id=…) — упоминание
+		}
 		req2 := &tg.MessagesSendMessageRequest{Message: plain}
 		if len(entities) > 0 {
 			req2.SetEntities(entities)
