@@ -83,6 +83,10 @@ type Draft struct {
 	// Topic — тема форума, куда уйдёт сообщение (0 — не форум), TopicTitle — её название
 	Topic      int
 	TopicTitle string
+	// EditOf — это не новое сообщение, а правка уже отправленного (его id);
+	// EditOld — его текст до правки (для карточки «было → станет»)
+	EditOf  int64
+	EditOld string
 
 	extra *omap.Map // поля от других версий — возвращаем при записи как есть
 }
@@ -91,7 +95,7 @@ var known = map[string]bool{
 	"id": true, "chat": true, "text": true, "reply_to": true, "created_at": true, "expires_at": true,
 	"status": true, "origin": true, "approved_at": true, "sent_at": true, "message_id": true,
 	"bot_message_id": true, "fmt": true, "files": true, "send_error": true, "note": true,
-	"history": true, "send_at": true, "topic": true, "topic_title": true,
+	"history": true, "send_at": true, "topic": true, "topic_title": true, "edit_of": true, "edit_old": true,
 }
 
 func (d *Draft) MarshalJSON() ([]byte, error) {
@@ -117,6 +121,9 @@ func (d *Draft) MarshalJSON() ([]byte, error) {
 	}
 	if d.Topic != 0 {
 		m.Set("topic", d.Topic).Set("topic_title", d.TopicTitle)
+	}
+	if d.EditOf != 0 {
+		m.Set("edit_of", d.EditOf).Set("edit_old", d.EditOld)
 	}
 	return m.MarshalJSON()
 }
@@ -147,6 +154,8 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		SendAt       *string           `json:"send_at"`
 		Topic        int               `json:"topic"`
 		TopicTitle   string            `json:"topic_title"`
+		EditOf       int64             `json:"edit_of"`
+		EditOld      string            `json:"edit_old"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
@@ -156,7 +165,7 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		ExpiresAt: aux.ExpiresAt, Status: aux.Status, Origin: aux.Origin, ApprovedAt: aux.ApprovedAt,
 		SentAt: aux.SentAt, MessageID: aux.MessageID, BotMessageID: aux.BotMessageID, Fmt: aux.Fmt,
 		Files: aux.Files, SendError: aux.SendError, Note: aux.Note, History: aux.History, SendAt: aux.SendAt,
-		Topic: aux.Topic, TopicTitle: aux.TopicTitle,
+		Topic: aux.Topic, TopicTitle: aux.TopicTitle, EditOf: aux.EditOf, EditOld: aux.EditOld,
 	}
 	if d.Status == "" {
 		d.Status = Pending
@@ -317,6 +326,9 @@ type CreateOpts struct {
 	// Topic, TopicTitle — тема форума (0 — не форум)
 	Topic      int
 	TopicTitle string
+	// EditOf, EditOld — правка отправленного сообщения (его id и прежний текст)
+	EditOf  int64
+	EditOld string
 }
 
 func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
@@ -343,6 +355,8 @@ func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
 		Note:       opts.Note,
 		Topic:      opts.Topic,
 		TopicTitle: opts.TopicTitle,
+		EditOf:     opts.EditOf,
+		EditOld:    opts.EditOld,
 	}
 	if opts.SendAt != nil {
 		at := audit.FormatTime(*opts.SendAt)

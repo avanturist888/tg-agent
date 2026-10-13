@@ -134,6 +134,7 @@ type Settings struct {
 	MaxDownloadMB      int
 	Reactions          bool
 	AutoSendDelaySec   int
+	EditWindowMin      int // сколько минут после отправки агент может править своё сообщение
 	Chats              map[string]ChatRule
 	ChatOrder          []string // порядок из chats.toml
 	// Agent — вызов от агента из контейнера (HTTP): Chats уже урезаны до его
@@ -434,6 +435,7 @@ func load(requireCredentials bool) (*Settings, error) {
 		MaxDownloadMB:      envInt("TG_MAX_DOWNLOAD_MB", 1024),
 		Reactions:          strings.ToLower(strings.TrimSpace(os.Getenv("TG_REACTIONS"))) != "off",
 		AutoSendDelaySec:   envInt("TG_AUTO_SEND_DELAY_SEC", 30),
+		EditWindowMin:      envInt("TG_EDIT_WINDOW_MIN", 60),
 		Chats:              chats,
 		ChatOrder:          order,
 		SharedBot:          shared,

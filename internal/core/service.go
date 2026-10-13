@@ -783,6 +783,17 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 		out.Set("mentions", mentionNotes) // что из «@Имя» стало упоминанием, а что нет
 	}
 
+	return finishDraft(ctx, s, rule, d, out.Set("files", filesOut), note, auto)
+}
+
+// finishDraft — показать черновик (или правку) владельцу по политике
+// отправки и сказать агенту, что дальше.
+func finishDraft(ctx context.Context, s *config.Settings, rule config.ChatRule, d *outbox.Draft, out *omap.Map,
+	note string, auto bool) (*omap.Map, error) {
+	what, button := "сообщение УЙДЁТ САМО", "«Отправить» отправляет сообщение само"
+	if d.EditOf != 0 {
+		what, button = "правка ПРИМЕНИТСЯ САМА", "«Исправить» применяет правку сама"
+	}
 	if auto {
 		card := s.BotReady() && Notify(ctx, s, d, rule.Title, note) != 0
 		ScheduleLocal(s, d)
@@ -790,34 +801,32 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 		if at, err := time.Parse(time.RFC3339, when); err == nil {
 			when = at.Local().Format("15:04:05")
 		}
-		return out.Set("files", filesOut).Set("send_policy", "auto_send").Set("status", "scheduled").
+		return out.Set("send_policy", "auto_send").Set("status", "scheduled").
 			Set("send_at", *d.SendAt).Set("card_sent", card).
-			Set("next_step", fmt.Sprintf("В этом чате автоотправка: сообщение УЙДЁТ САМО в %s (через %d с). "+
-				"Передумал — вызови tg_cancel_draft с этим draft_id до этого времени. Проверить, что ушло, — "+
-				"tg_wait_approval(draft_id).", when, s.AutoSendDelaySec)), nil
+			Set("next_step", fmt.Sprintf("В этом чате автоотправка: %s в %s (через %d с). "+
+				"Передумал — вызови tg_cancel_draft с этим draft_id до этого времени. Проверить — "+
+				"tg_wait_approval(draft_id).", what, when, s.AutoSendDelaySec)), nil
 	}
 
 	switch s.SendPolicy {
 	case "bot_approval":
 		card := Notify(ctx, s, d, rule.Title, note)
-		instruction := "Карточка с текстом ушла в бот подтверждений — человек нажмёт кнопку там. " +
-			"Вызови tg_wait_approval с этим draft_id и дождись результата; " +
-			"нажатие «Отправить» отправляет сообщение само."
+		instruction := "Карточка ушла в бот подтверждений — человек нажмёт кнопку там. " +
+			"Вызови tg_wait_approval с этим draft_id и дождись результата; нажатие " + button + "."
 		if card == 0 {
 			instruction = "Бот подтверждений недоступен, карточку показать не удалось. " +
 				"Скажи человеку и предложи подтвердить командой: " +
 				fmt.Sprintf("! %s approve %s --send", config.CLIHint(), d.ID)
 		}
-		return out.Set("files", filesOut).Set("send_policy", s.SendPolicy).Set("card_sent", card != 0).
-			Set("next_step", instruction), nil
+		return out.Set("send_policy", s.SendPolicy).Set("card_sent", card != 0).Set("next_step", instruction), nil
 	case "human_approval":
 		return out.Set("send_policy", s.SendPolicy).Set("next_step",
-			"Черновик создан, НО НЕ ОТПРАВЛЕН. Покажи пользователю текст целиком и попроси "+
+			"Черновик создан, НО НЕ ПРИМЕНЁН. Покажи пользователю текст целиком и попроси "+
 				fmt.Sprintf("подтвердить командой:  ! %s approve %s\n", config.CLIHint(), d.ID)+
 				"После подтверждения вызови tg_send_draft с этим draft_id."), nil
 	}
 	return out.Set("send_policy", s.SendPolicy).Set("next_step",
-		"Черновик создан, НО НЕ ОТПРАВЛЕН. Покажи пользователю текст целиком, дождись "+
+		"Черновик создан, НО НЕ ПРИМЕНЁН. Покажи пользователю текст целиком, дождись "+
 			"явного согласия в диалоге и только тогда вызови tg_send_draft "+
 			"(передай в user_confirmation дословную фразу пользователя)."), nil
 }
@@ -872,6 +881,14 @@ func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string
 			return err
 		}
 		t.Topic = d.Topic
+		if d.EditOf != 0 { // правка отправленного: только текст
+			r, err := c.EditMessage(ctx, t, int(d.EditOf), d.Text, d.Fmt)
+			if err != nil {
+				return err
+			}
+			result = r
+			return nil
+		}
 		if d.Text != "" {
 			r, err := c.SendMessage(ctx, t, d.Text, d.ReplyTo, d.Fmt)
 			if err != nil {
@@ -997,6 +1014,9 @@ func ListDrafts(s *config.Settings, status string) (*omap.Map, error) {
 		row := omap.New().Set("id", d.ID).Set("chat", s.Ref(d.Chat))
 		if d.Topic != 0 {
 			row.Set("topic", omap.New().Set("id", d.Topic).Set("title", d.TopicTitle))
+		}
+		if d.EditOf != 0 {
+			row.Set("edit_of", d.EditOf) // правка отправленного сообщения
 		}
 		row.Set("status", d.Status).Set("text", d.Text).
 			Set("created_at", d.CreatedAt).Set("expires_at", d.ExpiresAt).Set("message_id", d.MessageID)

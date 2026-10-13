@@ -197,6 +197,15 @@ type draftIn struct {
 	Topic   int      `json:"topic,omitempty" jsonschema:"тема форума, куда писать (id из tg_list_topics); при reply_to — по исходному сообщению"`
 }
 
+type editIn struct {
+	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
+	MessageID int64  `json:"message_id,omitempty" jsonschema:"id своего отправленного сообщения (из tg_wait_approval / tg_send_draft)"`
+	DraftID   string `json:"draft_id,omitempty" jsonschema:"или id черновика, которым это сообщение ушло"`
+	Text      string `json:"text" jsonschema:"новый текст целиком (Markdown по умолчанию)"`
+	Note      string `json:"note,omitempty" jsonschema:"зачем правка — показывается владельцу в карточке"`
+	Format    string `json:"format,omitempty" jsonschema:"markdown (по умолчанию) или plain"`
+}
+
 type reactIn struct {
 	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
 	MessageID int    `json:"message_id" jsonschema:"id сообщения"`
@@ -568,6 +577,32 @@ topic — в чате-форуме: тема, куда писать (id из tg_
 		func(ctx context.Context, _ *mcp.CallToolRequest, in draftIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 10*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 				return core.DraftMessage(ctx, s, in.Chat, in.Text, in.ReplyTo, in.Note, in.Format, in.Files, in.AsFiles, in.Topic)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_edit_message", Description: `Исправить своё уже отправленное сообщение. САМО ПО СЕБЕ НЕ ПРАВИТ — как и tg_draft_message.
+
+Только сообщения, отправленные через tg-agent (message_id из tg_wait_approval
+или tg_send_draft, либо draft_id, которым оно ушло), и только в течение
+часа после отправки (срок задаёт владелец). Чужие сообщения и сообщения,
+которые владелец писал сам, не правятся.
+
+text заменяет текст целиком: пришли весь новый текст, а не только поправку.
+Разметка — как в tg_draft_message (Markdown, упоминания). Меняется только
+текст: файлы и фото в сообщении остаются как были.
+
+Правку собеседники увидят сразу (с пометкой «изменено»), поэтому она
+проходит то же подтверждение, что и новое сообщение: владельцу в бот уходит
+карточка «было → станет» с кнопками «Исправить» / «Отклонить», дальше —
+tg_wait_approval(draft_id). В чате с auto_send правка применится сама
+через окно на отмену (tg_cancel_draft).
+
+Не правь ради мелочей и не меняй смысл уже прочитанного без нужды: если
+собеседник успел ответить, лучше написать новое сообщение. note — коротко,
+зачем правка.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in editIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 10*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.EditMessage(ctx, s, in.Chat, in.MessageID, in.DraftID, in.Text, in.Note, in.Format)
 			})
 		})
 

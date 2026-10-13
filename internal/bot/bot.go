@@ -248,11 +248,20 @@ func heading(d *outbox.Draft) string {
 	if name := d.AgentName(); name != "" {
 		who = "Агент " + name // из контейнера: владелец видит, чей черновик
 	}
+	if d.EditOf != 0 {
+		if d.Status == outbox.Scheduled || d.ApprovedBy() == "auto_send" {
+			return who + " исправляет своё сообщение (автоотправка)"
+		}
+		return who + " просит исправить своё сообщение"
+	}
 	if d.Status == outbox.Scheduled || d.ApprovedBy() == "auto_send" {
 		return who + " отправляет сообщение (автоотправка)"
 	}
 	return who + " просит отправить сообщение"
 }
+
+// oldShown — сколько прежнего текста показать в карточке правки.
+const oldShown = 1500
 
 func topicLabel(d *outbox.Draft) string {
 	if d.TopicTitle != "" {
@@ -283,6 +292,10 @@ func CardMarkdown(d *outbox.Draft, title, note, status string) string {
 		}
 		head = append(head, "📎 Файлы: "+strings.Join(labels, ", "))
 	}
+	if d.EditOf != 0 {
+		head = append(head, fmt.Sprintf("Сообщение #%d. **Было:**", d.EditOf), quoteMD(truncate(d.EditOld, oldShown)),
+			"**Станет:**")
+	}
 	body := "*без текста — только файлы*"
 	if d.Text != "" {
 		body = d.Text
@@ -295,6 +308,15 @@ func CardMarkdown(d *outbox.Draft, title, note, status string) string {
 		card += "\n\n" + Separator + "\n\n" + status
 	}
 	return card
+}
+
+// quoteMD — прежний текст цитатой, без разметки (как простой текст).
+func quoteMD(text string) string {
+	lines := strings.Split(MDEscape(text), "\n")
+	for i, l := range lines {
+		lines[i] = "> " + l
+	}
+	return strings.Join(lines, "\n")
 }
 
 // CardHTML — запасная карточка на старом HTML, если rich markdown не прошёл.
@@ -319,11 +341,23 @@ func CardHTML(d *outbox.Draft, title, note, status string) string {
 		}
 		head = append(head, "📎 Файлы: "+strings.Join(labels, ", "))
 	}
+	if d.EditOf != 0 {
+		head = append(head, fmt.Sprintf("Сообщение #%d. <b>Было:</b>\n<blockquote>%s</blockquote>\n<b>Станет:</b>",
+			d.EditOf, html.EscapeString(truncate(d.EditOld, oldShown))))
+	}
 	card := strings.Join(head, "\n") + "\n\n<pre>" + html.EscapeString(d.Text) + "</pre>"
 	if status != "" {
 		card += "\n\n" + htmlFromStatus(status)
 	}
 	return card
+}
+
+// verb — что делает кнопка: отправляет сообщение или применяет правку.
+func verb(d *outbox.Draft) string {
+	if d.EditOf != 0 {
+		return "Исправить"
+	}
+	return "Отправить"
 }
 
 // Keyboard — кнопки под карточкой. У автоотправки — «Отправить сейчас»
@@ -333,12 +367,12 @@ func Keyboard(s *config.Settings, d *outbox.Draft) map[string]any {
 	p := s.CallbackPrefix() + "d:" + d.ID
 	if d.Status == outbox.Scheduled {
 		return map[string]any{"inline_keyboard": [][]map[string]string{{
-			{"text": "✅ Отправить сейчас", "callback_data": p + ":ok"},
+			{"text": "✅ " + verb(d) + " сейчас", "callback_data": p + ":ok"},
 			{"text": "✋ Отменить", "callback_data": p + ":no"},
 		}}}
 	}
 	return map[string]any{"inline_keyboard": [][]map[string]string{{
-		{"text": "✅ Отправить", "callback_data": p + ":ok"},
+		{"text": "✅ " + verb(d), "callback_data": p + ":ok"},
 		{"text": "✋ Отклонить", "callback_data": p + ":no"},
 	}}}
 }

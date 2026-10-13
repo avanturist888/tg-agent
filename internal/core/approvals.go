@@ -169,7 +169,11 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 		t = title(s, d)
 	}
 	mid, _ := result.Get("message_id")
-	return fmt.Sprintf("✅ **Отправлено** в «%s» в %s (id %v)", bot.MDEscape(t), time.Now().Format("15:04"), mid)
+	done := "Отправлено"
+	if d != nil && d.EditOf != 0 {
+		done = "Исправлено"
+	}
+	return fmt.Sprintf("✅ **%s** в «%s» в %s (id %v)", done, bot.MDEscape(t), time.Now().Format("15:04"), mid)
 }
 
 func errName(err error) string {
