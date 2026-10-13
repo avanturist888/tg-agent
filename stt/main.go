@@ -207,24 +207,18 @@ func (e *engine) language(wav []float32, spans []span) string {
 	return e.lid.Compute(st).Lang
 }
 
+// transcribe — куски по одному: все разом одним DecodeStreams на голосовом
+// в 39 минут съели 3,9 ГБ памяти, по одному — 1 ГБ при той же скорости.
 func (e *engine) transcribe(wav []float32, spans []span) string {
-	parts := chunks(len(wav), spans)
-	streams := make([]*sherpa.OfflineStream, len(parts))
-	for i, p := range parts {
-		streams[i] = sherpa.NewOfflineStream(e.asr)
-		streams[i].AcceptWaveform(sampleRate, wav[p.start:p.end])
-	}
-	defer func() {
-		for _, s := range streams {
-			sherpa.DeleteOfflineStream(s)
-		}
-	}()
-	e.asr.DecodeStreams(streams)
 	var texts []string
-	for _, s := range streams {
-		if t := strings.TrimSpace(s.GetResult().Text); t != "" {
+	for _, p := range chunks(len(wav), spans) {
+		st := sherpa.NewOfflineStream(e.asr)
+		st.AcceptWaveform(sampleRate, wav[p.start:p.end])
+		e.asr.Decode(st)
+		if t := strings.TrimSpace(st.GetResult().Text); t != "" {
 			texts = append(texts, t)
 		}
+		sherpa.DeleteOfflineStream(st)
 	}
 	return strings.Join(texts, " ")
 }
