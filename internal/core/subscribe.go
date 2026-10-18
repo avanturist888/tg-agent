@@ -47,6 +47,182 @@ var wakeT3 = func(ctx context.Context, s *config.Settings, session, text string)
 	return t3.Wake(ctx, filepath.Join(s.DataDir(), "t3-token.json"), session, text)
 }
 
+// ── сессии одного треда T3 ───────────────────────────────────────────────
+//
+// T3 Code может завести треду новую сессию Claude: так было при его переезде
+// на протокол 2 — id сессий у всех тредов сменились, а новая сессия о
+// подписках прежней не знает. Подписки сессий одного треда сводятся к его
+// текущей сессии (joinThreadSubs): когда она назвалась (Hello) и на каждом
+// проходе рассылки.
+
+var (
+	threadOf       = t3.ThreadOf       // тред T3 сессии Claude (тесты подменяют)
+	currentSession = t3.CurrentSession // текущая сессия треда
+)
+
+const noThreadTTL = 10 * time.Minute // «сессия не из T3» перепроверяем не чаще
+
+var threadMemo = struct {
+	sync.Mutex
+	m map[string]memoThread
+}{m: map[string]memoThread{}}
+
+type memoThread struct {
+	thread string
+	at     time.Time
+}
+
+// sessionThread — тред T3 сессии ("" — не из T3 или неизвестно). Тред у
+// сессии не меняется: найденный запоминаем навсегда.
+func sessionThread(ctx context.Context, session string) string {
+	if session == "" {
+		return ""
+	}
+	threadMemo.Lock()
+	defer threadMemo.Unlock()
+	if m, ok := threadMemo.m[session]; ok && (m.thread != "" || time.Since(m.at) < noThreadTTL) {
+		return m.thread
+	}
+	th, err := threadOf(ctx, session)
+	if err != nil && !errors.Is(err, t3.NoThread) && !errors.Is(err, t3.Unavailable) {
+		return "" // сбой чтения базы — спросим в следующий раз
+	}
+	threadMemo.m[session] = memoThread{thread: th, at: time.Now()}
+	return th
+}
+
+// joinThreadSubs — подписки нескольких сессий одного треда переносит в одну:
+// в hello (сессия только что назвалась), если она и есть текущая сессия
+// треда, иначе в текущую, а если её не узнать — в самую свежую подписку.
+func joinThreadSubs(ctx context.Context, s *config.Settings, hello *inbox.Addr) {
+	subMu.Lock()
+	subs := loadSubs(subsPath(s))
+	subMu.Unlock()
+	if len(subs) == 0 || (len(subs) == 1 && hello == nil) {
+		return
+	}
+	groups := map[string][]string{} // тред → ключи подписок
+	for key, sub := range subs {
+		if th := sessionThread(ctx, sub.Agent.Session); th != "" {
+			groups[th] = append(groups[th], key)
+		}
+	}
+	if hello != nil && subs[hello.Key()] == nil {
+		if th := sessionThread(ctx, hello.Session); th != "" && len(groups[th]) > 0 {
+			groups[th] = append(groups[th], hello.Key())
+		}
+	}
+	type move struct {
+		thread, into string
+		from         []string
+	}
+	var moves []move
+	for th, keys := range groups {
+		if len(keys) < 2 {
+			continue
+		}
+		cur := currentSession(ctx, th)
+		into := ""
+		for _, k := range keys {
+			if sess := sessionOf(subs, hello, k); sess != "" && sess == cur {
+				into = k
+			}
+		}
+		if into == "" && cur == "" {
+			if hello != nil && slices.Contains(keys, hello.Key()) {
+				into = hello.Key()
+			} else {
+				for _, k := range keys {
+					if sub := subs[k]; sub != nil && (into == "" || sub.Since.After(subs[into].Since)) {
+						into = k
+					}
+				}
+			}
+		}
+		if into == "" {
+			continue // текущая сессия треда ещё не назвалась — подождём её
+		}
+		m := move{thread: th, into: into}
+		for _, k := range keys {
+			if k != into && subs[k] != nil {
+				m.from = append(m.from, k)
+			}
+		}
+		if len(m.from) > 0 {
+			moves = append(moves, m)
+		}
+	}
+	if len(moves) == 0 {
+		return
+	}
+	_ = editSubs(s, func(subs map[string]*subscription) bool {
+		for _, m := range moves {
+			dst := subs[m.into]
+			if dst == nil {
+				dst = &subscription{Agent: *hello, Chats: map[string]int{}, Since: time.Now()}
+				subs[m.into] = dst
+			}
+			if hello != nil && m.into == hello.Key() {
+				dst.Agent, dst.Dead = *hello, time.Time{}
+			}
+			for _, k := range m.from {
+				if src := subs[k]; src != nil {
+					mergeSub(dst, src)
+					delete(subs, k)
+				}
+			}
+		}
+		return true
+	})
+	for _, m := range moves {
+		_ = audit.Log(s.AuditPath(), "agent_subscription_moved", "thread", m.thread, "from", m.from, "session", m.into)
+	}
+	pokeSubs()
+}
+
+// sessionOf — id сессии подписки key (у ещё не подписанной hello — её).
+func sessionOf(subs map[string]*subscription, hello *inbox.Addr, key string) string {
+	if sub := subs[key]; sub != nil {
+		return sub.Agent.Session
+	}
+	if hello != nil && hello.Key() == key {
+		return hello.Session
+	}
+	return ""
+}
+
+// mergeSub — чаты src, которых нет в dst, переходят в dst со своими
+// отметками, темами, правками и удалениями.
+func mergeSub(dst, src *subscription) {
+	if dst.Chats == nil {
+		dst.Chats = map[string]int{}
+	}
+	for alias, from := range src.Chats {
+		if _, ok := dst.Chats[alias]; ok {
+			continue
+		}
+		dst.Chats[alias] = from
+		if t, ok := src.Topics[alias]; ok {
+			if dst.Topics == nil {
+				dst.Topics = map[string]int{}
+			}
+			dst.Topics[alias] = t
+		}
+		if ids := src.Edited[alias]; len(ids) > 0 {
+			if dst.Edited == nil {
+				dst.Edited = map[string][]int{}
+			}
+			dst.Edited[alias] = ids
+		}
+		if ids := src.Deleted[alias]; len(ids) > 0 {
+			if dst.Deleted == nil {
+				dst.Deleted = map[string][]int{}
+			}
+			dst.Deleted[alias] = ids
+		}
+	}
+}
+
 type subscription struct {
 	Agent inbox.Addr     `json:"agent"`
 	Chats map[string]int `json:"chats"` // alias → последний id, о котором уже сообщили
@@ -425,6 +601,9 @@ func Hello(s *config.Settings, a inbox.Addr) error {
 	if changed {
 		pokeSubs()
 	}
+	if err == nil && a.Session != "" {
+		joinThreadSubs(context.Background(), s, &a)
+	}
 	return err
 }
 
@@ -478,6 +657,7 @@ func RunNotifier(ctx context.Context, loader func() (*config.Settings, error)) {
 // notifyOnce — разослать то, что накопилось. Возвращает, через сколько
 // повторить для сессий, которых только что будили.
 func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Time) time.Duration {
+	joinThreadSubs(ctx, s, nil)
 	subMu.Lock()
 	subs := loadSubs(subsPath(s))
 	subMu.Unlock()

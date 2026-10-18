@@ -23,7 +23,8 @@ func TestLiveWakeOwnThread(t *testing.T) {
 	if err != nil {
 		t.Skip(err)
 	}
-	thread, err := in.threadFor(context.Background(), session)
+	thread, err := ThreadOf(context.Background(), session)
+	t.Logf("протокол T3 %d", in.proto)
 	if err != nil {
 		t.Fatal(err)
 	}

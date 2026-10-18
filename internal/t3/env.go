@@ -140,19 +140,25 @@ func (e *Env) api(ctx context.Context, method, path string, body, out any) error
 }
 
 // Descriptor — /.well-known/t3/environment: отвечает ли сервер и тот ли протокол.
+// Треды шлюза в окружениях пока умеют только протокол 1.
 func (e *Env) Descriptor(ctx context.Context) (label, version string, err error) {
+	label, version, proto, err := e.describe(ctx)
+	if err == nil && proto != protocolVersion {
+		err = fmt.Errorf("%w: протокол T3 %d, а не %d", Unavailable, proto, protocolVersion)
+	}
+	return label, version, err
+}
+
+func (e *Env) describe(ctx context.Context) (label, version string, proto int, err error) {
 	var d struct {
 		Label    string `json:"label"`
 		Version  string `json:"serverVersion"`
 		Protocol int    `json:"orchestrationProtocolVersion"`
 	}
 	if err := e.call(ctx, http.MethodGet, "/.well-known/t3/environment", "", nil, &d); err != nil {
-		return "", "", fmt.Errorf("%w: %v", Unavailable, err)
+		return "", "", 0, fmt.Errorf("%w: %v", Unavailable, err)
 	}
-	if d.Protocol != protocolVersion {
-		return d.Label, d.Version, fmt.Errorf("%w: протокол T3 %d, а не %d", Unavailable, d.Protocol, protocolVersion)
-	}
-	return d.Label, d.Version, nil
+	return d.Label, d.Version, d.Protocol, nil
 }
 
 // ── токен ────────────────────────────────────────────────────────────────

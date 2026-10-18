@@ -61,9 +61,18 @@
   `updates_too_long` в аудите, остаётся сверка лент.
 - T3 Code сам останавливает процесс Claude у треда, простоявшего 30 минут
   (`ProviderSessionReaper`), — канала сессии больше нет. Запасной путь
-  (`internal/t3`): тред ищется по id сессии в `~/.t3/userdata/state.sqlite`
-  (`provider_session_runtime.resume_cursor_json.$.resume`), ход запускается
-  через API T3 (`thread.turn.start`). Токен с правами только на треды служба
+  (`internal/t3`): тред ищется по id сессии в базе десктопа (`t3.ThreadOf`).
+  С 16.10.2026 T3 на протоколе оркестрации 2 (`t3/v2.go`): база
+  `statev2.sqlite` (`orchestration_v2_projection_provider_threads`,
+  `$.nativeThreadRef.nativeId`; сессии до переезда — в
+  `provider_session_runtime`), HTTP API только читает, сообщение в тред —
+  `message.dispatch` по WebSocket `/ws` (RPC Effect, тикет
+  `/api/auth/websocket-ticket`) с `deliveryIntent: "steer"`: в идущий ход
+  сразу, иначе новый ход. Протокол 1 (`state.sqlite`, `thread.turn.start`)
+  оставлен. T3 может завести треду новую сессию Claude (при переезде на v2
+  сменились у всех) — подписки сессий одного треда служба сводит к его
+  текущей (`joinThreadSubs`, `agent_subscription_moved` в аудите). Окружения
+  из `config/t3.toml` пока умеют только протокол 1. Токен с правами только на треды служба
   выпускает сама (`auth pairing create` + `/oauth/token`), хранит в
   `data/t3-token.json` и обновляет. Нет T3 или он не отвечает — путь просто
   выключен (`t3.Unavailable`), остальное работает. Живой тест:

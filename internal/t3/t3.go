@@ -5,9 +5,11 @@
 // Местный десктоп (Wake). T3 Code останавливает процесс Claude у треда,
 // простоявшего 30 минут без фоновой работы (ProviderSessionReaper), — вместе
 // с процессом пропадает входящий канал сессии, и разбудить агента через inbox
-// нельзя. Тогда служба просит сам T3 начать в треде ход (thread.turn.start):
-// T3 возобновит сессию, а уведомление появится в треде обычным сообщением.
-// Тред ищется по id сессии Claude в базе десктопа (state.sqlite).
+// нельзя. Тогда служба просит сам T3 начать в треде ход: T3 возобновит
+// сессию, а уведомление появится в треде обычным сообщением. Тред ищется по
+// id сессии Claude в базе десктопа (ThreadOf). Протокол 1 — thread.turn.start
+// по HTTP (база state.sqlite), протокол 2 — message.dispatch по WebSocket
+// (база statev2.sqlite, v2.go).
 //
 // Окружения из config/t3.toml (Env, env.go) — контейнеры со своим сервером
 // T3. Их базу не прочитать, а курсор сессии Claude API наружу не отдаёт,
@@ -29,7 +31,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -59,8 +60,9 @@ const (
 )
 
 type install struct {
-	home string // ~/.t3 (или T3CODE_HOME)
-	env  *Env   // его сервер: http://127.0.0.1:<порт>
+	home  string // ~/.t3 (или T3CODE_HOME)
+	env   *Env   // его сервер: http://127.0.0.1:<порт>
+	proto int    // orchestrationProtocolVersion сервера: 1 или 2
 }
 
 var client = &http.Client{Timeout: 15 * time.Second}
@@ -90,34 +92,15 @@ func find(ctx context.Context) (*install, error) {
 		revoke: func(ctx context.Context, sid string) {
 			_, _ = in.cli(ctx, "auth", "session", "revoke", "--base-dir", in.home, sid)
 		}}
-	if _, _, err := in.env.Descriptor(ctx); err != nil {
+	_, _, proto, err := in.env.describe(ctx)
+	if err != nil {
 		return nil, err
 	}
+	if proto != protocolVersion && proto != protocolV2 {
+		return nil, fmt.Errorf("%w: протокол T3 %d", Unavailable, proto)
+	}
+	in.proto = proto
 	return in, nil
-}
-
-// threadFor — тред T3, в котором живёт сессия Claude Code.
-func (in *install) threadFor(ctx context.Context, session string) (string, error) {
-	path := filepath.Join(in.home, "userdata", "state.sqlite")
-	if _, err := os.Stat(path); err != nil {
-		return "", Unavailable
-	}
-	dsn := "file:" + filepath.ToSlash(path) + "?mode=ro&_pragma=busy_timeout(3000)"
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return "", err
-	}
-	defer db.Close()
-	var thread string
-	err = db.QueryRowContext(ctx, `SELECT thread_id FROM provider_session_runtime
-		WHERE json_extract(resume_cursor_json, '$.resume') = ? ORDER BY last_seen_at DESC LIMIT 1`, session).Scan(&thread)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", NoThread
-	}
-	if err != nil {
-		return "", fmt.Errorf("база T3: %w", err)
-	}
-	return thread, nil
 }
 
 // Wake — начать в треде сессии ход с текстом text.
@@ -126,13 +109,17 @@ func Wake(ctx context.Context, tokenPath, session, text string) error {
 	if err != nil {
 		return err
 	}
-	thread, err := in.threadFor(ctx, session)
+	thread, err := ThreadOf(ctx, session)
 	if err != nil {
 		return err
 	}
 	in.env.TokenPath = tokenPath
-	// процесс сессии уже остановлен, так что «идущий» ход в снимке — старый
-	_, err = in.env.startTurn(ctx, thread, text, true)
+	if in.proto == protocolV2 {
+		err = in.env.sendV2(ctx, thread, text)
+	} else {
+		// процесс сессии уже остановлен, так что «идущий» ход в снимке — старый
+		_, err = in.env.startTurn(ctx, thread, text, true)
+	}
 	if errors.Is(err, ThreadGone) {
 		return NoThread // тред удалён или в архиве — владелец его закрыл, не тревожим
 	}

@@ -16,6 +16,7 @@ import (
 
 	"tgagent/internal/config"
 	"tgagent/internal/inbox"
+	"tgagent/internal/t3"
 )
 
 // fakeSession — входящий канал сессии Claude Code: принимает соединения и
@@ -311,5 +312,49 @@ func TestSubscribeTopics(t *testing.T) {
 	}
 	if sub := loadSubs(subsPath(s))[addr.Key()]; sub != nil {
 		t.Fatalf("подписка осталась: %+v", sub)
+	}
+}
+
+func TestSubscriptionsFollowNewT3Session(t *testing.T) {
+	s := watchEnv(t)
+	feed := FeedPath(s, "test")
+	appendNewer(feed, []int{10})
+	threadOf = func(_ context.Context, session string) (string, error) {
+		if session == "old-s" || session == "new-s" {
+			return "th", nil
+		}
+		return "", t3.NoThread
+	}
+	currentSession = func(context.Context, string) string { return "new-s" }
+
+	// подписалась прежняя сессия треда; T3 завёл треду новую
+	old, _ := fakeSession(t)
+	old.Session, old.Socket = "old-s", old.Socket+"-closed"
+	if _, err := Subscribe(WithAgent(context.Background(), &old), s, "test", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	fresh, got := fakeSession(t)
+	fresh.Session = "new-s"
+	if err := Hello(s, fresh); err != nil {
+		t.Fatal(err)
+	}
+	subs := loadSubs(subsPath(s))
+	if subs["old-s"] != nil || subs["new-s"] == nil || subs["new-s"].Chats["test"] != 10 || subs["new-s"].Agent != fresh {
+		t.Fatalf("подписка должна перейти к новой сессии: %+v", subs)
+	}
+	appendNewer(feed, []int{11})
+	notifyOnce(context.Background(), s, map[string]time.Time{})
+	expectNote(t, got, "новых: 1", "after_id=10")
+
+	// обе сессии подписаны (новая — сама): будим одну, текущую
+	if _, err := Subscribe(WithAgent(context.Background(), &old), s, "test", 11, 0); err != nil {
+		t.Fatal(err)
+	}
+	appendNewer(feed, []int{12})
+	notifyOnce(context.Background(), s, map[string]time.Time{})
+	expectNote(t, got, "новых: 1", "after_id=11")
+	expectSilence(t, got)
+	if subs := loadSubs(subsPath(s)); len(subs) != 1 || subs["new-s"] == nil {
+		t.Fatalf("у треда должна остаться одна подписка: %+v", subs)
 	}
 }

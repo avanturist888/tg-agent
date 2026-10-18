@@ -39,6 +39,13 @@ func watchEnv(t *testing.T) *config.Settings {
 	oldWake := wakeT3
 	wakeT3 = func(context.Context, *config.Settings, string, string) error { return t3.Unavailable }
 	t.Cleanup(func() { wakeT3 = oldWake })
+	oldThread, oldCur := threadOf, currentSession
+	threadOf = func(context.Context, string) (string, error) { return "", t3.NoThread }
+	currentSession = func(context.Context, string) string { return "" }
+	t.Cleanup(func() { threadOf, currentSession = oldThread, oldCur })
+	threadMemo.Lock()
+	clear(threadMemo.m)
+	threadMemo.Unlock()
 	// «свои» сообщения — память процесса: прошлые тесты не должны в неё попадать
 	outMu.Lock()
 	clear(outIDs)
