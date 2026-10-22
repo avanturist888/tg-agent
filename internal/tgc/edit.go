@@ -33,17 +33,26 @@ func (c *Conn) EditMessage(ctx context.Context, t Target, id int, text, format s
 		return omap.New().Set("message_id", id).Set("edited", true).Set("format", format)
 	}
 	if format == "markdown" {
-		req := &tg.MessagesEditMessageRequest{}
-		req.SetMessage("")
-		req.SetRichMessage(&tg.InputRichMessageMarkdown{Markdown: text})
-		err := edit(req)
+		var reason string
+		rich, err := c.richInput(ctx, text)
 		if err == nil {
-			return result("rich_markdown"), nil
+			req := &tg.MessagesEditMessageRequest{}
+			req.SetMessage("")
+			req.SetRichMessage(rich)
+			err := edit(req)
+			if err == nil {
+				return result("rich_markdown"), nil
+			}
+			if _, ok := tgerr.As(err); !ok {
+				return nil, err
+			}
+			reason = RPCErrorText(err)
+		} else {
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			reason = "упоминания: " + RPCErrorText(err)
 		}
-		if _, ok := tgerr.As(err); !ok {
-			return nil, err
-		}
-		reason := RPCErrorText(err)
 		plain, entities := ParseMarkdown(text)
 		for i, e := range entities {
 			entities[i] = c.mentionEntity(e)

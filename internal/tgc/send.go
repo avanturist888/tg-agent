@@ -112,16 +112,26 @@ func (c *Conn) SendMessage(ctx context.Context, t Target, text string, reply *in
 	}
 
 	if format == "markdown" {
-		req := &tg.MessagesSendMessageRequest{Message: ""}
-		req.SetRichMessage(&tg.InputRichMessageMarkdown{Markdown: text})
-		id, date, err := send(req)
+		var reason string
+		rich, err := c.richInput(ctx, text)
 		if err == nil {
-			return result(id, date, "rich_markdown"), nil
+			req := &tg.MessagesSendMessageRequest{Message: ""}
+			req.SetRichMessage(rich)
+			id, date, err := send(req)
+			if err == nil {
+				return result(id, date, "rich_markdown"), nil
+			}
+			if _, ok := tgerr.As(err); !ok {
+				return nil, err // сеть, отмена — не повод слать второй раз
+			}
+			reason = RPCErrorText(err)
+		} else {
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			// не разобрали упоминания — запасной путь их сохранит
+			reason = "упоминания: " + RPCErrorText(err)
 		}
-		if _, ok := tgerr.As(err); !ok {
-			return nil, err // сеть, отмена — не повод слать второй раз
-		}
-		reason := RPCErrorText(err)
 		plain, entities := ParseMarkdown(text)
 		for i, e := range entities {
 			entities[i] = c.mentionEntity(e) // [Имя](tg://user?id=…) — упоминание
@@ -130,7 +140,7 @@ func (c *Conn) SendMessage(ctx context.Context, t Target, text string, reply *in
 		if len(entities) > 0 {
 			req2.SetEntities(entities)
 		}
-		id, date, err = send(req2)
+		id, date, err := send(req2)
 		if err != nil {
 			return nil, err
 		}

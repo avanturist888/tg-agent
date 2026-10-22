@@ -6,7 +6,7 @@ package tgc
 // без username упоминают по id: в клиентах — выбором из списка, в разметке —
 // [Имя](tg://user?id=123). Агенту упоминания видны в tg_read_chat
 // (mentions), а писать их он может той же ссылкой: служба превращает её в
-// упоминание (в rich-разметке это делает сам Telegram, в запасном разборе
+// упоминание (в rich-сообщении — richmention.go, в запасном разборе
 // markdown — mentionEntity).
 
 import (
@@ -70,21 +70,32 @@ func mentions(m *tg.Message, b *Batch) []*omap.Map {
 		}
 	}
 	if rich, ok := m.GetRichMessage(); ok {
-		walkRich(reflect.ValueOf(rich), func(n *tg.TextMentionName) {
-			add(n.UserID, plainRich(n.Text))
+		walkRich(reflect.ValueOf(rich), func(n tg.RichTextClass) {
+			switch n := n.(type) {
+			case *tg.TextMentionName:
+				add(n.UserID, plainRich(n.Text))
+			case *tg.TextMention: // @username
+				text := plainRich(n.Text)
+				out = append(out, omap.New().Set("username", strings.TrimPrefix(text, "@")).Set("text", text))
+			}
 		})
 	}
 	return out
 }
 
-// walkRich — обойти дерево rich-сообщения и найти упоминания по id.
-func walkRich(v reflect.Value, fn func(*tg.TextMentionName)) {
+// walkRich — обойти дерево rich-сообщения и найти упоминания (по id и по
+// username).
+func walkRich(v reflect.Value, fn func(tg.RichTextClass)) {
 	switch v.Kind() {
 	case reflect.Interface, reflect.Pointer:
 		if v.IsNil() {
 			return
 		}
-		if n, ok := v.Interface().(*tg.TextMentionName); ok {
+		switch n := v.Interface().(type) {
+		case *tg.TextMentionName:
+			fn(n)
+			return
+		case *tg.TextMention:
 			fn(n)
 			return
 		}
