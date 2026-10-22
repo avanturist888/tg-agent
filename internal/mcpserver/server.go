@@ -159,9 +159,10 @@ type waitAccessIn struct {
 }
 
 type subscribeIn struct {
-	Chat    string `json:"chat" jsonschema:"alias из tg_list_chats"`
-	AfterID int    `json:"after_id,omitempty" jsonschema:"последний обработанный id: о более новых сообщат сразу"`
-	Topic   int    `json:"topic,omitempty" jsonschema:"только эта тема форума (0 — все темы)"`
+	Chat     string `json:"chat" jsonschema:"alias из tg_list_chats"`
+	AfterID  int    `json:"after_id,omitempty" jsonschema:"последний обработанный id: о более новых сообщат сразу"`
+	Topic    int    `json:"topic,omitempty" jsonschema:"только эта тема форума (0 — все темы)"`
+	Takeover bool   `json:"takeover,omitempty" jsonschema:"забрать чат у другой сессии — только если владелец прямо попросил"`
 }
 
 type unsubscribeIn struct {
@@ -373,6 +374,12 @@ after_id — твой последний обработанный id: о том,
            сразу. Без него — только о сообщениях после подписки.
 topic    — в чате-форуме: будить только о сообщениях этой темы. Без него
            уведомление скажет, в каких темах новое.
+takeover — забрать чат у другой сессии. Только если владелец прямо попросил.
+
+Чат (в форуме — тему) слушает одна сессия. Занят другой живой сессией —
+вернёт ошибку с её именем: скажи владельцу, а не бери takeover сам.
+Подписку сессии, что не отвечает или чей тред закрыт, забирает сама
+(в ответе — taken_from).
 
 Подписка живёт, пока жива сессия, и переживает перезапуск службы и
 возобновление сессии. Повторный вызов безопасен — он лишь переставляет
@@ -384,7 +391,7 @@ after_id. На несколько чатов — по вызову на кажд
 шлюза «TG: <чат>» в твоём окружении T3 — служба заводит его сама.`)},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in subscribeIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
-				return core.Subscribe(ctx, s, in.Chat, in.AfterID, in.Topic)
+				return core.Subscribe(ctx, s, in.Chat, in.AfterID, in.Topic, in.Takeover)
 			})
 		})
 

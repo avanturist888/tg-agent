@@ -33,9 +33,9 @@ func fakeHomeV2(t *testing.T) {
 			thread_id TEXT, owner_node_id TEXT, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL)`,
 		`CREATE TABLE provider_session_runtime (thread_id TEXT PRIMARY KEY, last_seen_at TEXT NOT NULL,
 			resume_cursor_json TEXT)`,
-		`CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, archived_at TEXT, deleted_at TEXT)`,
-		`INSERT INTO orchestration_v2_projection_threads VALUES ('th-new', NULL, NULL), ('th-old', NULL, NULL),
-			('th-arch', '2026-10-16T10:00:00Z', NULL)`,
+		`CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, title TEXT, archived_at TEXT, deleted_at TEXT)`,
+		`INSERT INTO orchestration_v2_projection_threads VALUES ('th-new', 'Новый', NULL, NULL), ('th-old', NULL, NULL, NULL),
+			('th-arch', 'Архив', '2026-10-16T10:00:00Z', NULL)`,
 		`INSERT INTO orchestration_v2_projection_provider_threads VALUES
 			('p1', 'th-new', NULL, '2026-10-16T10:00:00Z', '{"nativeThreadRef":{"nativeId":"new-s"}}'),
 			('p2', 'th-old', NULL, '2026-10-16T11:00:00Z', '{"nativeThreadRef":{"nativeId":"cur-s"}}'),
@@ -63,6 +63,12 @@ func TestThreadOfV2(t *testing.T) {
 	}
 	if cur := CurrentSession(ctx, "th-old"); cur != "cur-s" {
 		t.Fatalf("текущая сессия треда: %q", cur)
+	}
+	if th, err := ThreadInfo(ctx, "arch-s"); err != nil || th.ID != "th-arch" || th.Title != "Архив" || !th.Closed {
+		t.Fatalf("закрытый тред с заголовком: %+v %v", th, err)
+	}
+	if th, err := ThreadInfo(ctx, "new-s"); err != nil || th.Title != "Новый" || th.Closed {
+		t.Fatalf("открытый тред: %+v %v", th, err)
 	}
 }
 

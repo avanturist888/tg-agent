@@ -465,8 +465,111 @@ const noInbox = "Сессия не передала адрес своего вх
 
 // ── инструменты ──────────────────────────────────────────────────────────
 
+// ── один чат — одна сессия ───────────────────────────────────────────────
+//
+// Чат (в форуме — тема) слушает одна сессия: иначе на одно сообщение
+// отвечают два агента. Занят живой сессией другого треда — отказ, забрать
+// можно только явно (takeover, по слову владельца). Подписку сессии, что не
+// отвечает (Dead) или чей тред T3 закрыт, новая забирает сама. Сессии
+// одного треда не спорят — их сводит joinThreadSubs.
+
+var threadInfo = t3.ThreadInfo // тред T3 сессии с закрытыми (тесты подменяют)
+
+// holds — sub слушает alias в теме topic (0 — весь чат) или пересекается с ней.
+func holds(sub *subscription, alias string, topic int) bool {
+	if _, ok := sub.Chats[alias]; !ok {
+		return false
+	}
+	other := sub.Topics[alias]
+	return topic == 0 || other == 0 || other == topic
+}
+
+type holder struct {
+	key, reason string
+	sub         *subscription
+}
+
+// holders — чужие подписки на alias/topic: какие забрать и какая мешает.
+func holders(ctx context.Context, a *inbox.Addr, alias string, topic int, takeover bool,
+	subs map[string]*subscription) (take []holder, busy *holder) {
+	mine := sessionThread(ctx, a.Session)
+	for key, sub := range subs {
+		if key == a.Key() || !holds(sub, alias, topic) {
+			continue
+		}
+		h := holder{key: key, sub: sub}
+		switch {
+		case mine != "" && sessionThread(ctx, sub.Agent.Session) == mine:
+			continue // тот же тред
+		case !sub.Dead.IsZero():
+			h.reason = "dead"
+		case closedThread(ctx, sub.Agent.Session):
+			h.reason = "thread_closed"
+		case takeover:
+			h.reason = "takeover"
+		default:
+			if busy == nil {
+				busy = &h
+			}
+			continue
+		}
+		take = append(take, h)
+	}
+	return take, busy
+}
+
+func closedThread(ctx context.Context, session string) bool {
+	if session == "" {
+		return false
+	}
+	th, err := threadInfo(ctx, session)
+	return err == nil && th.Closed
+}
+
+// holderName — как назвать агенту чужую сессию.
+func holderName(ctx context.Context, sub *subscription) string {
+	sess := sub.Agent.Session
+	if th, err := threadInfo(ctx, sess); err == nil && th.Title != "" {
+		return "тред T3 «" + th.Title + "»"
+	}
+	if len(sess) > 8 {
+		sess = sess[:8]
+	}
+	return "сессия Claude Code " + sess
+}
+
+func busyError(ctx context.Context, s *config.Settings, alias string, topic int, h *holder) error {
+	what := "Чат " + s.Ref(alias)
+	if topic != 0 {
+		what = "Тему " + strconv.Itoa(topic) + " чата " + s.Ref(alias)
+	} else if t := h.sub.Topics[alias]; t != 0 {
+		what = "Чат " + s.Ref(alias) + " (тему " + strconv.Itoa(t) + ")"
+	}
+	return &Bad{Msg: what + " уже слушает другая сессия: " + holderName(ctx, h.sub) +
+		", подписана с " + h.sub.Since.Local().Format("02.01 15:04") + ". На один чат подписывается одна " +
+		"сессия, иначе на сообщение ответят два агента. Если владелец прямо попросил забрать чат " +
+		"себе — повтори tg_subscribe с takeover: true (та сессия перестанет получать уведомления " +
+		"об этом чате); иначе скажи владельцу, что чат уже занят."}
+}
+
+// release — снять с sub чат alias вместе с его отметками.
+func release(subs map[string]*subscription, key, alias string) {
+	sub := subs[key]
+	if sub == nil {
+		return
+	}
+	delete(sub.Chats, alias)
+	delete(sub.Topics, alias)
+	delete(sub.Edited, alias)
+	delete(sub.Deleted, alias)
+	if len(sub.Chats) == 0 {
+		delete(subs, key)
+	}
+}
+
 // Subscribe — tg_subscribe: будить эту сессию при новых сообщениях в чате.
-func Subscribe(ctx context.Context, s *config.Settings, chat string, after, topic int) (*omap.Map, error) {
+// takeover — забрать чат у другой живой сессии (только по слову владельца).
+func Subscribe(ctx context.Context, s *config.Settings, chat string, after, topic int, takeover bool) (*omap.Map, error) {
 	if s.Agent != nil {
 		if topic != 0 {
 			return nil, &Bad{Msg: "Агенту из контейнера подписка на одну тему недоступна — подпишись на весь чат."}
@@ -496,8 +599,22 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, after, topi
 	if after > 0 {
 		from = after
 	}
+	subMu.Lock()
+	current := loadSubs(subsPath(s))
+	subMu.Unlock()
+	take, busy := holders(ctx, a, rule.Alias, topic, takeover, current)
+	if busy != nil {
+		return nil, busyError(ctx, s, rule.Alias, topic, busy)
+	}
+	var taken []*omap.Map
+	for _, h := range take {
+		taken = append(taken, omap.New().Set("from", holderName(ctx, h.sub)).Set("reason", h.reason))
+	}
 	var chats []string
 	err = editSubs(s, func(subs map[string]*subscription) bool {
+		for _, h := range take {
+			release(subs, h.key, rule.Alias)
+		}
 		sub := subs[a.Key()]
 		if sub == nil {
 			sub = &subscription{Chats: map[string]int{}, Since: time.Now()}
@@ -519,12 +636,19 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, after, topi
 	if err != nil {
 		return nil, err
 	}
+	for _, h := range take {
+		_ = audit.Log(s.AuditPath(), "agent_subscription_taken", "chat", rule.Alias, "from", h.key,
+			"session", a.Key(), "reason", h.reason)
+	}
 	_ = audit.Log(s.AuditPath(), "agent_subscribed", "chat", rule.Alias, "session", a.Key(), "after_id", from,
 		"topic", topic)
 	pokeSubs()
 	out := omap.New().Set("chat", s.Ref(rule.Alias)).Set("subscribed", true)
 	if topic != 0 {
 		out.Set("topic", omap.New().Set("id", topic).Set("title", topicName))
+	}
+	if len(taken) > 0 {
+		out.Set("taken_from", taken) // кого больше не будят об этом чате
 	}
 	out.Set("after_id", from).Set("feed_last_id", last).Set("subscriptions", chats)
 	switch {

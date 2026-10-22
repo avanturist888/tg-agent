@@ -39,10 +39,11 @@ func watchEnv(t *testing.T) *config.Settings {
 	oldWake := wakeT3
 	wakeT3 = func(context.Context, *config.Settings, string, string) error { return t3.Unavailable }
 	t.Cleanup(func() { wakeT3 = oldWake })
-	oldThread, oldCur := threadOf, currentSession
+	oldThread, oldCur, oldInfo := threadOf, currentSession, threadInfo
 	threadOf = func(context.Context, string) (string, error) { return "", t3.NoThread }
 	currentSession = func(context.Context, string) string { return "" }
-	t.Cleanup(func() { threadOf, currentSession = oldThread, oldCur })
+	threadInfo = func(context.Context, string) (t3.SessionThread, error) { return t3.SessionThread{}, t3.NoThread }
+	t.Cleanup(func() { threadOf, currentSession, threadInfo = oldThread, oldCur, oldInfo })
 	threadMemo.Lock()
 	clear(threadMemo.m)
 	threadMemo.Unlock()

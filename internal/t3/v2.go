@@ -92,9 +92,40 @@ func threadV1(ctx context.Context, path, session string) (string, error) {
 }
 
 func threadV2(ctx context.Context, path, session string) (string, error) {
-	db, err := openRO(path)
+	info, err := infoV2(ctx, path, session)
 	if err != nil {
 		return "", err
+	}
+	if info.Closed {
+		return "", NoThread // владелец тред закрыл — не тревожим
+	}
+	return info.ID, nil
+}
+
+// SessionThread — тред T3 сессии: id, заголовок, закрыт ли (архив, удалён).
+type SessionThread struct {
+	ID, Title string
+	Closed    bool
+}
+
+// ThreadInfo — тред сессии вместе с закрытыми (ThreadOf их не отдаёт).
+// NoThread — сессия не из T3. Заголовок есть только на протоколе 2.
+func ThreadInfo(ctx context.Context, session string) (SessionThread, error) {
+	h := home()
+	if p := filepath.Join(h, "userdata", "statev2.sqlite"); exists(p) {
+		return infoV2(ctx, p, session)
+	}
+	if p := filepath.Join(h, "userdata", "state.sqlite"); exists(p) {
+		id, err := threadV1(ctx, p, session)
+		return SessionThread{ID: id}, err
+	}
+	return SessionThread{}, Unavailable
+}
+
+func infoV2(ctx context.Context, path, session string) (SessionThread, error) {
+	db, err := openRO(path)
+	if err != nil {
+		return SessionThread{}, err
 	}
 	defer db.Close()
 	var thread string
@@ -110,23 +141,21 @@ func threadV2(ctx context.Context, path, session string) (string, error) {
 		}
 	}
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", NoThread
+		return SessionThread{}, NoThread
 	}
 	if err != nil {
-		return "", fmt.Errorf("база T3: %w", err)
+		return SessionThread{}, fmt.Errorf("база T3: %w", err)
 	}
-	var archived, deleted sql.NullString
-	err = db.QueryRowContext(ctx, `SELECT archived_at, deleted_at FROM orchestration_v2_projection_threads
-		WHERE thread_id = ?`, thread).Scan(&archived, &deleted)
+	var title, archived, deleted sql.NullString
+	err = db.QueryRowContext(ctx, `SELECT title, archived_at, deleted_at FROM orchestration_v2_projection_threads
+		WHERE thread_id = ?`, thread).Scan(&title, &archived, &deleted)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return "", NoThread
+		return SessionThread{}, NoThread
 	case err != nil:
-		return "", fmt.Errorf("база T3: %w", err)
-	case archived.Valid || deleted.Valid:
-		return "", NoThread // владелец тред закрыл — не тревожим
+		return SessionThread{}, fmt.Errorf("база T3: %w", err)
 	}
-	return thread, nil
+	return SessionThread{ID: thread, Title: title.String, Closed: archived.Valid || deleted.Valid}, nil
 }
 
 // sendV2 — сообщение text в тред: в идущий ход или новым ходом.
