@@ -202,6 +202,27 @@
   кнопки, с пометкой (закреплённые — `data/upstream_cards.json`).
   Первая проверка источника — только сводка; `/updates` — проверить сейчас.
   Живая проверка источников: `go test -tags live -run Live ./internal/upstream -v`.
+- Клиент MAX (`internal/maxc`, команды `tg max`): режим веб-клиента —
+  WebSocket `wss://api.oneme.ru/websocket` с Origin `https://web.max.ru`,
+  кадры как у TCP (`>BBHHI` + msgpack; входящие сжаты: flags 0xFF — zstd,
+  иначе ненулевые — блок LZ4), протокол сверен с PyMax. Расширение msgpack
+  типа 1 — обёрнутое значение, `unwrapExt` разворачивает его сразу после
+  распаковки, незнакомые расширения — nil. Пишет в WebSocket один писатель
+  под замком, события — в порядке прихода из одной горутины. Вход: SESSION_INIT
+  → GET_QR / QR_STATUS / LOGIN_BY_QR (облачный пароль — CHECK_PASSWORD, его
+  вводит только владелец в консоли) → LOGIN по токену. Сессия —
+  `data/max/session.json` (токен = полный доступ к аккаунту: не печатать, не
+  в аудит), с тем же id устройства и user-agent, что при входе. Отозванный
+  токен — `ErrTokenRevoked`: сам не перезаходить, сказать владельцу.
+  `maxc.Client` держит вход и переподключается (пауза 1 с → 1 мин),
+  `OnLogin` — после каждого входа (сверять пропущенное), `OnEvent` —
+  `ParseEvent`: NOTIF_MESSAGE 128 со статусом EDITED/REMOVED — правка или
+  удаление, 142 — удаление списком, 130 — прочтение. На свои действия из
+  той же сессии сервер событий не шлёт. Вызовы: `History`, `Send` (cid — мс,
+  строго растут; ответ — `link` REPLY), `Edit`, `Delete`. Живые проверки
+  записи — только в «Избранном» MAX (чат 0): `go test -tags live -run
+  LiveSaved ./internal/maxc -v`; соединение — `-run LiveSession`. Агентам
+  MAX пока не доступен.
 - Правка отправленного (`core/edit.go`, `tg_edit_message`): только сообщения,
   ушедшие через tg-agent (черновик sent с этим message_id, у агента из
   контейнера — свой), и только `TG_EDIT_WINDOW_MIN` (60) минут после отправки.

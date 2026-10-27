@@ -94,6 +94,7 @@ func init() {
 		{name: "doctor", help: "проверить конфигурацию", run: cmdDoctor},
 		{name: "mcp", help: "MCP-сервер для Claude Code (stdio)", run: cmdMCP},
 		{name: "t3", help: "окружения T3 Code в контейнерах и треды шлюза (tg t3 help)", run: cmdT3},
+		{name: "max", help: "аккаунт MAX: вход по QR, перенос из PyMax, состояние (tg max help)", run: cmdMax},
 		{name: "agents", help: "агенты из контейнеров: MCP по HTTP (--new-token — токен для .env)", run: cmdAgents},
 		{name: "gui", help: "окно управления: чаты, черновики, настройки", run: cmdGUI},
 		// служебные: их запускает сама программа

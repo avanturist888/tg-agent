@@ -263,6 +263,8 @@ tg doctor [--offline]        проверить конфигурацию
 tg mcp                       MCP-сервер (его запускает Claude Code)
 tg t3 …                      окружения T3 в контейнерах и треды шлюза (tg t3 help)
 tg agents [--new-token]      агенты из контейнеров: MCP по HTTP
+tg max login | import | status   аккаунт MAX: вход по QR, перенос сессии PyMax,
+                             жив ли вход (агентам MAX пока не доступен)
 tg --profile <имя> init      заготовка профиля (второй аккаунт)
 tg --profile <имя> <команда> любая команда в профиле (или TG_PROFILE=<имя>)
 ```

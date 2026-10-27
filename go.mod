@@ -10,7 +10,10 @@ require (
 	github.com/gotd/td v0.162.0
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/joho/godotenv v1.5.1
+	github.com/klauspost/compress v1.19.1
 	github.com/modelcontextprotocol/go-sdk v1.8.0
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/net v0.59.0
 	golang.org/x/sys v0.48.0
 	golang.org/x/term v0.46.0
@@ -34,7 +37,6 @@ require (
 	github.com/gotd/ige v0.3.0 // indirect
 	github.com/gotd/neo v0.1.5 // indirect
 	github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1 // indirect
-	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
@@ -44,6 +46,7 @@ require (
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/yuin/goldmark v1.8.5 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
