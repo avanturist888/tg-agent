@@ -77,8 +77,8 @@ func TestAutoMenuSharedBot(t *testing.T) {
 	twoAccounts(t)
 	labels := func(s *config.Settings) map[string]string {
 		out := map[string]string{}
-		for _, row := range autoKeyboard(s)["inline_keyboard"].([][]map[string]string) {
-			out[row[0]["callback_data"]] = row[0]["text"]
+		for _, b := range chatButtons(s, autoView{Filter: 'a'}) {
+			out[strings.TrimSuffix(b["callback_data"], "~a0")] = b["text"]
 		}
 		return out
 	}

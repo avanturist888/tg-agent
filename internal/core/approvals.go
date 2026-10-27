@@ -215,6 +215,10 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		handleAutoCallback(ctx, s, q) // переключатель автоотправки (/auto)
 		return
 	}
+	if strings.HasPrefix(data, "am:") {
+		handleAutoMenuCallback(ctx, s, q) // фильтр и страницы меню /auto
+		return
+	}
 	if strings.HasPrefix(data, "a:") {
 		handleAccessCallback(ctx, s, q) // запрос доступа к чату
 		return

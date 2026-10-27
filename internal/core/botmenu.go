@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -57,7 +58,14 @@ func HandleMessage(ctx context.Context, s *config.Settings, m *bot.Message) {
 	cmd, _, _ = strings.Cut(cmd, "@") // /auto@имя_бота
 	switch strings.ToLower(cmd) {
 	case "/auto":
-		sendAutoMenu(ctx, s)
+		v := autoView{Filter: 'a'}
+		switch strings.ToLower(strings.TrimSpace(rest)) {
+		case "on", "вкл", "y":
+			v.Filter = 'y'
+		case "off", "выкл", "n":
+			v.Filter = 'n'
+		}
+		sendAutoMenu(ctx, s, v)
 	case "/notes":
 		sendNotesMenu(ctx, s)
 	case "/note":
@@ -66,7 +74,7 @@ func HandleMessage(ctx context.Context, s *config.Settings, m *bot.Message) {
 		upstreamCommand(ctx, s)
 	case "/start", "/help":
 		say(ctx, s, "Здесь приходят карточки сообщений агентов на одобрение и запросы доступа к чатам.\n"+
-			"/auto — включить или выключить автоотправку по чатам.\n"+
+			"/auto — включить или выключить автоотправку по чатам (/auto вкл, /auto выкл — сразу с фильтром).\n"+
 			"/notes — заметки к аккаунтам: агенты видят их рядом со списком чатов.\n"+
 			"/updates — версии MAX и PyMax; изменения приходят сами, закреплёнными.")
 	}
@@ -83,20 +91,45 @@ func say(ctx context.Context, s *config.Settings, text string) {
 
 // ── автоотправка ─────────────────────────────────────────────────────────
 
-func autoMenuText(s *config.Settings) string {
-	return fmt.Sprintf("🤖 <b>Автоотправка по чатам</b>\n\n"+
-		"🟢 — сообщение агента уходит само через %d с, если не нажать «Отменить».\n"+
-		"⚪ — только по кнопке «Отправить».\n\n"+
-		"Нажми на чат, чтобы переключить. Чатов без права отправки здесь нет.", s.AutoSendDelaySec)
+// autoView — что показывает меню /auto: фильтр и страница. Вид едет в
+// callback каждой кнопки: нажатие по чату другого аккаунта перерисовывает
+// его служба, и меню должно остаться тем же.
+type autoView struct {
+	Filter byte // 'a' — все, 'y' — с автоотправкой, 'n' — без неё
+	Page   int  // с нуля
 }
 
-// autoKeyboard — по кнопке на чат с отправкой. В callback — alias: порядок
-// чатов мог поменяться, пока меню висело. В общем боте — чаты всех
-// аккаунтов, что его делят: нажатие по чату другого аккаунта основная служба
-// передаст ему (метка CallbackPrefixFor), и кто бы ни перерисовал меню, оно
-// выйдет тем же.
-func autoKeyboard(s *config.Settings) map[string]any {
-	rows := [][]map[string]string{}
+const autoPageSize = 10
+
+func (v autoView) code() string { return fmt.Sprintf("%c%d", v.Filter, v.Page) }
+
+// parseAutoView — вид из callback; непонятное — все чаты, первая страница.
+func parseAutoView(code string) autoView {
+	v := autoView{Filter: 'a'}
+	if code == "" {
+		return v
+	}
+	if f := code[0]; f == 'y' || f == 'n' {
+		v.Filter = f
+	}
+	if n, err := strconv.Atoi(code[1:]); err == nil && n > 0 {
+		v.Page = n
+	}
+	return v
+}
+
+// autoItem — чат в меню; data — callback без вида (его добавит autoMenu).
+type autoItem struct {
+	label, data string
+	on          bool
+}
+
+// autoItems — чаты с отправкой. В callback — alias: порядок чатов мог
+// поменяться, пока меню висело. В общем боте — чаты всех аккаунтов, что его
+// делят: нажатие по чату другого аккаунта основная служба передаст ему
+// (метка CallbackPrefixFor).
+func autoItems(s *config.Settings) []autoItem {
+	var out []autoItem
 	accts := menuAccounts(s)
 	for _, acct := range accts {
 		prefix := config.CallbackPrefixFor(acct)
@@ -105,12 +138,9 @@ func autoKeyboard(s *config.Settings) map[string]any {
 		}
 		for _, r := range rulesOf(s, acct) {
 			data := prefix + "s:" + r.Alias
-			if !r.Send || len(data) > 64 {
+			// + «~y12» — вид меню; длиннее 64 байт Telegram кнопку не примет
+			if !r.Send || len(data)+5 > 64 {
 				continue
-			}
-			mark := "⚪"
-			if r.AutoSend() {
-				mark = "🟢"
 			}
 			ref := r.Alias
 			if len(accts) > 1 && acct != config.MainAccount {
@@ -120,10 +150,73 @@ func autoKeyboard(s *config.Settings) map[string]any {
 			if r.Title != "" && r.Title != r.Alias {
 				label = r.Title + " · " + ref
 			}
-			rows = append(rows, []map[string]string{{"text": mark + " " + label, "callback_data": data}})
+			out = append(out, autoItem{label: label, data: data, on: r.AutoSend()})
 		}
 	}
-	return map[string]any{"inline_keyboard": rows}
+	return out
+}
+
+// autoMenu — текст и кнопки меню /auto в виде v: строка фильтров, чаты
+// страницы, листание.
+func autoMenu(s *config.Settings, v autoView) (string, map[string]any) {
+	all := autoItems(s)
+	var on, shown []autoItem
+	for _, it := range all {
+		if it.on {
+			on = append(on, it)
+		}
+		if v.Filter == 'a' || (v.Filter == 'y') == it.on {
+			shown = append(shown, it)
+		}
+	}
+	pages := max(1, (len(shown)+autoPageSize-1)/autoPageSize)
+	v.Page = min(v.Page, pages-1) // чаты могли убыть, пока меню висело
+
+	filter := func(f byte, text string) map[string]string {
+		if f == v.Filter {
+			text = "▸ " + text
+		}
+		return map[string]string{"text": text, "callback_data": "am:" + autoView{Filter: f}.code()}
+	}
+	rows := [][]map[string]string{{
+		filter('a', fmt.Sprintf("Все · %d", len(all))),
+		filter('y', fmt.Sprintf("🟢 · %d", len(on))),
+		filter('n', fmt.Sprintf("⚪ · %d", len(all)-len(on))),
+	}}
+	for _, it := range shown[min(len(shown), v.Page*autoPageSize):min(len(shown), (v.Page+1)*autoPageSize)] {
+		mark := "⚪"
+		if it.on {
+			mark = "🟢"
+		}
+		rows = append(rows, []map[string]string{{"text": mark + " " + it.label, "callback_data": it.data + "~" + v.code()}})
+	}
+	if pages > 1 {
+		nav := []map[string]string{}
+		if v.Page > 0 {
+			nav = append(nav, map[string]string{"text": "◀️", "callback_data": "am:" + autoView{v.Filter, v.Page - 1}.code()})
+		}
+		nav = append(nav, map[string]string{"text": fmt.Sprintf("%d / %d", v.Page+1, pages), "callback_data": "am:" + v.code()})
+		if v.Page < pages-1 {
+			nav = append(nav, map[string]string{"text": "▶️", "callback_data": "am:" + autoView{v.Filter, v.Page + 1}.code()})
+		}
+		rows = append(rows, nav)
+	}
+
+	what := map[byte]string{'a': "все чаты", 'y': "с автоотправкой", 'n': "без автоотправки"}[v.Filter]
+	text := fmt.Sprintf("🤖 <b>Автоотправка по чатам</b>\n\n"+
+		"🟢 — сообщение агента уходит само через %d с, если не нажать «Отменить».\n"+
+		"⚪ — только по кнопке «Отправить».\n\n"+
+		"Показаны: %s", s.AutoSendDelaySec, what)
+	switch {
+	case len(shown) == 0:
+		text += " — таких нет."
+	case pages > 1:
+		text += fmt.Sprintf(", стр. %d из %d.", v.Page+1, pages)
+	default:
+		text += "."
+	}
+	text += " Нажми на чат, чтобы переключить. Чатов без права отправки здесь нет."
+	return text, map[string]any{"inline_keyboard": rows}
 }
 
 // menuAccounts — чьи чаты в меню бота: основной и все, кто делит его бота;
@@ -158,10 +251,9 @@ func rulesOf(s *config.Settings, acct string) []config.ChatRule {
 	return out
 }
 
-func sendAutoMenu(ctx context.Context, s *config.Settings) {
-	text := autoMenuText(s)
-	kb := autoKeyboard(s)
-	if len(kb["inline_keyboard"].([][]map[string]string)) == 0 {
+func sendAutoMenu(ctx context.Context, s *config.Settings, v autoView) {
+	text, kb := autoMenu(s, v)
+	if len(autoItems(s)) == 0 {
 		text = "Ни в один чат агентам не разрешено писать — автоотправку включать не для чего.\n" +
 			"Отправку открывает " + html.EscapeString("tg allow <alias> --send") + "."
 	}
@@ -172,10 +264,31 @@ func sendAutoMenu(ctx context.Context, s *config.Settings) {
 	}
 }
 
-// handleAutoCallback — «s:<alias>»: переключить автоотправку своего чата
-// (чужого — сюда нажатие уже передано его службе).
+// handleAutoMenuCallback — «am:<вид>»: фильтр или другая страница меню /auto.
+func handleAutoMenuCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) {
+	bot.AnswerCallback(ctx, s, q.ID, "")
+	if q.Message == nil {
+		return
+	}
+	fresh, err := config.Load()
+	if err != nil {
+		return
+	}
+	editAutoMenu(ctx, fresh, q.Message.MessageID, parseAutoView(strings.TrimPrefix(q.Data, "am:")))
+}
+
+func editAutoMenu(ctx context.Context, s *config.Settings, messageID int64, v autoView) {
+	text, kb := autoMenu(s, v)
+	_ = bot.Call(ctx, s, "editMessageText", map[string]any{
+		"chat_id": s.ApprovalChatID, "message_id": messageID, "text": text, "parse_mode": "HTML", "reply_markup": kb,
+	}, nil)
+}
+
+// handleAutoCallback — «s:<alias>~<вид>»: переключить автоотправку своего
+// чата (чужого — сюда нажатие уже передано его службе) и перерисовать меню в
+// том же виде. Кнопки старых меню — без вида.
 func handleAutoCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) {
-	alias := strings.TrimPrefix(q.Data, "s:")
+	alias, code, _ := strings.Cut(strings.TrimPrefix(q.Data, "s:"), "~")
 	fresh, err := config.Load() // права могли поменять, пока меню висело
 	if err != nil {
 		bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
@@ -199,9 +312,7 @@ func handleAutoCallback(ctx context.Context, s *config.Settings, q *bot.Callback
 	if fresh, err = config.Load(); err != nil {
 		return
 	}
-	_ = bot.Call(ctx, s, "editMessageReplyMarkup", map[string]any{
-		"chat_id": s.ApprovalChatID, "message_id": q.Message.MessageID, "reply_markup": autoKeyboard(fresh),
-	}, nil)
+	editAutoMenu(ctx, fresh, q.Message.MessageID, parseAutoView(code))
 }
 
 // toggleAuto — переключить автоотправку чата в chats.toml; вернёт новое состояние.
