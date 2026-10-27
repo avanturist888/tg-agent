@@ -559,3 +559,31 @@ func TestClientReconnects(t *testing.T) {
 		t.Fatalf("отозванный токен: %v", err)
 	}
 }
+
+func TestFolderMatches(t *testing.T) {
+	contacts := map[int64]bool{5: true}
+	dialog := Chat{ID: 1, Type: "DIALOG", Participants: Participants{100: 1, 5: 1}}
+	stranger := Chat{ID: 2, Type: "DIALOG", Participants: Participants{100: 1, 7: 1}, NewMessages: 2}
+	channel := Chat{ID: 3, Type: "CHANNEL"}
+	group := Chat{ID: 4, Type: "CHAT", Owner: 100, NewMessages: 1}
+	flags := func(c Chat) uint64 { return ChatFlags(c, 100, contacts) }
+	unread := Folder{Filters: []int{FilterUnread}}
+	channels := Folder{Filters: []int{FilterChannel}}
+	personal := Folder{Filters: []int{FilterContact, FilterNotContact}}
+	mine := Folder{Filters: []int{FilterChat, FilterOwner}, Exclude: []int64{9}, Include: []int64{3}}
+	for _, tc := range []struct {
+		f    Folder
+		c    Chat
+		want bool
+	}{
+		{unread, stranger, true}, {unread, dialog, false}, {unread, group, true},
+		{channels, channel, true}, {channels, group, false},
+		{personal, dialog, true}, {personal, stranger, true}, {personal, group, false},
+		{mine, group, true}, {mine, channel, true}, {mine, dialog, false},
+		{Folder{ID: AllFolder}, channel, true}, {Folder{}, channel, false},
+	} {
+		if got := tc.f.Matches(tc.c.ID, flags(tc.c)); got != tc.want {
+			t.Errorf("папка %v, чат %d: %v, ждали %v", tc.f.Filters, tc.c.ID, got, tc.want)
+		}
+	}
+}

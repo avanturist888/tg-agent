@@ -11,10 +11,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,10 +32,12 @@ func MaxSessionPath() string { return filepath.Join(config.DataPath(), "max", "s
 // maxRT — соединение службы и то, что она знает об аккаунте.
 var maxRT struct {
 	sync.Mutex
-	client *maxc.Client
-	self   int64
-	names  map[int64]string    // id человека → имя
-	chats  map[int64]maxc.Chat // из последнего входа
+	client   *maxc.Client
+	self     int64
+	names    map[int64]string    // id человека → имя
+	chats    map[int64]maxc.Chat // из последнего входа
+	ua       maxc.UserAgent      // как служба представилась (для загрузки голосовых)
+	contacts map[int64]bool      // контакты владельца (правила папок)
 }
 
 // ErrNoMax — без службы MAX сети нет: соединение держит только она.
@@ -108,7 +112,7 @@ func RunMax(ctx context.Context, loader func() (*config.Settings, error)) {
 			}
 		}
 		maxRT.Lock()
-		maxRT.client = cl
+		maxRT.client, maxRT.ua = cl, sess.UserAgent
 		maxRT.Unlock()
 		err = cl.Run(ctx)
 		maxRT.Lock()
@@ -137,8 +141,10 @@ func maxLoggedIn(ctx context.Context, loader func() (*config.Settings, error), r
 		maxRT.names = map[int64]string{}
 	}
 	maxRT.names[r.Profile.Contact.ID] = r.Profile.Contact.DisplayName()
+	maxRT.contacts = map[int64]bool{}
 	for _, c := range r.Contacts {
 		maxRT.names[c.ID] = c.DisplayName()
+		maxRT.contacts[c.ID] = true
 	}
 	maxRT.chats = map[int64]maxc.Chat{}
 	for _, ch := range r.Chats {
@@ -196,6 +202,7 @@ func maxFeed(s *config.Settings, rule config.ChatRule, msgs []maxc.Message) {
 }
 
 func maxOnEvent(loader func() (*config.Settings, error), ev maxc.Event) {
+	maxTrack(ev)
 	if ev.Kind != maxc.EventNew && ev.Kind != maxc.EventEdit && ev.Kind != maxc.EventDelete {
 		return
 	}
@@ -224,8 +231,8 @@ func maxOnEvent(loader func() (*config.Settings, error), ev maxc.Event) {
 // ── чтение ───────────────────────────────────────────────────────────────
 
 func maxReadChat(ctx context.Context, s *config.Settings, rule config.ChatRule, o ReadOpts, limit int) ([]*omap.Map, error) {
-	if o.Search != "" || o.Topic != 0 {
-		return nil, &Bad{Msg: "В MAX поиска и тем пока нет: читай без search и topic."}
+	if o.Topic != 0 {
+		return nil, &Bad{Msg: "В MAX тем нет — читай без topic."}
 	}
 	chatID, err := maxChatID(rule)
 	if err != nil {
@@ -238,6 +245,8 @@ func maxReadChat(ctx context.Context, s *config.Settings, rule config.ChatRule, 
 	var msgs []maxc.Message
 	after, before := int64(o.AfterID), int64(o.BeforeID)
 	switch {
+	case o.Search != "":
+		msgs, err = maxSearch(ctx, c, chatID, o.Search, limit)
 	case len(o.IDs) > 0:
 		seen := map[int64]bool{}
 		for _, id := range o.IDs {
@@ -259,19 +268,26 @@ func maxReadChat(ctx context.Context, s *config.Settings, rule config.ChatRule, 
 		return nil, err
 	}
 	slices.SortFunc(msgs, func(a, b maxc.Message) int { return compareInt(a.ID, b.ID) })
-	var out []*omap.Map
+	var kept []maxc.Message
 	for _, m := range msgs {
 		if m.Status == "REMOVED" || (before > 0 && m.ID >= before) || (after > 0 && m.ID <= after) {
 			continue // удалённое агенту не показываем, как и в Telegram
 		}
-		out = append(out, maxSerialize(ctx, c, m))
+		kept = append(kept, m)
 	}
-	if len(o.IDs) == 0 && len(out) > limit {
+	if len(o.IDs) == 0 && len(kept) > limit {
 		if o.AfterID > 0 {
-			out = out[:limit] // после after_id — ближайшие к нему
+			kept = kept[:limit] // после after_id — ближайшие к нему
 		} else {
-			out = out[len(out)-limit:]
+			kept = kept[len(kept)-limit:]
 		}
+	}
+	out := make([]*omap.Map, len(kept))
+	for i, m := range kept {
+		out[i] = maxSerialize(ctx, c, m)
+	}
+	if o.Transcribe {
+		maxAttachTranscripts(ctx, s, rule, c, chatID, kept, out)
 	}
 	return out, nil
 }
@@ -382,20 +398,21 @@ func maxSerialize(ctx context.Context, c *maxc.Conn, m maxc.Message) *omap.Map {
 			out.Set("forwarded_from", fwd)
 		}
 	}
-	var media []string
 	for _, a := range m.Attaches {
-		typ, _ := a["_type"].(string)
-		switch typ {
-		case "", "INLINE_KEYBOARD":
-		case "CONTROL": // служебное: вошёл, вышел, сменил название…
-			ev, _ := a["event"].(string)
-			out.Set("service_action", ev)
-		default:
-			media = append(media, typ)
+		if attachType(a) == "CONTROL" { // служебное: вошёл, вышел, сменил название…
+			out.Set("service_action", attachStr(a, "event"))
 		}
 	}
-	if len(media) > 0 {
-		out.Set("media", media) // PHOTO, VIDEO, FILE, AUDIO, STICKER… — скачать пока нельзя
+	if a := maxMedia(&m); a != nil {
+		out.Set("media", maxMediaKind(a)) // скачать — tg_download_file, картинку — tg_view_media
+		maxMediaInfo(out, a)
+	}
+	if r := m.Reactions; r != nil && len(r.Counters) > 0 {
+		list := make([]*omap.Map, 0, len(r.Counters))
+		for _, c := range r.Counters {
+			list = append(list, omap.New().Set("emoji", c.Reaction).Set("count", c.Count).Set("mine", c.Reaction == r.Mine))
+		}
+		out.Set("reactions", list)
 	}
 	if m.Status == "EDITED" && m.UpdateTime > 0 {
 		out.Set("edited", time.UnixMilli(m.UpdateTime).UTC().Format(time.RFC3339))
@@ -440,16 +457,49 @@ func maxDeliver(ctx context.Context, s *config.Settings, rule config.ChatRule, d
 		}
 		return omap.New().Set("message_id", m.ID).Set("format", d.Fmt), nil
 	}
-	o := maxc.SendOptions{Elements: els}
+	var reply int64
 	if d.ReplyTo != nil {
-		o.ReplyTo, _ = maxFixID(ctx, c, chatID, *d.ReplyTo)
+		reply, _ = maxFixID(ctx, c, chatID, *d.ReplyTo)
 	}
-	m, err := c.Send(ctx, chatID, text, o)
+	attaches, err := maxUpload(ctx, c, d.Files)
 	if err != nil {
 		return nil, err
 	}
-	markOutgoing(rule.Alias, int(m.ID))
-	return omap.New().Set("message_id", m.ID).Set("format", d.Fmt), nil
+	// разные виды вложений в одном сообщении сервер не принимает: фото —
+	// вместе (с текстом), каждый файл, видео и голосовое — отдельно
+	batches := [][]maxc.Attach{nil}
+	for _, a := range attaches {
+		if attachType(a) == "PHOTO" {
+			batches[0] = append(batches[0], a)
+		} else {
+			batches = append(batches, []maxc.Attach{a})
+		}
+	}
+	if text == "" && len(batches[0]) == 0 && len(batches) > 1 {
+		batches = batches[1:] // без текста и фото — первым уходит первый файл
+	}
+	var ids []int64
+	for i, b := range batches {
+		o := maxc.SendOptions{Attaches: b}
+		body := ""
+		if i == 0 {
+			body, o.Elements, o.ReplyTo = text, els, reply
+		}
+		m, err := c.Send(ctx, chatID, body, o)
+		if err != nil {
+			if len(ids) > 0 { // часть уже ушла — так и сказать
+				return nil, fmt.Errorf("ушло %d сообщений из %d, дальше ошибка: %w", len(ids), len(batches), err)
+			}
+			return nil, err
+		}
+		markOutgoing(rule.Alias, int(m.ID))
+		ids = append(ids, m.ID)
+	}
+	out := omap.New().Set("message_id", ids[0]).Set("format", d.Fmt)
+	if len(ids) > 1 {
+		out.Set("file_message_ids", ids[1:])
+	}
+	return out, nil
 }
 
 // maxEditOld — прежний текст своего сообщения для правки (и проверки: есть
@@ -582,4 +632,87 @@ func maxNearestSent(s *config.Settings, alias string, id int64) int64 {
 		}
 	}
 	return best
+}
+
+// maxChatStatus — непрочитанные и последнее сообщение чатов белого списка
+// (tg_list_chats with_status): из того, что служба знает о чатах.
+func maxChatStatus(ctx context.Context, s *config.Settings) (map[string]*omap.Map, error) {
+	c, err := maxConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	maxRT.Lock()
+	chats := maps.Clone(maxRT.chats)
+	maxRT.Unlock()
+	out := map[string]*omap.Map{}
+	for _, rule := range s.Rules() {
+		id, err := maxChatID(rule)
+		if err != nil {
+			continue
+		}
+		ch, ok := chats[id]
+		var at any
+		preview := ""
+		if ok && ch.LastMessage != nil {
+			at = time.UnixMilli(ch.LastMessage.Time).UTC().Format(time.RFC3339)
+			preview = truncate(ch.LastMessage.Text, 160)
+		} else if hist, err := c.History(ctx, id, 0, 1); err == nil && len(hist) > 0 {
+			at = time.UnixMilli(hist[len(hist)-1].Time).UTC().Format(time.RFC3339)
+			preview = truncate(hist[len(hist)-1].Text, 160)
+		}
+		out[rule.Alias] = omap.New().Set("unread", ch.NewMessages).Set("unread_mentions", 0).
+			Set("last_message_at", at).Set("last_message_preview", preview)
+	}
+	return out, nil
+}
+
+// maxTrack — событие обновляет то, что служба знает о чате: последнее
+// сообщение и непрочитанные.
+func maxTrack(ev maxc.Event) {
+	if ev.Kind != maxc.EventNew && ev.Kind != maxc.EventRead {
+		return
+	}
+	maxRT.Lock()
+	defer maxRT.Unlock()
+	if maxRT.chats == nil {
+		return
+	}
+	ch, ok := maxRT.chats[ev.ChatID]
+	if !ok {
+		ch = maxc.Chat{ID: ev.ChatID}
+	}
+	if ev.Kind == maxc.EventNew && ev.Message != nil {
+		m := *ev.Message
+		ch.LastMessage, ch.LastEventTime = &m, m.Time
+	}
+	ch.NewMessages = ev.Unread
+	maxRT.chats[ev.ChatID] = ch
+}
+
+// maxMediaKind — вид вложения словами Telegram (агенту привычно).
+func maxMediaKind(a maxc.Attach) string {
+	switch attachType(a) {
+	case "PHOTO":
+		return "photo"
+	case "VIDEO":
+		if attachInt(a, "videoType") == 1 {
+			return "video_note"
+		}
+		return "video"
+	case "AUDIO":
+		return "voice"
+	case "FILE":
+		return "document"
+	case "STICKER":
+		return "sticker"
+	case "SHARE":
+		return "webpage"
+	case "CONTACT":
+		return "contact"
+	case "CALL":
+		return "call"
+	case "POLL":
+		return "poll"
+	}
+	return strings.ToLower(attachType(a))
 }

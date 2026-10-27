@@ -4,6 +4,7 @@ package maxc
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -146,4 +147,72 @@ func btoi(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// TestLiveFolders — правила папок MAX (только структура).
+func TestLiveFolders(t *testing.T) {
+	home, _ := os.Getwd()
+	sess, err := LoadSession(filepath.Join(home, "..", "..", "profiles", "max", "data", "max", "session.json"))
+	if err != nil {
+		t.Skip(err)
+	}
+	ctx := context.Background()
+	c, _, err := Open(ctx, sess, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var raw map[string]any
+	if err := c.Invoke(ctx, OpFoldersGet, map[string]any{"folderSync": 0}, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range raw["folders"].([]any) {
+		m := f.(map[string]any)
+		t.Logf("%v: filters=%v options=%v include=%T", m["id"], m["filters"], m["options"], m["include"])
+	}
+	t.Logf("allFilterExcludeFolders=%v", raw["allFilterExcludeFolders"])
+}
+
+// TestLiveAttach — каждое вложение отдельно в «Избранное» (и сразу удалить).
+// MAX_ATTACH_DIR — папка с probe.png, probe.txt, probe.ogg.
+func TestLiveAttach(t *testing.T) {
+	dir := os.Getenv("MAX_ATTACH_DIR")
+	home, _ := os.Getwd()
+	sess, err := LoadSession(filepath.Join(home, "..", "..", "profiles", "max", "data", "max", "session.json"))
+	if err != nil || dir == "" {
+		t.Skip("нет сессии или MAX_ATTACH_DIR")
+	}
+	ctx := context.Background()
+	c, _, err := Open(ctx, sess, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for _, name := range []string{"probe.png", "probe.txt", "probe.ogg"} {
+		p := filepath.Join(dir, name)
+		var a Attach
+		switch name {
+		case "probe.png":
+			a, err = c.UploadPhoto(ctx, p)
+		case "probe.txt":
+			a, err = c.UploadFile(ctx, p)
+		default:
+			a, err = c.UploadVoice(ctx, p, 3*time.Second, sess.UserAgent)
+		}
+		if err != nil {
+			t.Errorf("%s: загрузка: %v", name, err)
+			continue
+		}
+		keys := []string{}
+		for k, v := range a {
+			keys = append(keys, fmt.Sprintf("%s:%T", k, v))
+		}
+		m, err := c.Send(ctx, SavedChat, "проба вложения "+name, SendOptions{Silent: true, Attaches: []Attach{a}})
+		if err != nil {
+			t.Errorf("%s: отправка %v: %v", name, keys, err)
+			continue
+		}
+		t.Logf("%s: ушло, вложений в ответе %d (%v)", name, len(m.Attaches), keys)
+		_ = c.Delete(ctx, SavedChat, []int64{m.ID}, false)
+	}
 }

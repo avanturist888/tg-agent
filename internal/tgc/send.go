@@ -480,3 +480,9 @@ func contains(list []string, s string) bool {
 	}
 	return false
 }
+
+// VoiceDuration — длительность голосового OGG/Opus в секундах (0 — не вышло).
+func VoiceDuration(path string) int {
+	d, _ := oggVoice(path)
+	return d
+}

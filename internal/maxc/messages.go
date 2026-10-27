@@ -73,6 +73,7 @@ type Message struct {
 	Elements   []Element        `json:"elements"`
 	Attaches   []map[string]any `json:"attaches"`
 	Link       *Link            `json:"link"`
+	Reactions  *ReactionInfo    `json:"reactionInfo"`
 }
 
 // cid — id сообщения со стороны клиента: мс Unix, строго растут (как у PyMax).
@@ -119,19 +120,38 @@ type SendOptions struct {
 	ReplyTo  int64     // ответ на сообщение
 	Elements []Element // разметка
 	Silent   bool      // без звука у получателя
+	Attaches []Attach  // фото, файлы, видео, голосовые (Upload*)
 }
 
 // Send — отправить текст; вернёт сообщение, как его записал сервер.
 func (c *Conn) Send(ctx context.Context, chatID int64, text string, o SendOptions) (*Message, error) {
-	msg := map[string]any{"text": text, "cid": nextCID(), "elements": elems(o.Elements), "attaches": []any{}}
+	attaches := []Attach{}
+	if o.Attaches != nil {
+		attaches = o.Attaches
+	}
+	msg := map[string]any{"text": text, "cid": nextCID(), "elements": elems(o.Elements), "attaches": attaches}
 	if o.ReplyTo != 0 {
 		msg["link"] = map[string]any{"type": "REPLY", "messageId": o.ReplyTo}
 	}
 	var r struct {
 		Message Message `json:"message"`
 	}
-	if err := c.Invoke(ctx, OpMsgSend, map[string]any{"chatId": chatID, "message": msg, "notify": !o.Silent}, &r); err != nil {
-		return nil, err
+	// вложение ещё обрабатывается — сервер просит подождать
+	for try := 0; ; try++ {
+		err := c.Invoke(ctx, OpMsgSend, map[string]any{"chatId": chatID, "message": msg, "notify": !o.Silent}, &r)
+		var e *Error
+		if errors.As(err, &e) && e.Code == "attachment.not.ready" && try < 30 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		break
 	}
 	if r.Message.ID == 0 {
 		return nil, errors.New("maxc: сервер не вернул отправленное сообщение")

@@ -73,12 +73,12 @@ func TestMaxSerialize(t *testing.T) {
 	maxEnv(t)
 	m := maxc.Message{ID: 7, Time: 1792666937000, Sender: 5, Text: "", Status: "EDITED", UpdateTime: 1792666999000,
 		Attaches: []map[string]any{{"_type": "PHOTO"}, {"_type": "CONTROL", "event": "joined"}},
-		Link: &maxc.Link{Type: "FORWARD", Message: &maxc.Message{ID: 3, Sender: 100, Text: "исходное", Time: 1792666000000}}}
+		Link:     &maxc.Link{Type: "FORWARD", Message: &maxc.Message{ID: 3, Sender: 100, Text: "исходное", Time: 1792666000000}}}
 	got := maxSerialize(context.Background(), nil, m)
 	want := `{"id":7,"date":"2026-10-22T`
 	if s := compact(got); !strings.HasPrefix(s, want) || !strings.Contains(s, `"from":{"id":5,"name":"Аня"}`) ||
 		!strings.Contains(s, `"text":"исходное"`) || !strings.Contains(s, `"forwarded_from":{"from":{"id":100,"name":"Я"}`) ||
-		!strings.Contains(s, `"media":["PHOTO"]`) || !strings.Contains(s, `"service_action":"joined"`) ||
+		!strings.Contains(s, `"media":"photo"`) || !strings.Contains(s, `"service_action":"joined"`) ||
 		!strings.Contains(s, `"edited":"`) {
 		t.Fatalf("сообщение: %s", s)
 	}
@@ -92,10 +92,6 @@ func TestMaxSerialize(t *testing.T) {
 func TestMaxDraftLimits(t *testing.T) {
 	s, _ := maxEnv(t)
 	s.SendPolicy = "bot_approval"
-	if _, err := DraftMessage(context.Background(), s, "team", "x", nil, "", "", []string{"C:/a.txt"}, false, 0); err == nil ||
-		!strings.Contains(err.Error(), "только текст") {
-		t.Fatalf("файлы в MAX: %v", err)
-	}
 	if _, err := DraftMessage(context.Background(), s, "team", "x", nil, "", "", nil, false, 5); err == nil {
 		t.Fatal("темы в MAX нет")
 	}
@@ -106,8 +102,11 @@ func TestMaxDraftLimits(t *testing.T) {
 	if text, els = maxText(&outbox.Draft{Text: "**да**", Fmt: "plain"}); text != "**да**" || els != nil {
 		t.Fatalf("plain: %q %v", text, els)
 	}
-	if _, err := maxReadChat(context.Background(), s, s.Chats["team"], ReadOpts{Search: "x"}, 10); err == nil {
-		t.Fatal("поиска в MAX нет")
+	if _, err := maxReadChat(context.Background(), s, s.Chats["team"], ReadOpts{Topic: 3}, 10); err == nil {
+		t.Fatal("тем в MAX нет")
+	}
+	if _, err := maxReadChat(context.Background(), s, s.Chats["team"], ReadOpts{Search: "x"}, 10); err != ErrNoMax {
+		t.Fatalf("поиск без службы: %v", err)
 	}
 	if _, err := maxReadChat(context.Background(), s, s.Chats["team"], ReadOpts{}, 10); err != ErrNoMax {
 		t.Fatalf("без службы: %v", err)
@@ -117,4 +116,32 @@ func TestMaxDraftLimits(t *testing.T) {
 func compact(m *omap.Map) string {
 	raw, _ := omap.Marshal(m)
 	return string(raw)
+}
+
+func TestMaxMediaKinds(t *testing.T) {
+	for _, tc := range []struct {
+		a    maxc.Attach
+		kind string
+	}{
+		{maxc.Attach{"_type": "PHOTO"}, "photo"}, {maxc.Attach{"_type": "AUDIO"}, "voice"},
+		{maxc.Attach{"_type": "VIDEO", "videoType": int8(1)}, "video_note"}, {maxc.Attach{"_type": "VIDEO"}, "video"},
+		{maxc.Attach{"_type": "FILE"}, "document"}, {maxc.Attach{"_type": "STICKER"}, "sticker"},
+	} {
+		if got := maxMediaKind(tc.a); got != tc.kind {
+			t.Errorf("%v → %s, ждали %s", tc.a, got, tc.kind)
+		}
+	}
+	m := maxc.Message{Attaches: []map[string]any{{"_type": "INLINE_KEYBOARD"}, {"_type": "FILE", "name": "a.pdf", "size": int64(10)}}}
+	out := maxSerialize(context.Background(), nil, m)
+	if s := compact(out); !strings.Contains(s, `"media":"document"`) || !strings.Contains(s, `"file":{"name":"a.pdf","size":10}`) {
+		t.Fatalf("файл: %s", s)
+	}
+	if !maxIsVoice(maxc.Attach{"_type": "AUDIO"}) || maxIsVoice(maxc.Attach{"_type": "VIDEO"}) {
+		t.Fatal("голосовое — AUDIO и кружок")
+	}
+	for in, want := range map[string]string{"../dir/a<b>.txt": "a_b_.txt", "a:b|c?.txt": "a_b_c_.txt"} {
+		if got := safeName(in); got != want {
+			t.Fatalf("имя файла %q: %s, ждали %s", in, got, want)
+		}
+	}
 }

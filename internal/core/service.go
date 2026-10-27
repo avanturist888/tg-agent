@@ -76,13 +76,18 @@ func ListChats(ctx context.Context, s *config.Settings, withStatus bool) (*omap.
 		}
 		chats = append(chats, item)
 	}
-	if withStatus && !s.IsMAX() { // у MAX непрочитанных и превью пока нет
+	if withStatus {
 		var status map[string]*omap.Map
-		err := tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
-			var err error
-			status, err = c.ChatStatus(ctx, s.Rules())
-			return err
-		})
+		var err error
+		if s.IsMAX() {
+			status, err = maxChatStatus(ctx, s)
+		} else {
+			err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
+				var err error
+				status, err = c.ChatStatus(ctx, s.Rules())
+				return err
+			})
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -431,6 +436,9 @@ func DownloadFile(ctx context.Context, s *config.Settings, chat string, messageI
 	if err != nil {
 		return nil, err
 	}
+	if s.IsMAX() {
+		return maxDownloadFile(ctx, s, rule, int64(messageID))
+	}
 	var got *tgc.Downloaded
 	err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
 		t, err := c.Resolve(ctx, rule)
@@ -486,21 +494,25 @@ func React(ctx context.Context, s *config.Settings, chat string, messageID int, 
 		return nil, &Bad{"Реакция — это один эмодзи, например 👍."}
 	}
 	var reactions []*omap.Map
-	err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
-		t, err := c.Resolve(ctx, rule)
-		if err != nil {
-			return err
-		}
-		reactions, err = c.SetReaction(ctx, t, messageID, emoji)
-		if code := tgc.RPCMessage(err); code != "" {
-			msg := "Telegram отказал: " + err.Error()
-			if hint := reactionHints[code]; hint != "" {
-				msg += " — " + hint
+	if s.IsMAX() {
+		reactions, err = maxReact(ctx, rule, int64(messageID), emoji)
+	} else {
+		err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
+			t, err := c.Resolve(ctx, rule)
+			if err != nil {
+				return err
 			}
-			return &Bad{msg}
-		}
-		return err
-	})
+			reactions, err = c.SetReaction(ctx, t, messageID, emoji)
+			if code := tgc.RPCMessage(err); code != "" {
+				msg := "Telegram отказал: " + err.Error()
+				if hint := reactionHints[code]; hint != "" {
+					msg += " — " + hint
+				}
+				return &Bad{msg}
+			}
+			return err
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -524,6 +536,9 @@ func ViewMedia(ctx context.Context, s *config.Settings, chat string, messageID i
 	rule, err := readable(s, chat)
 	if err != nil {
 		return nil, nil, err
+	}
+	if s.IsMAX() {
+		return maxViewMedia(ctx, s, rule, int64(messageID))
 	}
 	var img *tgc.Image
 	err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
@@ -550,6 +565,14 @@ func TranscribeMessage(ctx context.Context, s *config.Settings, chat string, mes
 	rule, err := readable(s, chat)
 	if err != nil {
 		return nil, err
+	}
+	if s.IsMAX() {
+		switch engine {
+		case "", "auto", "gigaam", "max":
+		default:
+			return nil, &Bad{Msg: "engine в MAX: auto, gigaam или max (расшифровка самого MAX)."}
+		}
+		return maxTranscribeMessage(ctx, s, rule, int64(messageID), engine)
 	}
 	switch engine {
 	case "", "auto", "gigaam", tgc.EngineTelegram:
@@ -746,8 +769,8 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 		topicName    string
 	)
 	if s.IsMAX() {
-		if len(files) > 0 || topic != 0 {
-			return nil, &Bad{Msg: "В MAX пока уходит только текст (и ответ через reply_to): без files и topic."}
+		if topic != 0 {
+			return nil, &Bad{Msg: "В MAX тем нет — пиши без topic."}
 		}
 	} else {
 		// «@Имя» без username — в упоминание по id, где человек однозначен
@@ -894,9 +917,6 @@ func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string
 	}
 	result := omap.New()
 	if s.IsMAX() {
-		if len(d.Files) > 0 {
-			return nil, &Bad{Msg: "В MAX файлы пока не уходят — черновик с файлами отправить нельзя."}
-		}
 		result, err = maxDeliver(ctx, s, rule, d)
 	} else {
 		err = deliverTelegram(ctx, s, rule, d, result)

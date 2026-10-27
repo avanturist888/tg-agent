@@ -54,6 +54,9 @@ func ListFolders(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 	if err := onlyLocal(s); err != nil {
 		return nil, err
 	}
+	if s.IsMAX() {
+		return maxListFolders(ctx, s)
+	}
 	var folders []tgc.Folder
 	err := tgc.Run(ctx, s, tgc.Opts{Caller: "folders"}, func(ctx context.Context, c *tgc.Conn) error {
 		var err error
@@ -91,6 +94,9 @@ func FolderChats(ctx context.Context, s *config.Settings, folder string) (*omap.
 	folder = strings.TrimSpace(folder)
 	if folder == "" {
 		return nil, &Bad{Msg: "Укажи папку: id или название из tg_list_folders."}
+	}
+	if s.IsMAX() {
+		return maxFolderChats(ctx, s, folder)
 	}
 	var (
 		found tgc.Folder
@@ -231,7 +237,7 @@ func RequestAccess(ctx context.Context, s *config.Settings, chatID int64, read, 
 	if reason == "" {
 		return nil, &Bad{Msg: "reason обязателен: по нему владелец решает, давать ли доступ. Напиши, зачем чат и для какого проекта."}
 	}
-	if chatID == 0 {
+	if chatID == 0 && !s.IsMAX() { // в MAX 0 — «Избранное»
 		return nil, &Bad{Msg: "chat_id — id чата из tg_folder_chats."}
 	}
 	if !read && !send {
@@ -245,19 +251,32 @@ func RequestAccess(ctx context.Context, s *config.Settings, chatID int64, read, 
 		info     tgc.DialogRow
 		existing *config.ChatRule
 	)
-	err := tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "request_access"}, func(ctx context.Context, c *tgc.Conn) error {
-		var err error
-		if info, err = c.ChatInfo(ctx, chatID); err != nil {
-			return &Bad{Msg: fmt.Sprintf("Чат %d не найден среди чатов аккаунта: %v", chatID, err)}
+	var err error
+	if s.IsMAX() {
+		if info, err = maxChatInfo(ctx, chatID); err != nil {
+			return nil, err
 		}
 		for _, r := range s.Rules() {
-			if ruleMarkedID(r, c) == chatID {
+			if id, e := maxChatID(r); e == nil && id == chatID {
 				existing = &r
 				break
 			}
 		}
-		return nil
-	})
+	} else {
+		err = tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "request_access"}, func(ctx context.Context, c *tgc.Conn) error {
+			var err error
+			if info, err = c.ChatInfo(ctx, chatID); err != nil {
+				return &Bad{Msg: fmt.Sprintf("Чат %d не найден среди чатов аккаунта: %v", chatID, err)}
+			}
+			for _, r := range s.Rules() {
+				if ruleMarkedID(r, c) == chatID {
+					existing = &r
+					break
+				}
+			}
+			return nil
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -460,7 +479,11 @@ func afterAccess(ctx context.Context, r *accessRequest) {
 		return
 	}
 	if r.Status == accessGranted && r.CanRead {
-		_, _ = PollOnce(ctx, s) // лента появится сразу, а не через минуту
+		if s.IsMAX() {
+			maxCatchup(ctx, s)
+		} else {
+			_, _ = PollOnce(ctx, s) // лента появится сразу, а не через минуту
+		}
 	}
 	if r.Agent == nil {
 		return

@@ -91,6 +91,9 @@ type Conn struct {
 	evCond *sync.Cond
 	events []Frame
 
+	waitMu sync.Mutex
+	waits  map[string]chan Frame // «вложение готово», «расшифровка готова»
+
 	done   chan struct{}
 	cancel context.CancelFunc
 }
@@ -246,6 +249,7 @@ func (c *Conn) readLoop(ctx context.Context) {
 }
 
 func (c *Conn) route(f Frame) {
+	c.notifyWaits(f)
 	if f.Cmd == CmdResponse || f.Cmd == CmdError {
 		c.mu.Lock()
 		ch := c.pending[f.Seq]
@@ -297,6 +301,62 @@ func (c *Conn) pingLoop(ctx context.Context) {
 		if err != nil && ctx.Err() == nil {
 			c.fail(fmt.Errorf("maxc: пинг: %w", err))
 			return
+		}
+	}
+}
+
+// waitFor — канал, куда придёт событие с ключом key (см. notifyWaits).
+func (c *Conn) waitFor(key string) <-chan Frame {
+	ch := make(chan Frame, 1)
+	c.waitMu.Lock()
+	if c.waits == nil {
+		c.waits = map[string]chan Frame{}
+	}
+	c.waits[key] = ch
+	c.waitMu.Unlock()
+	return ch
+}
+
+func (c *Conn) stopWait(key string) {
+	c.waitMu.Lock()
+	delete(c.waits, key)
+	c.waitMu.Unlock()
+}
+
+// notifyWaits — событие, которого ждут: вложение обработано (136) или
+// готова расшифровка голосового (293).
+func (c *Conn) notifyWaits(f Frame) {
+	if f.Cmd != CmdRequest || (f.Opcode != OpNotifAttach && f.Opcode != OpNotifTranscript) {
+		return
+	}
+	var p struct {
+		FileID    ID    `json:"fileId"`
+		VideoID   ID    `json:"videoId"`
+		AudioID   ID    `json:"audioId"`
+		ChatID    int64 `json:"chatId"`
+		MessageID ID    `json:"messageId"`
+	}
+	if f.Decode(&p) != nil {
+		return
+	}
+	var keys []string
+	if f.Opcode == OpNotifTranscript {
+		keys = append(keys, fmt.Sprintf("transcript:%d:%d", p.ChatID, p.MessageID))
+	} else {
+		for kind, id := range map[string]ID{"file": p.FileID, "video": p.VideoID, "audio": p.AudioID} {
+			if id != 0 {
+				keys = append(keys, fmt.Sprintf("%s:%d", kind, id))
+			}
+		}
+	}
+	c.waitMu.Lock()
+	defer c.waitMu.Unlock()
+	for _, k := range keys {
+		if ch := c.waits[k]; ch != nil {
+			select {
+			case ch <- f:
+			default:
+			}
 		}
 	}
 }

@@ -90,6 +90,8 @@ type Chat struct {
 	Title         string       `json:"title"`
 	Participants  Participants `json:"participants"`
 	LastMessage   *Message     `json:"lastMessage"`
+	NewMessages   int          `json:"newMessages"` // непрочитанных
+	Count         int          `json:"participantsCount"`
 	LastEventTime int64        `json:"lastEventTime"`
 }
 

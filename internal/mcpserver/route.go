@@ -260,8 +260,7 @@ func part(acct string, res mcp.Result) *omap.Map {
 }
 
 // maxOnlyTelegram — инструменты, которых у аккаунта MAX пока нет.
-var maxOnlyTelegram = set("tg_view_media", "tg_download_file", "tg_transcribe", "tg_search_chat",
-	"tg_list_topics", "tg_react", "tg_list_folders", "tg_folder_chats", "tg_request_access")
+var maxOnlyTelegram = set("tg_list_topics")
 
 // maxGuard — в процессе профиля MAX такие вызовы получают понятный отказ, а
 // не ошибку Telegram.
@@ -269,8 +268,7 @@ func maxGuard(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 		if call, ok := req.(*mcp.CallToolRequest); ok && method == "tools/call" && call.Params != nil &&
 			maxOnlyTelegram[call.Params.Name] && config.Network() == config.NetMAX {
-			return Failed(&core.Bad{Msg: fmt.Sprintf("%s в аккаунте MAX пока нет: там есть чтение (tg_read_chat), "+
-				"черновики с подтверждением, правка своих сообщений и подписки.", call.Params.Name)}), nil
+			return Failed(&core.Bad{Msg: fmt.Sprintf("%s: в MAX нет тем форумов — читай и пиши без topic.", call.Params.Name)}), nil
 		}
 		return next(ctx, method, req)
 	}
