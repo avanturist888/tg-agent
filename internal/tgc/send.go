@@ -1,12 +1,15 @@
 package tgc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"mime"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/gotd/td/telegram/uploader"
@@ -174,15 +177,27 @@ type OutFile struct {
 // другим — смешивать их в одном альбоме Telegram не даёт. reply получает
 // первый альбом.
 func (c *Conn) SendFiles(ctx context.Context, t Target, files []OutFile, reply *int64) ([]int, error) {
-	var photos, docs []string
+	var photos, docs, voices []string
 	for _, f := range files {
-		if f.Photo {
+		switch {
+		case f.Photo:
 			photos = append(photos, f.Path)
-		} else {
+		case isVoiceFile(f.Path):
+			voices = append(voices, f.Path)
+		default:
 			docs = append(docs, f.Path)
 		}
 	}
 	var ids []int
+	// голосовые в альбом не собираются — каждое отдельным сообщением
+	for _, p := range voices {
+		got, err := c.sendVoice(ctx, t, p, reply)
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, got...)
+		reply = nil
+	}
 	for _, g := range []struct {
 		paths []string
 		photo bool
@@ -201,6 +216,124 @@ func (c *Conn) SendFiles(ctx context.Context, t Target, files []OutFile, reply *
 		ids = append(ids, got...)
 		reply = nil
 	}
+	return ids, nil
+}
+
+// isVoiceFile — .ogg/.oga/.opus уходят голосовым: Telegram ждёт там Opus в OGG.
+func isVoiceFile(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".ogg", ".oga", ".opus":
+		return true
+	}
+	return false
+}
+
+// oggVoice — длительность и waveform голосового из OGG/Opus. Длительность —
+// по granule position последней страницы (у Opus она всегда в отсчётах
+// 48 кГц). Без waveform клиенты рисуют голосовое пустой полоской, а
+// декодера Opus у нас нет — громкость оцениваем по размерам пакетов: в VBR
+// тишина занимает единицы байт, речь — десятки.
+func oggVoice(path string) (duration int, waveform []byte) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, nil
+	}
+	var sizes []int
+	var granule uint64
+	cur := 0
+	for i := 0; i+27 <= len(data); {
+		if !bytes.Equal(data[i:i+4], []byte("OggS")) {
+			break
+		}
+		nseg := int(data[i+26])
+		if i+27+nseg > len(data) {
+			break
+		}
+		if g := binary.LittleEndian.Uint64(data[i+6 : i+14]); g != ^uint64(0) {
+			granule = g
+		}
+		body := 0
+		for _, l := range data[i+27 : i+27+nseg] {
+			cur += int(l)
+			body += int(l)
+			if l < 255 {
+				sizes = append(sizes, cur)
+				cur = 0
+			}
+		}
+		i += 27 + nseg + body
+	}
+	duration = int((granule + 47999) / 48000)
+	if len(sizes) > 2 {
+		waveform = packWaveform(levels(sizes[2:], 100)) // первые два — OpusHead и OpusTags
+	}
+	return duration, waveform
+}
+
+// levels — n столбцов 0..31: средний размер пакета в доле записи, от самого
+// тихого столбца до самого громкого.
+func levels(sizes []int, n int) []int {
+	n = min(n, len(sizes))
+	avg := make([]float64, n)
+	for k := range n {
+		part := sizes[k*len(sizes)/n : (k+1)*len(sizes)/n]
+		for _, s := range part {
+			avg[k] += float64(s)
+		}
+		avg[k] /= float64(len(part))
+	}
+	lo, hi := slices.Min(avg), slices.Max(avg)
+	out := make([]int, n)
+	for k, a := range avg {
+		if hi > lo {
+			out[k] = int(31 * (a - lo) / (hi - lo))
+		}
+	}
+	return out
+}
+
+// packWaveform — значения по 5 бит подряд, младшие биты первыми (как
+// пишут waveform официальные клиенты).
+func packWaveform(v []int) []byte {
+	out := make([]byte, (len(v)*5+7)/8)
+	for i, x := range v {
+		bit := i * 5
+		w := uint16(x&31) << (bit % 8)
+		out[bit/8] |= byte(w)
+		if bit/8+1 < len(out) {
+			out[bit/8+1] |= byte(w >> 8)
+		}
+	}
+	return out
+}
+
+func (c *Conn) sendVoice(ctx context.Context, t Target, path string, reply *int64) ([]int, error) {
+	file, err := uploader.NewUploader(c.API).FromPath(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	dur, wave := oggVoice(path)
+	audio := &tg.DocumentAttributeAudio{Voice: true, Duration: dur}
+	if wave != nil {
+		audio.SetWaveform(wave)
+	}
+	req := &tg.MessagesSendMediaRequest{
+		Peer: t.Input,
+		Media: &tg.InputMediaUploadedDocument{
+			File:       file,
+			MimeType:   "audio/ogg",
+			Attributes: []tg.DocumentAttributeClass{audio},
+		},
+		RandomID: randomID(),
+	}
+	if r := replyTo(reply, t.Topic); r != nil {
+		req.ReplyTo = r
+	}
+	res, err := c.API.MessagesSendMedia(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	ids, _ := sent(res, []int64{req.RandomID})
 	return ids, nil
 }
 
