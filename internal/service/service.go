@@ -39,7 +39,7 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	done := make(chan struct{}, 6)
+	done := make(chan struct{}, 7)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		_ = srv.Serve(ctx)
@@ -55,6 +55,10 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 	go func() {
 		defer func() { done <- struct{}{} }()
 		runHTTP(ctx, loader) // MCP по HTTP для агентов из контейнеров
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		core.RunUpstream(ctx, loader) // обновления MAX и PyMax → закреплённые карточки в боте
 	}()
 	go func() {
 		defer func() { done <- struct{}{} }()
@@ -87,7 +91,7 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 		core.RecoverInterrupted(ctx, s) // у своего бота это делает RunButtons
 	}
 	<-ctx.Done()
-	for range 6 {
+	for range 7 {
 		<-done
 	}
 	_ = audit.Log(s.AuditPath(), "service_stop")

@@ -479,7 +479,8 @@ type Update struct {
 type Message struct {
 	MessageID int64 `json:"message_id"`
 	From      struct {
-		ID int64 `json:"id"`
+		ID    int64 `json:"id"`
+		IsBot bool  `json:"is_bot"`
 	} `json:"from"`
 	Chat struct {
 		ID int64 `json:"id"`

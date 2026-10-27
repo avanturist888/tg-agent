@@ -223,6 +223,10 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		handleNotesCallback(ctx, s, q) // заметки к аккаунтам (/notes)
 		return
 	}
+	if data == upstreamAck {
+		handleUpstreamCallback(ctx, s, q) // «Разобрано» под карточкой обновления
+		return
+	}
 	if !strings.HasPrefix(data, "d:") {
 		return
 	}

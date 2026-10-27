@@ -2,7 +2,8 @@ package core
 
 // Команды владельца в боте подтверждений. /auto — список чатов с отправкой и
 // переключатели автоотправки: нажатие сразу правит config/chats.toml.
-// /notes и /note — заметки к аккаунтам (core/notes.go).
+// /notes и /note — заметки к аккаунтам (core/notes.go). /updates — слежение
+// за обновлениями MAX и PyMax (core/upstream.go).
 //
 // Меню — обычное сообщение, не rich: под rich-сообщением нажатие приходит без
 // message, а id меню нужен, чтобы перерисовать кнопки.
@@ -29,6 +30,7 @@ func setCommands(ctx context.Context, s *config.Settings) {
 		"commands": []map[string]string{
 			{"command": "auto", "description": "автоотправка по чатам"},
 			{"command": "notes", "description": "заметки к аккаунтам"},
+			{"command": "updates", "description": "обновления MAX и PyMax"},
 		},
 		"scope": map[string]any{"type": "chat", "chat_id": s.ApprovalChatID},
 	}, nil)
@@ -36,6 +38,9 @@ func setCommands(ctx context.Context, s *config.Settings) {
 
 // HandleMessage — сообщение боту. Слушаем только владельца в его чате с ботом.
 func HandleMessage(ctx context.Context, s *config.Settings, m *bot.Message) {
+	if m.From.IsBot && m.Chat.ID == s.ApprovalChatID {
+		return // сервисное от самого бота («закрепил сообщение») — не отказ
+	}
 	if m.From.ID != s.ApprovalChatID || m.Chat.ID != s.ApprovalChatID {
 		logEvent(s, "command_rejected", "sender", m.From.ID)
 		return
@@ -57,10 +62,13 @@ func HandleMessage(ctx context.Context, s *config.Settings, m *bot.Message) {
 		sendNotesMenu(ctx, s)
 	case "/note":
 		noteCommand(ctx, s, strings.TrimSpace(rest))
+	case "/updates":
+		upstreamCommand(ctx, s)
 	case "/start", "/help":
 		say(ctx, s, "Здесь приходят карточки сообщений агентов на одобрение и запросы доступа к чатам.\n"+
 			"/auto — включить или выключить автоотправку по чатам.\n"+
-			"/notes — заметки к аккаунтам: агенты видят их рядом со списком чатов.")
+			"/notes — заметки к аккаунтам: агенты видят их рядом со списком чатов.\n"+
+			"/updates — версии MAX и PyMax; изменения приходят сами, закреплёнными.")
 	}
 }
 
