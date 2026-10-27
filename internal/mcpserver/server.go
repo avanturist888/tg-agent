@@ -235,7 +235,8 @@ type draftIDIn struct {
 // New собирает сервер со всеми инструментами.
 func New() *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "telegram", Version: "0.2.0"}, &mcp.ServerOptions{Instructions: instructions})
-	server.AddReceivingMiddleware(route) // вызовы к чатам другого аккаунта — в его службу
+	server.AddReceivingMiddleware(route)    // вызовы к чатам другого аккаунта — в его службу
+	server.AddReceivingMiddleware(maxGuard) // в профиле MAX — только то, что MAX умеет
 
 	mcp.AddTool(server, &mcp.Tool{Name: "tg_list_chats", Annotations: readOnly, Description: localPaths(`Список чатов Telegram, к которым у тебя есть доступ (белый список).
 

@@ -17,7 +17,9 @@ import (
 	"golang.org/x/term"
 
 	"tgagent/internal/config"
+	"tgagent/internal/core"
 	"tgagent/internal/maxc"
+	"tgagent/internal/service"
 	"tgagent/internal/upstream"
 )
 
@@ -50,8 +52,8 @@ func cmdMax(ctx context.Context, args []string) int {
 	return 2
 }
 
-func maxDir() string         { return filepath.Join(config.DataPath(), "max") }
-func maxSessionPath() string { return filepath.Join(maxDir(), "session.json") }
+func maxDir() string         { return filepath.Dir(core.MaxSessionPath()) }
+func maxSessionPath() string { return core.MaxSessionPath() }
 
 var semver = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
@@ -201,6 +203,22 @@ func maxStatus(ctx context.Context, args []string) int {
 	}
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
+	// служба держит соединение — спросить её, а не открывать второе с тем же токеном
+	var st core.MaxStatus
+	switch err := service.Do(cctx, "max_status", nil, &st); {
+	case err == nil:
+		state := "на связи"
+		if !st.Connected {
+			state = "нет связи (переподключается)"
+		}
+		fmt.Printf("MAX: %s (id %d) — служба %s, чатов %d.\n", st.Name, st.UserID, state, st.Chats)
+		if *list {
+			fmt.Println("Список чатов при работающей службе: tg --profile " + config.Profile() + " dialogs")
+		}
+		return 0
+	case !errors.Is(err, core.ErrNoMax) && !strings.Contains(err.Error(), core.ErrNoMax.Error()):
+		return fail(err)
+	}
 	c, r, err := maxc.Open(cctx, sess, maxc.Options{})
 	if errors.Is(err, maxc.ErrTokenRevoked) {
 		fmt.Println("Сессия MAX завершена на стороне MAX (выход на телефоне или «со всех устройств»). Войти заново: tg max login --force")

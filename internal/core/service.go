@@ -76,7 +76,7 @@ func ListChats(ctx context.Context, s *config.Settings, withStatus bool) (*omap.
 		}
 		chats = append(chats, item)
 	}
-	if withStatus {
+	if withStatus && !s.IsMAX() { // у MAX непрочитанных и превью пока нет
 		var status map[string]*omap.Map
 		err := tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
 			var err error
@@ -137,54 +137,11 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 		forum    bool
 		topic    *omap.Map
 	)
-	err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
-		t, err := c.Resolve(ctx, rule)
-		if err != nil {
-			return err
-		}
-		if o.Topic != 0 && len(o.IDs) == 0 {
-			title, err := topicTitle(ctx, c, t, rule, o.Topic)
-			if err != nil {
-				return err
-			}
-			topic = omap.New().Set("id", o.Topic).Set("title", title)
-		}
-		var batch *tgc.Batch
-		if len(o.IDs) > 0 {
-			ids := append([]int(nil), o.IDs...)
-			sort.Ints(ids)
-			if batch, err = c.Messages(ctx, t, ids); err != nil {
-				return err
-			}
-			if err := c.FillTopics(ctx, t, batch); err != nil {
-				return err
-			}
-			for _, m := range batch.Messages { // уже по возрастанию
-				messages = append(messages, c.Serialize(m, batch))
-			}
-		} else {
-			if batch, err = c.History(ctx, t, limit, o.BeforeID, o.AfterID, o.Search, o.Topic); err != nil {
-				return err
-			}
-			if err := c.FillTopics(ctx, t, batch); err != nil {
-				return err
-			}
-			// хронологический порядок: старые сверху
-			for i := len(batch.Messages) - 1; i >= 0; i-- {
-				messages = append(messages, c.Serialize(batch.Messages[i], batch))
-			}
-		}
-		forum = batch.Forum
-		parents, err := replyParents(ctx, c, t, messages)
-		if err != nil {
-			return err
-		}
-		if o.Transcribe {
-			cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
-			c.AttachTranscripts(ctx, t, rule, append(messages, parents...), cache, s.TranscribePerCall, localSTT(s, rule))
-		}
-		return nil
-	})
+	if s.IsMAX() {
+		messages, err = maxReadChat(ctx, s, rule, o, limit)
+	} else {
+		err = readTelegram(ctx, s, rule, o, limit, &messages, &forum, &topic)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -217,6 +174,59 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 	}
 	return out.Set("count", len(messages)).
 		Set("oldest_id", oldest).Set("newest_id", newest).Set("messages", messages), nil
+}
+
+// readTelegram — тело ReadChat для Telegram.
+func readTelegram(ctx context.Context, s *config.Settings, rule config.ChatRule, o ReadOpts, limit int,
+	messages *[]*omap.Map, forum *bool, topic **omap.Map) error {
+	return tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
+		t, err := c.Resolve(ctx, rule)
+		if err != nil {
+			return err
+		}
+		if o.Topic != 0 && len(o.IDs) == 0 {
+			title, err := topicTitle(ctx, c, t, rule, o.Topic)
+			if err != nil {
+				return err
+			}
+			*topic = omap.New().Set("id", o.Topic).Set("title", title)
+		}
+		var batch *tgc.Batch
+		if len(o.IDs) > 0 {
+			ids := append([]int(nil), o.IDs...)
+			sort.Ints(ids)
+			if batch, err = c.Messages(ctx, t, ids); err != nil {
+				return err
+			}
+			if err := c.FillTopics(ctx, t, batch); err != nil {
+				return err
+			}
+			for _, m := range batch.Messages { // уже по возрастанию
+				*messages = append(*messages, c.Serialize(m, batch))
+			}
+		} else {
+			if batch, err = c.History(ctx, t, limit, o.BeforeID, o.AfterID, o.Search, o.Topic); err != nil {
+				return err
+			}
+			if err := c.FillTopics(ctx, t, batch); err != nil {
+				return err
+			}
+			// хронологический порядок: старые сверху
+			for i := len(batch.Messages) - 1; i >= 0; i-- {
+				*messages = append(*messages, c.Serialize(batch.Messages[i], batch))
+			}
+		}
+		*forum = batch.Forum
+		parents, err := replyParents(ctx, c, t, *messages)
+		if err != nil {
+			return err
+		}
+		if o.Transcribe {
+			cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
+			c.AttachTranscripts(ctx, t, rule, append(*messages, parents...), cache, s.TranscribePerCall, localSTT(s, rule))
+		}
+		return nil
+	})
 }
 
 // topicTitle — название темы форума; ошибка, если чат не форум или темы нет.
@@ -731,11 +741,20 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 	if s.Agent != nil && len(files) > 0 {
 		return nil, &Bad{Msg: remoteNoFiles}
 	}
-	// «@Имя» без username — в упоминание по id, где человек однозначен
-	text, mentionNotes := fixMentions(ctx, s, rule, text, format)
-	topic, topicName, err := draftTopic(ctx, s, rule, topic, replyTo)
-	if err != nil {
-		return nil, err
+	var (
+		mentionNotes []*omap.Map
+		topicName    string
+	)
+	if s.IsMAX() {
+		if len(files) > 0 || topic != 0 {
+			return nil, &Bad{Msg: "В MAX пока уходит только текст (и ответ через reply_to): без files и topic."}
+		}
+	} else {
+		// «@Имя» без username — в упоминание по id, где человек однозначен
+		text, mentionNotes = fixMentions(ctx, s, rule, text, format)
+		if topic, topicName, err = draftTopic(ctx, s, rule, topic, replyTo); err != nil {
+			return nil, err
+		}
 	}
 	id := outbox.NewID()
 	var snaps []outbox.FileSnap
@@ -874,8 +893,24 @@ func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string
 		return nil, denied("Черновик %s в статусе '%s', отправить нельзя.", draftID, d.Status)
 	}
 	result := omap.New()
+	if s.IsMAX() {
+		if len(d.Files) > 0 {
+			return nil, &Bad{Msg: "В MAX файлы пока не уходят — черновик с файлами отправить нельзя."}
+		}
+		result, err = maxDeliver(ctx, s, rule, d)
+	} else {
+		err = deliverTelegram(ctx, s, rule, d, result)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return finishDelivery(s, rule, d, draftID, by, result)
+}
+
+// deliverTelegram — отправка черновика в Telegram; ответ — в result.
+func deliverTelegram(ctx context.Context, s *config.Settings, rule config.ChatRule, d *outbox.Draft, result *omap.Map) error {
 	// человек уже нажал «Отправить» — ждём сессию сколько нужно, а не падаем
-	err = tgc.Run(ctx, s, tgc.Opts{Wait: 300 * time.Second, Caller: "deliver_approved"}, func(ctx context.Context, c *tgc.Conn) error {
+	return tgc.Run(ctx, s, tgc.Opts{Wait: 300 * time.Second, Caller: "deliver_approved"}, func(ctx context.Context, c *tgc.Conn) error {
 		t, err := c.Resolve(ctx, rule)
 		if err != nil {
 			return err
@@ -917,9 +952,12 @@ func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
+}
+
+// finishDelivery — сообщение ушло: отметить черновик, убрать копии файлов,
+// записать в аудит.
+func finishDelivery(s *config.Settings, rule config.ChatRule, d *outbox.Draft, draftID, by string, result *omap.Map) (*omap.Map, error) {
+	box := outbox.New(s.OutboxPath())
 	mid, _ := result.Get("message_id")
 	msgID := toInt64(mid)
 	if _, err := box.MarkSent(draftID, msgID, audit.Now()); err != nil {

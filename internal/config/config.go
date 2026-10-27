@@ -143,6 +143,26 @@ type Settings struct {
 	// SharedBot — у профиля нет своего бота: карточки идут ботом основного
 	// профиля, а нажатия принимает основная служба (CallbackPrefix).
 	SharedBot bool
+	// Network — чей аккаунт у профиля: telegram (по умолчанию) или max
+	// (TG_NETWORK=max: служба держит клиент MAX, ключи Telegram не нужны).
+	Network string
+}
+
+const (
+	NetTelegram = "telegram"
+	NetMAX      = "max"
+)
+
+// IsMAX — профиль аккаунта MAX.
+func (s *Settings) IsMAX() bool { return s.Network == NetMAX }
+
+// Network — сеть профиля этого процесса (после SetProfile и чтения .env).
+func Network() string {
+	applyDotenv(EnvPath())
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("TG_NETWORK")), NetMAX) {
+		return NetMAX
+	}
+	return NetTelegram
 }
 
 func (s *Settings) DataDir() string         { return DataPath() }
@@ -357,9 +377,10 @@ func Load() (*Settings, error) { return load(true) }
 
 func load(requireCredentials bool) (*Settings, error) {
 	applyDotenv(EnvPath())
+	network := Network()
 	apiID := strings.TrimSpace(os.Getenv("TG_API_ID"))
 	apiHash := strings.TrimSpace(os.Getenv("TG_API_HASH"))
-	if requireCredentials && (apiID == "" || apiHash == "") {
+	if requireCredentials && network == NetTelegram && (apiID == "" || apiHash == "") {
 		if profile != "" {
 			return nil, cfgErr("Профиль %s: не заданы TG_API_ID / TG_API_HASH в %s. Заготовку профиля "+
 				"делает `tg --profile %s init`.", profile, EnvPath(), profile)
@@ -439,6 +460,7 @@ func load(requireCredentials bool) (*Settings, error) {
 		Chats:              chats,
 		ChatOrder:          order,
 		SharedBot:          shared,
+		Network:            network,
 	}, nil
 }
 

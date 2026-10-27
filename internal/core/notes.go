@@ -225,6 +225,9 @@ func selfLabel(ctx context.Context, s *config.Settings) string {
 	if l := AccountLabel(config.AccountName()); l != "" {
 		return l
 	}
+	if s.IsMAX() {
+		return maxSelfLabel()
+	}
 	var u accountUser
 	err := tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
 		me, err := c.Self(ctx)

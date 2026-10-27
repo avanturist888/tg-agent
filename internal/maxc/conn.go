@@ -17,10 +17,12 @@ const (
 	OpSessionInit    uint16 = 6
 	OpLogin          uint16 = 19
 	OpLogout         uint16 = 20
+	OpContactInfo    uint16 = 32
 	OpChatHistory    uint16 = 49
 	OpMsgSend        uint16 = 64
 	OpMsgDelete      uint16 = 66
 	OpMsgEdit        uint16 = 67
+	OpMsgGet         uint16 = 71
 	OpCheckPassword  uint16 = 115
 	OpNotifMessage   uint16 = 128
 	OpNotifMark      uint16 = 130

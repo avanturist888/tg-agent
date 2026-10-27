@@ -221,8 +221,23 @@
   той же сессии сервер событий не шлёт. Вызовы: `History`, `Send` (cid — мс,
   строго растут; ответ — `link` REPLY), `Edit`, `Delete`. Живые проверки
   записи — только в «Избранном» MAX (чат 0): `go test -tags live -run
-  LiveSaved ./internal/maxc -v`; соединение — `-run LiveSession`. Агентам
-  MAX пока не доступен.
+  LiveSaved ./internal/maxc -v`; соединение — `-run LiveSession`.
+- Аккаунт MAX у агентов — профиль `max` с `TG_NETWORK=max`
+  (`Settings.IsMAX`, ключи Telegram не нужны): маршрутизация `max/<alias>`,
+  общий бот, черновики и подписки — те же, что у профилей Telegram. Служба
+  такого профиля вместо `tgc.Serve` и сверки лент запускает `core.RunMax`
+  (`core/max.go`): ленты и `noteChange` по событиям, после каждого входа —
+  наверстать по истории; отозванная сессия — закреплённая карточка (раз).
+  Ветки по сети — `ReadChat` (`maxReadChat`), `DeliverApproved`
+  (`maxDeliver`), `EditMessage` (`maxEditOld`), op `dialogs`, `selfLabel`;
+  `topicsOf` и подписка с темой для MAX не ходят в Telegram. Чего у MAX нет —
+  `maxGuard` в mcpserver отвечает отказом. Соединение держит только служба:
+  без неё `ErrNoMax`; `tg max status` при службе спрашивает её (op
+  `max_status`), второе соединение с тем же токеном не открываем. Id
+  сообщения MAX = мс<<16 | счётчик, больше 2⁵³: от Claude Code приходит
+  округлённым (±8) — `maxFixID` / `maxNearestSent` находят точный. В
+  «Избранном» MAX сообщения владельца будят подписку (своими считаются только
+  отправленные шлюзом), в остальных чатах — нет.
 - Правка отправленного (`core/edit.go`, `tg_edit_message`): только сообщения,
   ушедшие через tg-agent (черновик sent с этим message_id, у агента из
   контейнера — свой), и только `TG_EDIT_WINDOW_MIN` (60) минут после отправки.

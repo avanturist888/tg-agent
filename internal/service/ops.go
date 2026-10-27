@@ -158,7 +158,13 @@ func init() {
 			})
 			return me, err
 		})},
+		"max_status": {local: true, fn: func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return core.MaxState(ctx)
+		}},
 		"dialogs": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, a LimitArgs) (any, error) {
+			if s.IsMAX() {
+				return maxDialogRows(ctx)
+			}
 			var rows []tgc.DialogRow
 			err := tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
 				var err error
@@ -332,3 +338,18 @@ func typed(err error) error {
 
 // ToolResult — результат инструмента, как его отдаёт служба.
 type ToolResult = mcp.CallToolResult
+
+// maxDialogRows — чаты аккаунта MAX в виде диалогов Telegram (tg dialogs,
+// tg allow --match).
+func maxDialogRows(ctx context.Context) ([]tgc.DialogRow, error) {
+	chats, err := core.MaxDialogs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]tgc.DialogRow, len(chats))
+	for i, c := range chats {
+		kind := map[string]string{"DIALOG": "user", "CHAT": "group", "CHANNEL": "channel"}[c.Kind]
+		rows[i] = tgc.DialogRow{ID: c.ID, Title: c.Title, Kind: kind, Unread: c.Unread}
+	}
+	return rows, nil
+}

@@ -68,6 +68,9 @@ func EditMessage(ctx context.Context, s *config.Settings, chat string, messageID
 	if messageID == 0 {
 		return nil, &Bad{Msg: "Укажи message_id своего отправленного сообщения (или draft_id, которым оно ушло)."}
 	}
+	if s.IsMAX() { // id MAX мог прийти округлённым — это id одного из наших отправленных
+		messageID = maxNearestSent(s, rule.Alias, messageID)
+	}
 	orig, err := editTarget(s, rule.Alias, messageID)
 	if err != nil {
 		return nil, err
@@ -85,8 +88,14 @@ func EditMessage(ctx context.Context, s *config.Settings, chat string, messageID
 	if n := len([]rune(text)); n > 32768 {
 		return nil, &Bad{Msg: fmt.Sprintf("Слишком длинно: %d символов, предел Telegram — 32768.", n)}
 	}
-	window := time.Duration(s.EditWindowMin) * time.Minute
 	var old string
+	if s.IsMAX() {
+		if old, err = maxEditOld(ctx, s, rule, messageID); err != nil {
+			return nil, err
+		}
+		return editDraft(ctx, s, rule, orig, messageID, old, text, note, format, nil)
+	}
+	window := time.Duration(s.EditWindowMin) * time.Minute
 	err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
 		t, err := c.Resolve(ctx, rule)
 		if err != nil {
@@ -117,6 +126,12 @@ func EditMessage(ctx context.Context, s *config.Settings, chat string, messageID
 		return nil, err
 	}
 	text, mentionNotes := fixMentions(ctx, s, rule, text, format)
+	return editDraft(ctx, s, rule, orig, messageID, old, text, note, format, mentionNotes)
+}
+
+// editDraft — черновик правки: тот же путь подтверждения, что у сообщения.
+func editDraft(ctx context.Context, s *config.Settings, rule config.ChatRule, orig *outbox.Draft, messageID int64,
+	old, text, note, format string, mentionNotes []*omap.Map) (*omap.Map, error) {
 	opts := outbox.CreateOpts{ID: outbox.NewID(), Chat: rule.Alias, Text: text, TTLMin: s.DraftTTLMin, Note: note,
 		Fmt: format, Origin: draftOrigin(s), Topic: orig.Topic, TopicTitle: orig.TopicTitle,
 		EditOf: messageID, EditOld: old}

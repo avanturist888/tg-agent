@@ -94,11 +94,20 @@ func (c *Conn) History(ctx context.Context, chatID, from int64, backward int) ([
 	if from <= 0 {
 		from = time.Now().UnixMilli()
 	}
+	return c.history(ctx, chatID, from, 0, backward)
+}
+
+// HistoryForward — сообщения чата начиная с from (мс Unix), не больше forward.
+func (c *Conn) HistoryForward(ctx context.Context, chatID, from int64, forward int) ([]Message, error) {
+	return c.history(ctx, chatID, from, forward, 0)
+}
+
+func (c *Conn) history(ctx context.Context, chatID, from int64, forward, backward int) ([]Message, error) {
 	var r struct {
 		Messages []Message `json:"messages"`
 	}
 	err := c.Invoke(ctx, OpChatHistory, map[string]any{
-		"chatId": chatID, "from": from, "forward": 0, "backward": backward,
+		"chatId": chatID, "from": from, "forward": forward, "backward": backward,
 		"backwardTime": 0, "forwardTime": 0, "getChat": false, "itemType": "REGULAR",
 		"getMessages": true, "interactive": false,
 	}, &r)
@@ -235,4 +244,45 @@ func ParseEvent(f Frame) (Event, error) {
 		ev.Kind = EventPresence
 	}
 	return ev, nil
+}
+
+// Participants — участники чата: id → время (сервер шлёт словарь с
+// ключами-числами).
+type Participants map[int64]int64
+
+func (p *Participants) DecodeMsgpack(d *msgpack.Decoder) error {
+	v, err := d.DecodeInterfaceLoose()
+	if err != nil {
+		return err
+	}
+	m, _ := v.(map[string]any)
+	out := make(Participants, len(m))
+	for k, t := range m {
+		id, err := strconv.ParseInt(k, 10, 64)
+		if err != nil {
+			continue
+		}
+		n, _ := t.(int64)
+		out[id] = n
+	}
+	*p = out
+	return nil
+}
+
+// Messages — сообщения чата по id (кого нет — того нет в ответе).
+func (c *Conn) Messages(ctx context.Context, chatID int64, ids []int64) ([]Message, error) {
+	var r struct {
+		Messages []Message `json:"messages"`
+	}
+	err := c.Invoke(ctx, OpMsgGet, map[string]any{"chatId": chatID, "messageIds": ids}, &r)
+	return r.Messages, err
+}
+
+// Contacts — сведения о людях по id (имена отправителей).
+func (c *Conn) Contacts(ctx context.Context, ids []int64) ([]Contact, error) {
+	var r struct {
+		Contacts []Contact `json:"contacts"`
+	}
+	err := c.Invoke(ctx, OpContactInfo, map[string]any{"contactIds": ids}, &r)
+	return r.Contacts, err
 }

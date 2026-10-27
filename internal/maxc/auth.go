@@ -83,13 +83,14 @@ type Profile struct {
 }
 
 type Chat struct {
-	ID            int64    `json:"id"`
-	Type          string   `json:"type"` // DIALOG, CHAT, CHANNEL
-	Status        string   `json:"status"`
-	Owner         int64    `json:"owner"`
-	Title         string   `json:"title"`
-	LastMessage   *Message `json:"lastMessage"`
-	LastEventTime int64    `json:"lastEventTime"`
+	ID            int64        `json:"id"`
+	Type          string       `json:"type"` // DIALOG, CHAT, CHANNEL
+	Status        string       `json:"status"`
+	Owner         int64        `json:"owner"`
+	Title         string       `json:"title"`
+	Participants  Participants `json:"participants"`
+	LastMessage   *Message     `json:"lastMessage"`
+	LastEventTime int64        `json:"lastEventTime"`
 }
 
 // LoginResult — ответ на LOGIN: профиль, первые чаты и контакты.
