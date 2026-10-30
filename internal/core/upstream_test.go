@@ -154,6 +154,43 @@ func TestUpstreamFlow(t *testing.T) {
 	}
 }
 
+// Агент разобрал изменение сам: карточка откреплена, кнопки нет, вывод дописан.
+func TestUpstreamAgentAck(t *testing.T) {
+	f := &fakeUpstream{value: "26.10.6"}
+	s := f.install(t)
+	ctx := context.Background()
+	CheckUpstream(ctx, s)
+	f.value = "26.11.0"
+	CheckUpstream(ctx, s)
+	f.take()
+	if _, err := AckUpstream(ctx, s, "web", " "); err == nil {
+		t.Fatal("без вывода — отказ")
+	}
+	cards, err := PinnedUpstream(s)
+	if err != nil || len(cards) != 1 || cards[0].Source != "web" || cards[0].MessageID != 2 {
+		t.Fatalf("закреплённые: %+v %v", cards, err)
+	}
+	done, err := AckUpstream(ctx, s, "all", "веб-клиент <не> менялся")
+	if err != nil || len(done) != 1 {
+		t.Fatalf("ack: %+v %v", done, err)
+	}
+	if calls := f.take(); strings.Join(calls, "|") != "unpinChatMessage:2|editMessageText:2" {
+		t.Fatalf("вызовы: %q", calls)
+	}
+	if !strings.Contains(f.lastEdit, "26.11.0") || !strings.HasSuffix(f.lastEdit, "<i>✅ Разобрал агент: веб-клиент &lt;не&gt; менялся</i>") {
+		t.Fatalf("пометка: %q", f.lastEdit)
+	}
+	if cards, _ := PinnedUpstream(s); len(cards) != 0 {
+		t.Fatalf("после ack: %+v", cards)
+	}
+	if _, err := AckUpstream(ctx, s, "web", "ещё раз"); err == nil {
+		t.Fatal("нечего откреплять — ошибка")
+	}
+	if done, err := AckUpstream(ctx, s, "all", "ещё раз"); err != nil || len(done) != 0 {
+		t.Fatalf("all без карточек: %+v %v", done, err)
+	}
+}
+
 func TestUpstreamCardLimit(t *testing.T) {
 	details := make([]string, 40)
 	for i := range details {

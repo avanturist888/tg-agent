@@ -306,6 +306,81 @@ func handleUpstreamCallback(ctx context.Context, s *config.Settings, q *bot.Call
 	upstreamAnswer(ctx, s, q.ID, "Откреплено.")
 }
 
+// UpstreamCard — закреплённая, ещё не разобранная карточка (tg updates).
+type UpstreamCard struct {
+	Source    string `json:"source"`
+	Title     string `json:"title"`
+	MessageID int64  `json:"message_id"`
+}
+
+// PinnedUpstream — карточки, которые ждут разбора.
+func PinnedUpstream(s *config.Settings) ([]UpstreamCard, error) {
+	if config.Profile() != "" {
+		return nil, &Bad{Msg: "карточки обновлений — у основного профиля: без --profile"}
+	}
+	var out []UpstreamCard
+	err := updatePinned(s, func(m map[string]pinnedCard) {
+		for _, src := range upstreamSources() {
+			if c, ok := m[src.ID]; ok {
+				out = append(out, UpstreamCard{Source: src.ID, Title: src.Title, MessageID: c.ID})
+			}
+		}
+	})
+	return out, err
+}
+
+// AckUpstream — «Разобрано» за владельца: агент проверил изменение, и
+// внимания оно не требует. Карточка откреплена, без кнопки, с выводом агента
+// (note). source — id источника или "all".
+func AckUpstream(ctx context.Context, s *config.Settings, source, note string) ([]UpstreamCard, error) {
+	note = strings.TrimSpace(note)
+	if note == "" {
+		return nil, &Bad{Msg: "нужен вывод: почему внимание владельца не нужно"}
+	}
+	cards, err := PinnedUpstream(s)
+	if err != nil {
+		return nil, err
+	}
+	var done []UpstreamCard
+	for _, c := range cards {
+		if source != "all" && c.Source != source {
+			continue
+		}
+		var pc pinnedCard
+		_ = updatePinned(s, func(m map[string]pinnedCard) { pc = m[c.Source] })
+		if err := upstreamBot(ctx, s, "unpinChatMessage", map[string]any{
+			"chat_id": s.ApprovalChatID, "message_id": c.MessageID,
+		}, nil); err != nil {
+			logEvent(s, "upstream_pin_failed", "message_id", c.MessageID, "error", err.Error())
+			return done, fmt.Errorf("%s: не открепилось: %w", c.Source, err)
+		}
+		err := errors.New("текст карточки неизвестен")
+		if pc.Text != "" { // без reply_markup правка снимает и кнопку
+			err = upstreamBot(ctx, s, "editMessageText", map[string]any{
+				"chat_id": s.ApprovalChatID, "message_id": c.MessageID, "parse_mode": "HTML",
+				"text":                 pc.Text + "\n\n<i>✅ Разобрал агент: " + html.EscapeString(truncRunes(note, 500)) + "</i>",
+				"link_preview_options": map[string]any{"is_disabled": true},
+			}, nil)
+		}
+		if err != nil {
+			_ = upstreamBot(ctx, s, "editMessageReplyMarkup", map[string]any{
+				"chat_id": s.ApprovalChatID, "message_id": c.MessageID, "reply_markup": map[string]any{"inline_keyboard": [][]any{}},
+			}, nil)
+		}
+		_ = updatePinned(s, func(m map[string]pinnedCard) {
+			if m[c.Source].ID == c.MessageID {
+				delete(m, c.Source)
+			}
+		})
+		logEvent(s, "upstream_acked", "message_id", c.MessageID, "source", c.Source, "by", "agent")
+		done = append(done, c)
+	}
+	if len(done) == 0 && source != "all" {
+		return nil, &Bad{Msg: "у источника " + source + " нет закреплённой карточки (tg updates — какие есть)"}
+	}
+	return done, nil
+}
+
 // upstreamCommand — /updates: проверить сейчас и показать, что видно.
 func upstreamCommand(ctx context.Context, s *config.Settings) {
 	if config.Profile() != "" {

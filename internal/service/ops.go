@@ -49,6 +49,11 @@ type DraftArgs struct {
 	By string `json:"by"`
 }
 
+type UpstreamAckArgs struct {
+	Source string `json:"source"` // id источника или "all"
+	Note   string `json:"note"`   // вывод агента — дописывается в карточку
+}
+
 type ValueArgs struct {
 	Value string `json:"value"`
 }
@@ -157,6 +162,12 @@ func init() {
 				return nil
 			})
 			return me, err
+		})},
+		"upstream_cards": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, _ struct{}) (any, error) {
+			return core.PinnedUpstream(s)
+		})},
+		"upstream_ack": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, a UpstreamAckArgs) (any, error) {
+			return core.AckUpstream(ctx, s, a.Source, a.Note)
 		})},
 		"max_status": {local: true, fn: func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return core.MaxState(ctx)
