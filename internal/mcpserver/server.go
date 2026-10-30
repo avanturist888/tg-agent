@@ -345,7 +345,7 @@ chat_id — id из tg_folder_chats; send=true — нужна и отправк�
 
 	mcp.AddTool(server, &mcp.Tool{Name: "tg_wait_access", Description: `Дождаться решения владельца по запросу доступа (tg_request_access).
 
-status: granted — чат открыт (alias, can_read, can_send внутри);
+status: granted — чат открыт (alias, can_read, can_send, auto_send внутри);
 denied — отказ, не проси снова без новой просьбы владельца;
 waiting — ещё не нажал: это не отказ, решение придёт уведомлением.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in waitAccessIn) (*mcp.CallToolResult, any, error) {

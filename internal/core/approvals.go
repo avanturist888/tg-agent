@@ -116,6 +116,7 @@ func accountMark() string {
 func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draft, status string) {
 	if cardID != nil && *cardID != 0 {
 		bot.FinishCard(ctx, s, *cardID, d, title(s, d), status, d.Note)
+		unpinDraftCard(ctx, s, d.ID) // решено — внимание владельца больше не нужно
 	}
 }
 
@@ -386,6 +387,7 @@ func SendDue(ctx context.Context, s *config.Settings) {
 // разбора кнопок: getUpdates при подвисшей сети стоит до таймаута, и
 // автоотправка из его цикла опаздывала на минуту.
 func RunAutoSend(ctx context.Context, loader func() (*config.Settings, error)) {
+	var swept time.Time
 	for ctx.Err() == nil {
 		// черновик могут создать в любой момент — смотрим очередь дважды в секунду
 		sleepCtx(ctx, 500*time.Millisecond)
@@ -396,6 +398,7 @@ func RunAutoSend(ctx context.Context, loader func() (*config.Settings, error)) {
 		if next, err := outbox.New(s.OutboxPath()).NextDue(); err == nil && next != nil && !time.Now().Before(*next) {
 			SendDue(ctx, s)
 		}
+		maybeSweepPins(ctx, s, &swept) // протухшие карточки — открепить
 	}
 }
 

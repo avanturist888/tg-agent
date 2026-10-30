@@ -853,6 +853,9 @@ func finishDraft(ctx context.Context, s *config.Settings, rule config.ChatRule, 
 	switch s.SendPolicy {
 	case "bot_approval":
 		card := Notify(ctx, s, d, rule.Title, note)
+		if card != 0 {
+			pinDraftCard(ctx, s, d.ID, card) // ждёт владельца — не потеряться среди автоотправки
+		}
 		instruction := "Карточка ушла в бот подтверждений — человек нажмёт кнопку там. " +
 			"Вызови tg_wait_approval с этим draft_id и дождись результата; нажатие " + button + "."
 		if card == 0 {

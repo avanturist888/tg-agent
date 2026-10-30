@@ -176,6 +176,7 @@ type accessRequest struct {
 	Alias    string      `json:"alias,omitempty"` // какой alias у чата сейчас / стал после согласия
 	CanRead  bool        `json:"can_read,omitempty"`
 	CanSend  bool        `json:"can_send,omitempty"`
+	CanAuto  bool        `json:"can_auto,omitempty"` // автоотправка — решил владелец при допуске
 	Agent    *inbox.Addr `json:"agent,omitempty"` // куда сообщить о решении
 	CardID   int64       `json:"card_id,omitempty"`
 	Created  time.Time   `json:"created"`
@@ -334,11 +335,7 @@ func accessCardMarkdown(r *accessRequest, existing *config.ChatRule, status stri
 		chat += ", @" + bot.MDEscape(r.Username)
 	}
 	fmt.Fprintf(&b, "**Чат:** %s\n", chat)
-	fmt.Fprintf(&b, "**Просит:** %s", rights(r.Read, r.Send))
-	if r.Send {
-		b.WriteString(" (каждое сообщение — всё равно через карточку)")
-	}
-	b.WriteString("\n")
+	fmt.Fprintf(&b, "**Просит:** %s\n", rights(r.Read, r.Send))
 	if existing != nil {
 		fmt.Fprintf(&b, "**Сейчас:** %s (`%s`)\n", rights(existing.Read, existing.Send), existing.Alias)
 	}
@@ -350,12 +347,16 @@ func accessCardMarkdown(r *accessRequest, existing *config.ChatRule, status stri
 }
 
 func accessKeyboard(s *config.Settings, r *accessRequest) map[string]any {
-	grant := "r"
-	if r.Send {
-		grant = "rw"
-	}
 	p := s.CallbackPrefix() + "a:" + r.ID + ":"
-	rows := [][]map[string]string{{{"text": "✅ Разрешить", "callback_data": p + grant}}}
+	var rows [][]map[string]string
+	if r.Send {
+		// автоотправку владелец решает здесь же, при допуске: в допущенном чате агент действует сам
+		rows = append(rows,
+			[]map[string]string{{"text": "⚡ Разрешить, отправка без подтверждения", "callback_data": p + "rwa"}},
+			[]map[string]string{{"text": "✅ Разрешить, каждое сообщение — через карточку", "callback_data": p + "rw"}})
+	} else {
+		rows = append(rows, []map[string]string{{"text": "✅ Разрешить", "callback_data": p + "r"}})
+	}
 	if r.Send && r.Read {
 		rows = append(rows, []map[string]string{{"text": "👁 Только чтение", "callback_data": p + "r"}})
 	}
@@ -390,7 +391,7 @@ func finishAccessCard(ctx context.Context, s *config.Settings, r *accessRequest,
 	}
 }
 
-// handleAccessCallback — нажатие под карточкой запроса доступа («a:<id>:<rw|r|no>»).
+// handleAccessCallback — нажатие под карточкой запроса доступа («a:<id>:<rwa|rw|r|no>»).
 func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) {
 	parts := strings.SplitN(q.Data, ":", 3)
 	for len(parts) < 3 {
@@ -408,9 +409,9 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 	}
 	var status string
 	switch verdict {
-	case "rw", "r":
-		read, send := true, verdict == "rw"
-		if !r.Read && verdict == "rw" {
+	case "rwa", "rw", "r":
+		read, send, auto := true, verdict != "r", verdict == "rwa"
+		if !r.Read && send {
 			read = false // просили только отправку
 		}
 		fresh, err := config.Load() // белый список свежий: его могли поправить, пока карточка висела
@@ -418,14 +419,14 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 			bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
 			return
 		}
-		alias, err := grantAccess(fresh, r, read, send)
+		alias, err := grantAccess(fresh, r, read, send, auto)
 		if err != nil {
 			bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
 			logEvent(s, "access_grant_failed", "request_id", id, "error", err.Error())
 			return
 		}
-		r.Status, r.Alias, r.CanRead, r.CanSend = accessGranted, alias, read, send
-		status = fmt.Sprintf("✅ **Разрешено:** %s, alias `%s`", rights(read, send), alias)
+		r.Status, r.Alias, r.CanRead, r.CanSend, r.CanAuto = accessGranted, alias, read, send, auto
+		status = fmt.Sprintf("✅ **Разрешено:** %s, alias `%s`", grantedRights(r), alias)
 		bot.AnswerCallback(ctx, s, q.ID, "Чат открыт агентам.")
 	default:
 		r.Status = accessDenied
@@ -441,21 +442,32 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 		return false
 	})
 	logEvent(s, "access_"+r.Status, "request_id", id, "chat_id", r.Peer, "title", r.Title, "alias", r.Alias,
-		"read", r.CanRead, "send", r.CanSend, "by", "telegram_button")
+		"read", r.CanRead, "send", r.CanSend, "auto_send", r.CanAuto, "by", "telegram_button")
 	finishAccessCard(ctx, s, r, status)
 	go afterAccess(context.WithoutCancel(ctx), r)
 }
 
+// grantedRights — права из решения владельца, для карточки и агента.
+func grantedRights(r *accessRequest) string {
+	switch {
+	case r.CanSend && r.CanAuto:
+		return rights(r.CanRead, true) + ", отправка без подтверждения"
+	case r.CanSend:
+		return rights(r.CanRead, true) + ", каждое сообщение — через карточку"
+	}
+	return rights(r.CanRead, false)
+}
+
 // grantAccess — дописать чат в белый список (или расширить права). Возвращает alias.
-func grantAccess(s *config.Settings, r *accessRequest, read, send bool) (string, error) {
+func grantAccess(s *config.Settings, r *accessRequest, read, send, auto bool) (string, error) {
 	for _, rule := range s.Rules() {
 		if rulePeerID(rule) == r.Peer {
-			return rule.Alias, chatsfile.Update(rule.Alias, rule.Read || read, rule.Send || send, rule.AutoSend(), nil, nil)
+			return rule.Alias, chatsfile.Update(rule.Alias, rule.Read || read, rule.Send || send, rule.AutoSend() || auto, nil, nil)
 		}
 	}
 	alias := uniqueAlias(s, slug(r.Title, r.Kind))
 	note := fmt.Sprintf("Открыт по запросу агента %s: %s", time.Now().Format("02.01.2006"), r.Reason)
-	return alias, chatsfile.Add(chatsfile.Chat{Alias: alias, Peer: r.Peer, Title: r.Title, Read: read, Send: send, Note: note})
+	return alias, chatsfile.Add(chatsfile.Chat{Alias: alias, Peer: r.Peer, Title: r.Title, Read: read, Send: send, Auto: send && auto, Note: note})
 }
 
 // rulePeerID — id чата из правила без обращения к Telegram (0 — задан не числом).
@@ -491,7 +503,7 @@ func afterAccess(ctx context.Context, r *accessRequest) {
 	text := fmt.Sprintf("tg-agent: владелец отказал в доступе к чату «%s» (запрос %s). Не проси снова без новой просьбы владельца.", r.Title, r.ID)
 	if r.Status == accessGranted {
 		text = fmt.Sprintf("tg-agent: владелец открыл чат «%s» (запрос %s): alias %q, %s. "+
-			"Обращайся к нему по alias, правила — в tg_list_chats.", r.Title, r.ID, s.Ref(r.Alias), rights(r.CanRead, r.CanSend))
+			"Обращайся к нему по alias, правила — в tg_list_chats.", r.Title, r.ID, s.Ref(r.Alias), grantedRights(r))
 	}
 	if err := inbox.Send(ctx, *r.Agent, "tg-agent", text); err != nil && r.Agent.Session != "" {
 		_ = wakeT3(ctx, s, r.Agent.Session, text) // сессию остановил T3 Code
@@ -532,7 +544,7 @@ func WaitAccess(ctx context.Context, s *config.Settings, id string, timeoutSec i
 	out := omap.New().Set("request_id", id).Set("chat_id", r.Peer).Set("title", r.Title).Set("status", r.Status)
 	switch r.Status {
 	case accessGranted:
-		out.Set("alias", s.Ref(r.Alias)).Set("can_read", r.CanRead).Set("can_send", r.CanSend).
+		out.Set("alias", s.Ref(r.Alias)).Set("can_read", r.CanRead).Set("can_send", r.CanSend).Set("auto_send", r.CanAuto).
 			Set("hint", "Чат в белом списке — обращайся к нему по alias.")
 	case accessDenied:
 		out.Set("hint", "Владелец отказал. Не проси снова без его новой просьбы.")
