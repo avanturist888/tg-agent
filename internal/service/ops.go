@@ -169,6 +169,9 @@ func init() {
 		"upstream_ack": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, a UpstreamAckArgs) (any, error) {
 			return core.AckUpstream(ctx, s, a.Source, a.Note)
 		})},
+		"upstream_escalate": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, a UpstreamAckArgs) (any, error) {
+			return core.EscalateUpstream(ctx, s, a.Source, a.Note)
+		})},
 		"max_status": {local: true, fn: func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return core.MaxState(ctx)
 		}},

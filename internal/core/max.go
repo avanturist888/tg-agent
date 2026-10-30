@@ -125,7 +125,7 @@ func RunMax(ctx context.Context, loader func() (*config.Settings, error)) {
 				if s.BotReady() {
 					_ = sendPinned(ctx, s, "⚠️ <b>Сессия MAX завершена</b>\n\nMAX больше не принимает вход шлюза "+
 						"(выход на телефоне или «со всех устройств»). Агентам MAX недоступен.\n\n"+
-						"Войти заново: <code>tg --profile "+config.Profile()+" max login --force</code>", "max-session")
+						"Войти заново: <code>tg --profile "+config.Profile()+" max login --force</code>", "max-session", "", "") // вход по QR — только владелец
 				}
 			}
 		}

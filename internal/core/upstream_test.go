@@ -40,8 +40,9 @@ func (f *fakeUpstream) install(t *testing.T) *config.Settings {
 			}
 			return upstream.Values{"v": f.value}, []string{"Сборка сайта: 31 → 32."}, nil
 		}}
-	oldSrc, oldBot := upstreamSources, upstreamBot
+	oldSrc, oldBot, oldWake := upstreamSources, upstreamBot, upstreamWake
 	upstreamSources = func() []*upstream.Source { return []*upstream.Source{src} }
+	upstreamWake = nil // агента нет — карточки сразу владельцу (прежний путь)
 	upstreamBot = func(_ context.Context, _ *config.Settings, method string, payload any, out any) error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -66,7 +67,7 @@ func (f *fakeUpstream) install(t *testing.T) *config.Settings {
 		}
 		return nil
 	}
-	t.Cleanup(func() { config.Root, upstreamSources, upstreamBot = old, oldSrc, oldBot })
+	t.Cleanup(func() { config.Root, upstreamSources, upstreamBot, upstreamWake = old, oldSrc, oldBot, oldWake })
 	return &config.Settings{BotToken: "x", ApprovalChatID: 42}
 }
 
@@ -188,6 +189,70 @@ func TestUpstreamAgentAck(t *testing.T) {
 	}
 	if done, err := AckUpstream(ctx, s, "all", "ещё раз"); err != nil || len(done) != 0 {
 		t.Fatalf("all без карточек: %+v %v", done, err)
+	}
+}
+
+// Изменение сначала разбирает агент: карточка без звука и не закреплена,
+// агент разбужен; ему нужно решение владельца — закреплена со звуком; агента
+// не разбудить — сразу владельцу.
+func TestUpstreamToAgent(t *testing.T) {
+	f := &fakeUpstream{value: "26.10.6"}
+	s := f.install(t)
+	ctx := context.Background()
+	var woke []string
+	var wakeErr error
+	upstreamWake = func(_ context.Context, _ *config.Settings, title, text string) error {
+		woke = append(woke, title+"|"+text)
+		return wakeErr
+	}
+	CheckUpstream(ctx, s)
+	f.take()
+	f.value = "26.11.0"
+	CheckUpstream(ctx, s)
+	if calls := f.take(); len(calls) != 1 || !strings.Contains(calls[0], "Разбирает агент") {
+		t.Fatalf("карточка агенту: %q", calls)
+	}
+	if len(woke) != 1 || !strings.HasPrefix(woke[0], "Обновление: веб-клиент MAX|") ||
+		!strings.Contains(woke[0], "26.10.6 → 26.11.0") || !strings.Contains(woke[0], "updates ack web") {
+		t.Fatalf("агенту: %q", woke)
+	}
+	if cards, _ := PinnedUpstream(s); len(cards) != 1 || !cards[0].Agent {
+		t.Fatalf("открытые: %+v", cards)
+	}
+	// нужно решение владельца — закрепить со звуком, что решить — в карточке
+	if _, err := EscalateUpstream(ctx, s, "web", "сменился вход — перелогинить?"); err != nil {
+		t.Fatal(err)
+	}
+	if calls := f.take(); strings.Join(calls, "|") != "editMessageText:2|pinChatMessage:2" ||
+		!strings.Contains(f.lastEdit, "Нужно твоё решение:</b> сменился вход") || strings.Contains(f.lastEdit, "Разбирает агент") {
+		t.Fatalf("эскалация: %q %q", calls, f.lastEdit)
+	}
+	if cards, _ := PinnedUpstream(s); len(cards) != 1 || cards[0].Agent {
+		t.Fatalf("после эскалации: %+v", cards)
+	}
+	AckUpstream(ctx, s, "web", "владелец решил")
+	f.take()
+
+	// агента не разбудить — карточка владельцу: пометка убрана, закреплена со звуком
+	wakeErr = errors.New("нет Нестора")
+	f.value = "26.12.0"
+	CheckUpstream(ctx, s)
+	if calls := f.take(); len(calls) != 3 || calls[1] != "editMessageText:3" || calls[2] != "pinChatMessage:3" ||
+		strings.Contains(f.lastEdit, "Разбирает агент") {
+		t.Fatalf("без агента: %q", calls)
+	}
+	// разобранную агентом карточку снимает ack без открепления
+	wakeErr = nil
+	f.value = "26.13.0"
+	CheckUpstream(ctx, s)
+	if calls := f.take(); strings.Join(calls[1:], "|") != "unpinChatMessage:3|editMessageText:3" {
+		t.Fatalf("замена закреплённой: %q", calls) // прежнюю, закреплённую, снимает замена
+	}
+	if _, err := AckUpstream(ctx, s, "web", "не затрагивает"); err != nil {
+		t.Fatal(err)
+	}
+	if calls := f.take(); strings.Join(calls, "|") != "editMessageText:4" { // откреплять нечего
+		t.Fatalf("ack карточки агента: %q", calls)
 	}
 }
 

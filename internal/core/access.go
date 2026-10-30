@@ -177,7 +177,7 @@ type accessRequest struct {
 	CanRead  bool        `json:"can_read,omitempty"`
 	CanSend  bool        `json:"can_send,omitempty"`
 	CanAuto  bool        `json:"can_auto,omitempty"` // автоотправка — решил владелец при допуске
-	Agent    *inbox.Addr `json:"agent,omitempty"` // куда сообщить о решении
+	Agent    *inbox.Addr `json:"agent,omitempty"`    // куда сообщить о решении
 	CardID   int64       `json:"card_id,omitempty"`
 	Created  time.Time   `json:"created"`
 	Decided  time.Time   `json:"decided,omitzero"`

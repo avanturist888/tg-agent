@@ -18,3 +18,5 @@ func spawnSendDue() error {
 	}
 	return cmd.Process.Release()
 }
+
+func hideWindow(*exec.Cmd) {}

@@ -2,12 +2,15 @@ package core
 
 // Слежение за обновлениями того, от чего зависит клиент MAX (internal/upstream):
 // служба основного профиля раз в час проверяет веб-клиент MAX, каталог сборок
-// Android-клиента и PyMax. Изменение — карточка владельцу в бот; она
-// закреплена, пока он не нажмёт «Разобрано» (u:ack), — так не теряется среди
-// карточек сообщений. Новая карточка источника заменяет его прежнюю, ещё не
-// разобранную: та откреплена, без кнопки и с пометкой. Изменение, о котором
-// бот не сообщил, не запоминается: следующая проверка пришлёт его снова.
-// /updates — проверить сейчас.
+// Android-клиента и PyMax. Изменение сначала разбирает агент, а не владелец
+// (он не передатчик): карточка уходит в бот без звука и закрепления, а агент
+// проекта просыпается в новом треде (через Нестора) — проверяет, чинит сам и
+// снимает карточку (tg updates ack) или зовёт владельца (tg updates escalate:
+// закрепить со звуком). Агента не разбудить — карточка сразу владельцу,
+// закреплённая, пока он не нажмёт «Разобрано» (u:ack). Новая карточка
+// источника заменяет его прежнюю, ещё не разобранную: та откреплена, без
+// кнопки и с пометкой. Изменение, о котором бот не сообщил, не запоминается:
+// следующая проверка пришлёт его снова. /updates — проверить сейчас.
 
 import (
 	"context"
@@ -16,6 +19,7 @@ import (
 	"fmt"
 	"html"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -40,6 +44,7 @@ var (
 	upstreamSources = upstream.Sources
 	upstreamBot     = bot.Call
 	upstreamAnswer  = bot.AnswerCallback
+	upstreamWake    = wakeProjectAgent
 )
 
 func upstreamPath(s *config.Settings) string { return filepath.Join(s.DataDir(), "upstream.json") }
@@ -48,8 +53,9 @@ func upstreamPath(s *config.Settings) string { return filepath.Join(s.DataDir(),
 // отдельно от состояния проверок под своим коротким замком: «Разобрано» не
 // ждёт проверку, которая держит upstreamMu, пока ходит в сеть.
 type pinnedCard struct {
-	ID   int64  `json:"id"`
-	Text string `json:"text"` // HTML карточки: дописать пометку при замене
+	ID    int64  `json:"id"`
+	Text  string `json:"text"`            // HTML карточки: дописать пометку при замене
+	Agent bool   `json:"agent,omitempty"` // разбирает агент: не закреплена
 }
 
 var pinnedMu sync.Mutex
@@ -128,11 +134,14 @@ func CheckUpstream(ctx context.Context, s *config.Settings) (*upstream.State, er
 				text := fmt.Sprintf("⚠️ <b>Не удаётся проверить: %s</b>\n\n%d проверок подряд с ошибкой:\n<code>%s</code>\n\n"+
 					"Если источник переехал или поменял формат — слежение за ним нужно поправить.",
 					html.EscapeString(r.Source.Title), upstreamFailNotice, html.EscapeString(r.Err.Error()))
-				_ = sendPinned(ctx, s, text, id)
+				brief := fmt.Sprintf("Слежение за обновлениями MAX не может проверить источник «%s» (%s): "+
+					"%d проверок подряд с ошибкой: %s\nИсточник мог переехать или поменять формат — "+
+					"почини проверку в internal/upstream.", r.Source.Title, id, upstreamFailNotice, r.Err.Error())
+				_ = sendPinned(ctx, s, text, id, "Не удаётся проверить: "+r.Source.Title, brief)
 			}
 		case r.Changed():
 			if s.BotReady() {
-				if err := sendPinned(ctx, s, upstreamCard(r), id); err != nil {
+				if err := sendPinned(ctx, s, upstreamCard(r), id, "Обновление: "+r.Source.Title, upstreamBrief(r)); err != nil {
 					continue // не запоминаем: сообщим со следующей проверкой
 				}
 			}
@@ -223,31 +232,81 @@ func upstreamSummary(st *upstream.State, title string) string {
 	return b.String()
 }
 
-// sendPinned — карточка с кнопкой «Разобрано», закреплённая в чате с ботом.
-func sendPinned(ctx context.Context, s *config.Settings, text, source string) error {
+const upstreamAgentMark = "\n\n<i>🔎 Разбирает агент tg-agent — позовёт, если нужно твоё решение.</i>"
+
+func upstreamKeyboard(s *config.Settings) map[string]any {
+	return map[string]any{"inline_keyboard": [][]map[string]string{{
+		{"text": "✅ Разобрано", "callback_data": s.CallbackPrefix() + upstreamAck},
+	}}}
+}
+
+// upstreamBrief — изменение для агента, простым текстом.
+func upstreamBrief(r upstream.Result) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Слежение за обновлениями MAX: изменение у источника «%s» (%s).\n", r.Source.Title, r.Source.ID)
+	for _, d := range r.Diffs {
+		fmt.Fprintf(&b, "%s: %s → %s\n", d.Label, d.Old, d.New)
+	}
+	for _, d := range r.Details {
+		b.WriteString(truncRunes(d, 700) + "\n")
+	}
+	link := r.Cur["url"]
+	if link == "" {
+		link = r.Source.URL
+	}
+	b.WriteString("Ссылка: " + link + "\n")
+	return b.String()
+}
+
+// sendPinned — карточка изменения с кнопкой «Разобрано». Сначала её
+// разбирает агент: карточка без звука и не закреплена. Агента не разбудить —
+// закреплена для владельца.
+func sendPinned(ctx context.Context, s *config.Settings, text, source, title, brief string) error {
 	var sent struct {
 		MessageID int64 `json:"message_id"`
 	}
-	kb := map[string]any{"inline_keyboard": [][]map[string]string{{
-		{"text": "✅ Разобрано", "callback_data": s.CallbackPrefix() + upstreamAck},
-	}}}
+	toAgent := upstreamWake != nil && brief != ""
+	shown := text
+	if toAgent {
+		shown += upstreamAgentMark
+	}
 	if err := upstreamBot(ctx, s, "sendMessage", map[string]any{
-		"chat_id": s.ApprovalChatID, "text": text, "parse_mode": "HTML",
-		"link_preview_options": map[string]any{"is_disabled": true}, "reply_markup": kb,
+		"chat_id": s.ApprovalChatID, "text": shown, "parse_mode": "HTML", "disable_notification": toAgent,
+		"link_preview_options": map[string]any{"is_disabled": true}, "reply_markup": upstreamKeyboard(s),
 	}, &sent); err != nil {
 		logEvent(s, "notify_failed", "what", "upstream", "source", source, "error", err.Error())
 		return err
 	}
-	// уведомление уже было от самого сообщения — второе («закрепил») ни к чему
-	if err := upstreamBot(ctx, s, "pinChatMessage", map[string]any{
-		"chat_id": s.ApprovalChatID, "message_id": sent.MessageID, "disable_notification": true,
-	}, nil); err != nil {
-		logEvent(s, "upstream_pin_failed", "source", source, "message_id", sent.MessageID, "error", err.Error())
+	card := pinnedCard{ID: sent.MessageID, Text: text, Agent: toAgent}
+	if toAgent {
+		task := brief + "\nКарточка в боте подтверждений (сообщение " + fmt.Sprint(sent.MessageID) + "). " +
+			"Проверь, затрагивает ли это клиент MAX (internal/maxc, core/max*.go) и слежение (internal/upstream). " +
+			"Нужна правка — сделай её сам по правилам проекта (CLAUDE.md). Потом: внимания владельца не нужно — " +
+			"bin\\tg.exe updates ack " + source + " \"<вывод одной-двумя фразами>\"; нужно его решение — " +
+			"bin\\tg.exe updates escalate " + source + " \"<что именно решить>\"."
+		if err := upstreamWake(ctx, s, title, task); err != nil {
+			logEvent(s, "upstream_wake_failed", "source", source, "error", err.Error())
+			card.Agent = false
+			_ = upstreamBot(ctx, s, "editMessageText", map[string]any{
+				"chat_id": s.ApprovalChatID, "message_id": sent.MessageID, "text": text, "parse_mode": "HTML",
+				"link_preview_options": map[string]any{"is_disabled": true}, "reply_markup": upstreamKeyboard(s),
+			}, nil)
+		} else {
+			logEvent(s, "upstream_agent_woken", "source", source, "message_id", sent.MessageID)
+		}
+	}
+	if !card.Agent {
+		// само сообщение могло прийти без звука (ждали агента) — тогда звучит закрепление
+		if err := upstreamBot(ctx, s, "pinChatMessage", map[string]any{
+			"chat_id": s.ApprovalChatID, "message_id": sent.MessageID, "disable_notification": !toAgent,
+		}, nil); err != nil {
+			logEvent(s, "upstream_pin_failed", "source", source, "message_id", sent.MessageID, "error", err.Error())
+		}
 	}
 	var old pinnedCard
 	if err := updatePinned(s, func(m map[string]pinnedCard) {
 		old = m[source]
-		m[source] = pinnedCard{ID: sent.MessageID, Text: text}
+		m[source] = card
 	}); err != nil {
 		logEvent(s, "upstream_pin_failed", "source", source, "message_id", sent.MessageID, "error", err.Error())
 	}
@@ -285,9 +344,15 @@ func handleUpstreamCallback(ctx context.Context, s *config.Settings, q *bot.Call
 		return
 	}
 	id := q.Message.MessageID
+	agent := false // карточку разбирал агент — она и не закреплена
+	_ = updatePinned(s, func(m map[string]pinnedCard) {
+		for _, c := range m {
+			agent = agent || (c.ID == id && c.Agent)
+		}
+	})
 	if err := upstreamBot(ctx, s, "unpinChatMessage", map[string]any{
 		"chat_id": s.ApprovalChatID, "message_id": id,
-	}, nil); err != nil {
+	}, nil); err != nil && !agent {
 		upstreamAnswer(ctx, s, q.ID, "Не открепилось: "+err.Error())
 		logEvent(s, "upstream_pin_failed", "message_id", id, "error", err.Error())
 		return
@@ -311,6 +376,7 @@ type UpstreamCard struct {
 	Source    string `json:"source"`
 	Title     string `json:"title"`
 	MessageID int64  `json:"message_id"`
+	Agent     bool   `json:"agent,omitempty"` // разбирает агент, не закреплена
 }
 
 // PinnedUpstream — карточки, которые ждут разбора.
@@ -322,7 +388,7 @@ func PinnedUpstream(s *config.Settings) ([]UpstreamCard, error) {
 	err := updatePinned(s, func(m map[string]pinnedCard) {
 		for _, src := range upstreamSources() {
 			if c, ok := m[src.ID]; ok {
-				out = append(out, UpstreamCard{Source: src.ID, Title: src.Title, MessageID: c.ID})
+				out = append(out, UpstreamCard{Source: src.ID, Title: src.Title, MessageID: c.ID, Agent: c.Agent})
 			}
 		}
 	})
@@ -348,7 +414,9 @@ func AckUpstream(ctx context.Context, s *config.Settings, source, note string) (
 		}
 		var pc pinnedCard
 		_ = updatePinned(s, func(m map[string]pinnedCard) { pc = m[c.Source] })
-		if err := upstreamBot(ctx, s, "unpinChatMessage", map[string]any{
+		if pc.Agent {
+			// не закреплена — снимать нечего
+		} else if err := upstreamBot(ctx, s, "unpinChatMessage", map[string]any{
 			"chat_id": s.ApprovalChatID, "message_id": c.MessageID,
 		}, nil); err != nil {
 			logEvent(s, "upstream_pin_failed", "message_id", c.MessageID, "error", err.Error())
@@ -379,6 +447,83 @@ func AckUpstream(ctx context.Context, s *config.Settings, source, note string) (
 		return nil, &Bad{Msg: "у источника " + source + " нет закреплённой карточки (tg updates — какие есть)"}
 	}
 	return done, nil
+}
+
+// EscalateUpstream — агент разобрал изменение, и нужно решение владельца:
+// карточка закреплена со звуком, что решить — дописано в неё.
+func EscalateUpstream(ctx context.Context, s *config.Settings, source, note string) (*UpstreamCard, error) {
+	note = strings.TrimSpace(note)
+	if note == "" {
+		return nil, &Bad{Msg: "нужно, что именно владельцу решить"}
+	}
+	cards, err := PinnedUpstream(s)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range cards {
+		if c.Source != source {
+			continue
+		}
+		var pc pinnedCard
+		_ = updatePinned(s, func(m map[string]pinnedCard) { pc = m[source] })
+		text := pc.Text + "\n\n<b>⚠️ Нужно твоё решение:</b> " + html.EscapeString(truncRunes(note, 800))
+		if err := upstreamBot(ctx, s, "editMessageText", map[string]any{
+			"chat_id": s.ApprovalChatID, "message_id": c.MessageID, "text": text, "parse_mode": "HTML",
+			"link_preview_options": map[string]any{"is_disabled": true}, "reply_markup": upstreamKeyboard(s),
+		}, nil); err != nil {
+			logEvent(s, "card_edit_failed", "source", source, "message_id", c.MessageID, "error", err.Error())
+		}
+		// само сообщение пришло без звука — звучит закрепление
+		if err := upstreamBot(ctx, s, "pinChatMessage", map[string]any{
+			"chat_id": s.ApprovalChatID, "message_id": c.MessageID, "disable_notification": false,
+		}, nil); err != nil {
+			logEvent(s, "upstream_pin_failed", "source", source, "message_id", c.MessageID, "error", err.Error())
+			return nil, fmt.Errorf("не закрепилось: %w", err)
+		}
+		_ = updatePinned(s, func(m map[string]pinnedCard) {
+			if m[source].ID == c.MessageID {
+				m[source] = pinnedCard{ID: c.MessageID, Text: text}
+			}
+		})
+		logEvent(s, "upstream_escalated", "source", source, "message_id", c.MessageID)
+		c.Agent = false
+		return &c, nil
+	}
+	return nil, &Bad{Msg: "у источника " + source + " нет открытой карточки (tg updates — какие есть)"}
+}
+
+// wakeProjectAgent — разбудить агента этого проекта в новом треде через
+// Нестора (почта между агентами машины). Нет Нестора — ошибка: карточка
+// тогда идёт владельцу.
+func wakeProjectAgent(ctx context.Context, _ *config.Settings, title, text string) error {
+	exe := os.Getenv("TG_NESTOR")
+	if exe == "" {
+		exe, _ = exec.LookPath("nestor")
+	}
+	if exe == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			if p := filepath.Join(home, "nestor", "bin", "nestor.exe"); fileExists(p) {
+				exe = p
+			}
+		}
+	}
+	if exe == "" {
+		return errors.New("Нестор не найден (TG_NESTOR, PATH, ~/nestor/bin)")
+	}
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, exe, "send", config.Root, "-", "--new", "--title", title)
+	cmd.Stdin = strings.NewReader(text)
+	hideWindow(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, truncRunes(strings.TrimSpace(string(out)), 300))
+	}
+	return nil
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
 }
 
 // upstreamCommand — /updates: проверить сейчас и показать, что видно.

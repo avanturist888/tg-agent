@@ -11,13 +11,15 @@ import (
 	"tgagent/internal/service"
 )
 
-const updatesUsage = `tg updates — закреплённые карточки обновлений MAX и PyMax.
+const updatesUsage = `tg updates — карточки обновлений MAX и PyMax, которые ждут разбора.
 
-  tg updates                        какие карточки ждут разбора
+  tg updates                        какие карточки открыты
   tg updates ack <источник|all> <вывод>
-                                    разобрано: открепить, снять кнопку и
-                                    дописать в карточку вывод — для изменений,
-                                    которые не требуют внимания владельца`
+                                    разобрано, внимание владельца не нужно:
+                                    снять кнопку и закрепление, дописать вывод
+  tg updates escalate <источник> <что решить>
+                                    нужно решение владельца: закрепить
+                                    карточку со звуком и дописать, что решить`
 
 func cmdUpdates(ctx context.Context, args []string) int {
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
@@ -29,10 +31,14 @@ func cmdUpdates(ctx context.Context, args []string) int {
 			return fail(err)
 		}
 		if len(cards) == 0 {
-			fmt.Println("Закреплённых карточек нет.")
+			fmt.Println("Открытых карточек нет.")
 		}
 		for _, c := range cards {
-			fmt.Printf("%-15s %s (сообщение %d)\n", c.Source, c.Title, c.MessageID)
+			who := "закреплена для владельца"
+			if c.Agent {
+				who = "разбирает агент"
+			}
+			fmt.Printf("%-15s %s (сообщение %d, %s)\n", c.Source, c.Title, c.MessageID, who)
 		}
 		return 0
 	case args[0] == "ack" && len(args) >= 3:
@@ -41,14 +47,23 @@ func cmdUpdates(ctx context.Context, args []string) int {
 			Source: args[1], Note: strings.Join(args[2:], " "),
 		}, &done)
 		for _, c := range done {
-			fmt.Printf("Откреплена: %s\n", c.Title)
+			fmt.Printf("Разобрано: %s\n", c.Title)
 		}
 		if err != nil {
 			return fail(err)
 		}
 		if len(done) == 0 {
-			fmt.Println("Закреплённых карточек нет.")
+			fmt.Println("Открытых карточек нет.")
 		}
+		return 0
+	case args[0] == "escalate" && len(args) >= 3:
+		var c core.UpstreamCard
+		if err := service.Do(cctx, "upstream_escalate", service.UpstreamAckArgs{
+			Source: args[1], Note: strings.Join(args[2:], " "),
+		}, &c); err != nil {
+			return fail(err)
+		}
+		fmt.Printf("Закреплена для владельца: %s\n", c.Title)
 		return 0
 	case args[0] == "-h" || args[0] == "--help" || args[0] == "help":
 		fmt.Println(updatesUsage)
