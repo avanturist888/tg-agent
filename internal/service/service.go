@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,6 +61,7 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 		defer func() { done <- struct{}{} }()
 		core.RunUpstream(ctx, loader) // обновления MAX и PyMax → закреплённые карточки в боте
 	}()
+	svcCtx := ctx
 	go func() {
 		defer func() { done <- struct{}{} }()
 		if s.IsMAX() { // профиль аккаунта MAX: вместо Telegram — клиент MAX
@@ -69,6 +71,11 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 		if err := tgc.Serve(ctx, s, tgc.Events{Message: core.FeedOnMessage(loader),
 			Edit: core.FeedOnEdit(loader), Delete: core.FeedOnDelete(loader)}, func(ctx context.Context, _ *tgc.Conn) {
 			reconcile(ctx, loader) // догнать пропущенное, пока нас не было
+			repairOnce.Do(func() { // черновики, ушедшие без message_id (27.10–02.11)
+				if fresh, err := loader(); err == nil {
+					go core.RepairSentIDs(svcCtx, fresh) // не ctx соединения: его рвут при пересоздании
+				}
+			})
 		}, func(ctx context.Context) {
 			noLogin(ctx, loader)
 		}); err != nil {
@@ -101,6 +108,8 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 	_ = audit.Log(s.AuditPath(), "service_stop")
 	return nil
 }
+
+var repairOnce sync.Once
 
 func reconcile(ctx context.Context, loader func() (*config.Settings, error)) {
 	s, err := loader()

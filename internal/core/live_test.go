@@ -47,8 +47,8 @@ func TestLiveApproveSendViaService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Status != outbox.Sent || d.MessageID == nil {
-		t.Fatalf("не отправлено: %s %v (%s)", d.Status, d.SendError, res.Summary)
+	if d.Status != outbox.Sent || d.MessageID == nil || *d.MessageID <= 0 {
+		t.Fatalf("не отправлено или без id: %s %v (%s)", d.Status, d.SendError, res.Summary)
 	}
 	t.Logf("ушло за %v, message_id %d", time.Since(start).Round(time.Millisecond), *d.MessageID)
 

@@ -128,6 +128,22 @@ func (c *Conn) History(ctx context.Context, t Target, limit, beforeID, afterID i
 	return all, nil
 }
 
+// HistoryAround — сообщения чата около date (unix-время): limit до неё и
+// несколько после, новые сверху. Сверху запас нужен и сам по себе: с одним
+// offset_date Telegram не отдаёт самое новое сообщение чата.
+func (c *Conn) HistoryAround(ctx context.Context, t Target, date, limit int) (*Batch, error) {
+	const after = 10
+	res, err := c.API.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		Peer: t.Input, OffsetDate: date, AddOffset: -after, Limit: limit + after,
+	})
+	if err != nil {
+		return nil, err
+	}
+	b := c.unpack(res)
+	c.Peers.Save()
+	return b, nil
+}
+
 // Message — одно сообщение по id (nil — нет такого).
 func (c *Conn) Message(ctx context.Context, t Target, id int) (tg.MessageClass, *Batch, error) {
 	b, err := c.Messages(ctx, t, []int{id})

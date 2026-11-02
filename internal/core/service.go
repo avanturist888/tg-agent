@@ -939,42 +939,57 @@ func deliverTelegram(ctx context.Context, s *config.Settings, rule config.ChatRu
 			return err
 		}
 		t.Topic = d.Topic
-		if d.EditOf != 0 { // правка отправленного: только текст
-			r, err := c.EditMessage(ctx, t, int(d.EditOf), d.Text, d.Fmt)
-			if err != nil {
-				return err
-			}
-			result = r
-			return nil
+		r, err := sendDraft(ctx, c, t, d)
+		if err != nil {
+			return err
 		}
-		if d.Text != "" {
-			r, err := c.SendMessage(ctx, t, d.Text, d.ReplyTo, d.Fmt)
-			if err != nil {
-				return err
-			}
-			result = r
-		}
-		if len(d.Files) > 0 {
-			files := make([]tgc.OutFile, len(d.Files))
-			for i, f := range d.Files {
-				files[i] = tgc.OutFile{Path: f.Path, Photo: f.Kind == outbox.KindPhoto}
-			}
-			// без текста файлы отвечают на reply_to сами, с текстом — идут следом
-			reply := d.ReplyTo
-			if d.Text != "" {
-				reply = nil
-			}
-			ids, err := c.SendFiles(ctx, t, files, reply)
-			if err != nil {
-				return err
-			}
-			if _, ok := result.Get("message_id"); !ok && len(ids) > 0 {
-				result.Set("message_id", ids[0])
-			}
-			result.Set("file_message_ids", ids)
-		}
+		// именно дописать в result вызывающего: присвоение параметру его
+		// не меняет, и message_id терялся (27.10–02.11 у всех отправок был 0)
+		result.Merge(r)
 		return nil
 	})
+}
+
+// draftSender — то, чем sendDraft отправляет (tgc.Conn; в тестах — подделка).
+type draftSender interface {
+	SendMessage(ctx context.Context, t tgc.Target, text string, reply *int64, format string) (*omap.Map, error)
+	EditMessage(ctx context.Context, t tgc.Target, id int, text, format string) (*omap.Map, error)
+	SendFiles(ctx context.Context, t tgc.Target, files []tgc.OutFile, reply *int64) ([]int, error)
+}
+
+// sendDraft — отправить черновик (или правку) и вернуть ответ с message_id.
+func sendDraft(ctx context.Context, c draftSender, t tgc.Target, d *outbox.Draft) (*omap.Map, error) {
+	if d.EditOf != 0 { // правка отправленного: только текст
+		return c.EditMessage(ctx, t, int(d.EditOf), d.Text, d.Fmt)
+	}
+	result := omap.New()
+	if d.Text != "" {
+		r, err := c.SendMessage(ctx, t, d.Text, d.ReplyTo, d.Fmt)
+		if err != nil {
+			return nil, err
+		}
+		result.Merge(r)
+	}
+	if len(d.Files) > 0 {
+		files := make([]tgc.OutFile, len(d.Files))
+		for i, f := range d.Files {
+			files[i] = tgc.OutFile{Path: f.Path, Photo: f.Kind == outbox.KindPhoto}
+		}
+		// без текста файлы отвечают на reply_to сами, с текстом — идут следом
+		reply := d.ReplyTo
+		if d.Text != "" {
+			reply = nil
+		}
+		ids, err := c.SendFiles(ctx, t, files, reply)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := result.Get("message_id"); !ok && len(ids) > 0 {
+			result.Set("message_id", ids[0])
+		}
+		result.Set("file_message_ids", ids)
+	}
+	return result, nil
 }
 
 // finishDelivery — сообщение ушло: отметить черновик, убрать копии файлов,
