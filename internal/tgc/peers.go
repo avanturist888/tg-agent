@@ -335,6 +335,7 @@ type Dialog struct {
 	Unread     int
 	Top        int
 	FolderID   int
+	Mentions   int  // непрочитанные упоминания
 	Muted      bool // уведомления выключены (для правил папок)
 	UnreadMark bool // помечен непрочитанным вручную
 }
@@ -412,7 +413,8 @@ func (c *Conn) IterDialogs(ctx context.Context, limit int) (*DialogPage, error) 
 			folder, _ := dlg.GetFolderID()
 			muteUntil, _ := dlg.NotifySettings.GetMuteUntil()
 			page.Dialogs = append(page.Dialogs, Dialog{Peer: dlg.Peer, Unread: dlg.UnreadCount, Top: dlg.TopMessage,
-				FolderID: folder, Muted: muteUntil > int(time.Now().Unix()), UnreadMark: dlg.UnreadMark})
+				FolderID: folder, Muted: muteUntil > int(time.Now().Unix()), UnreadMark: dlg.UnreadMark,
+				Mentions: dlg.UnreadMentionsCount})
 			added++
 		}
 		if len(dialogs) < want || added == 0 || (total >= 0 && len(page.Dialogs) >= total) {

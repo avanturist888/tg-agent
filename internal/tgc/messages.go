@@ -670,7 +670,12 @@ func (c *Conn) ChatStatus(ctx context.Context, rules []config.ChatRule) (map[str
 	}
 	var wanted []item
 	var peers []tg.InputDialogPeerClass
+	var groups []config.ChatRule
 	for _, r := range rules {
+		if _, ok := r.Peer.(int64); ok && r.Via != "" {
+			groups = append(groups, r) // сотни чатов: getPeerDialogs на них упирается в FLOOD_WAIT
+			continue
+		}
 		t, err := c.Resolve(ctx, r)
 		if err != nil {
 			return nil, err
@@ -683,6 +688,29 @@ func (c *Conn) ChatStatus(ctx context.Context, rules []config.ChatRule) (map[str
 		peers = append(peers, &tg.InputDialogPeer{Peer: input})
 	}
 	status := map[string]*omap.Map{}
+	if len(groups) > 0 {
+		page, err := c.dialogsFresh(ctx, 0)
+		if err != nil {
+			return nil, err
+		}
+		byID := dialogsByID(page)
+		for _, r := range groups {
+			d, ok := byID[r.Peer.(int64)]
+			if !ok {
+				continue
+			}
+			var at any
+			preview := ""
+			if m, ok := page.Messages[peerKey(d.Peer)+":"+strconv.Itoa(d.Top)]; ok {
+				at = isoTime(messageDate(m))
+				if msg, ok := m.(*tg.Message); ok {
+					preview = truncateRunes(msg.Message, 160)
+				}
+			}
+			status[r.Alias] = omap.New().Set("unread", d.Unread).Set("unread_mentions", d.Mentions).
+				Set("last_message_at", at).Set("last_message_preview", preview)
+		}
+	}
 	if len(peers) == 0 {
 		return status, nil
 	}
@@ -719,15 +747,56 @@ func (c *Conn) ChatStatus(ctx context.Context, rules []config.ChatRule) (map[str
 	return status, nil
 }
 
+func dialogsByID(page *DialogPage) map[int64]Dialog {
+	out := make(map[int64]Dialog, len(page.Dialogs))
+	for _, d := range page.Dialogs {
+		out[MarkedPeerID(d.Peer)] = d
+	}
+	return out
+}
+
+// GroupTops — id последнего сообщения чатов групп белого списка (по alias)
+// из списка диалогов: getPeerDialogs на сотни каналов Telegram не даёт.
+func (c *Conn) GroupTops(ctx context.Context, rules []config.ChatRule) (map[string]int, error) {
+	page, err := c.dialogsFresh(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	byID := dialogsByID(page)
+	out := map[string]int{}
+	for _, r := range rules {
+		if id, ok := r.Peer.(int64); ok {
+			if d, ok := byID[id]; ok {
+				out[r.Alias] = d.Top
+			}
+		}
+	}
+	return out, nil
+}
+
 // peerDialogs — messages.getPeerDialogs частями: чатов из групп (папка,
 // каналы) бывает больше, чем Telegram принимает за раз.
 func (c *Conn) peerDialogs(ctx context.Context, peers []tg.InputDialogPeerClass) (*tg.MessagesPeerDialogs, error) {
 	const chunk = 100
 	all := &tg.MessagesPeerDialogs{}
 	for start := 0; start < len(peers); start += chunk {
-		res, err := c.API.MessagesGetPeerDialogs(ctx, peers[start:min(start+chunk, len(peers))])
-		if err != nil {
-			return nil, err
+		var res *tg.MessagesPeerDialogs
+		for attempt := 0; ; attempt++ {
+			var err error
+			res, err = c.API.MessagesGetPeerDialogs(ctx, peers[start:min(start+chunk, len(peers))])
+			if err == nil {
+				break
+			}
+			// сотни каналов — несколько запросов подряд: короткий FLOOD_WAIT пережидаем
+			wait, flood := tgerr.AsFloodWait(err)
+			if !flood || wait > 40*time.Second || attempt == 2 {
+				return nil, err
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait + time.Second):
+			}
 		}
 		c.Peers.Remember(res.Users, res.Chats)
 		all.Dialogs = append(all.Dialogs, res.Dialogs...)

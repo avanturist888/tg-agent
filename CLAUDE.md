@@ -228,8 +228,14 @@ tg-agent убирает владельца из цепочки её достав
   группы (права чату из группы — отдельным `[[chat]]` с тем же alias).
   Alias чата группы постоянный (`Aliases`): @username или `slug`. Запрос —
   `tg_request_access(folder | public_channels)`, та же карточка
-  (`core/access_sets.go`). `getPeerDialogs` — частями по 100
-  (`peerDialogs`): чатов в группах много.
+  (`core/access_sets.go`). Чатов в группах сотни (публичных каналов у
+  владельца ~370), поэтому: `tg_list_chats` перечисляет их только по
+  `set` / `active_since`; `messages.getPeerDialogs` на них не звать —
+  Telegram сразу даёт FLOOD_WAIT 30 с (проверено 03.11.2026): верх и
+  статус чатов групп — из списка диалогов (`GroupTops`, `ChatStatus` по
+  `Via`), сверка лент по ним — раз в 10 минут (`groupPollDue`), новое и
+  так приходит событиями. Каждый FLOOD_WAIT с методом — `flood_wait` в
+  аудите (`tgc/floodlog.go`).
 - Раскладка по папкам и архиву (`core/folders_manage.go`,
   `tgc/folders_edit.go`) — отдельное право `[manage] folders = true`
   (запрос `manage_folders`): `tg_unfiled_chats`, `tg_move_chat`,

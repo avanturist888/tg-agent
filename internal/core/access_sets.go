@@ -266,8 +266,15 @@ func setDecisionText(s *config.Settings, r *accessRequest) string {
 			n++
 		}
 	}
-	return fmt.Sprintf("tg-agent: владелец открыл %s (запрос %s): %d чатов, в tg_list_chats — с via. %s",
-		setGranted(r), r.ID, n, "Новые чаты группы откроются сами.")
+	return fmt.Sprintf("tg-agent: владелец разрешил (запрос %s): %s — %d чатов. Список — tg_list_chats(set=%q) "+
+		"или active_since; новые чаты группы откроются сами.", r.ID, setGranted(r), n, setListRef(r))
+}
+
+func setListRef(r *accessRequest) string {
+	if r.Scope == scopePublic {
+		return "public_channels"
+	}
+	return r.Title
 }
 
 func setWaitResult(s *config.Settings, r *accessRequest) *omap.Map {

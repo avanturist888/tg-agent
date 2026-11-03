@@ -173,6 +173,7 @@ func newClient(s *config.Settings, hub telegram.UpdateHandler, storage session.S
 		UpdateHandler: hub,
 		DialTimeout:   20 * time.Second,
 		Clock:         skewClock{offset: ClockOffset(s)},
+		Middlewares:   []telegram.Middleware{floodLog(s)},
 	}
 	if os.Getenv("TG_GO_DEBUG") != "" {
 		// подробный журнал MTProto в stderr — только для отладки подключения

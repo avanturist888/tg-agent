@@ -76,8 +76,11 @@ func appendIDs(path string, ids []int) error {
 func PollOnce(ctx context.Context, s *config.Settings) (map[string]int, error) {
 	added := map[string]int{}
 	var rules []config.ChatRule
+	groups := groupPollDue()
 	for _, r := range s.Rules() {
-		if r.Read {
+		// чаты групп (папка, сотни публичных каналов) сверяем реже: новое и
+		// так приходит событиями, а сверка — только на случай пропусков
+		if r.Read && (r.Via == "" || groups || LastID(FeedPath(s, r.Alias)) == 0) {
 			rules = append(rules, r)
 		}
 	}
@@ -87,7 +90,14 @@ func PollOnce(ctx context.Context, s *config.Settings) (map[string]int, error) {
 	err := tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "poll_once"},
 		func(ctx context.Context, c *tgc.Conn) error {
 			targets := map[string]tgc.Target{}
+			byAlias := map[string]config.ChatRule{}
+			var groupRules []config.ChatRule
 			for _, r := range rules {
+				byAlias[r.Alias] = r
+				if _, ok := r.Peer.(int64); ok && r.Via != "" {
+					groupRules = append(groupRules, r) // их верх — из списка диалогов
+					continue
+				}
 				t, err := c.Resolve(ctx, r)
 				if err != nil {
 					return err
@@ -97,6 +107,15 @@ func PollOnce(ctx context.Context, s *config.Settings) (map[string]int, error) {
 			top, err := c.TopMessages(ctx, targets)
 			if err != nil {
 				return err
+			}
+			if len(groupRules) > 0 {
+				tops, err := c.GroupTops(ctx, groupRules)
+				if err != nil {
+					return err
+				}
+				for alias, id := range tops {
+					top[alias] = id
+				}
 			}
 			for alias, topID := range top {
 				path := FeedPath(s, alias)
@@ -111,7 +130,13 @@ func PollOnce(ctx context.Context, s *config.Settings) (map[string]int, error) {
 				if topID <= known {
 					continue
 				}
-				batch, err := c.History(ctx, targets[alias], 200, 0, known, "", 0)
+				t, ok := targets[alias]
+				if !ok {
+					if t, err = c.Resolve(ctx, byAlias[alias]); err != nil {
+						return err
+					}
+				}
+				batch, err := c.History(ctx, t, 200, 0, known, "", 0)
 				if err != nil {
 					return err
 				}
@@ -136,6 +161,24 @@ func PollOnce(ctx context.Context, s *config.Settings) (map[string]int, error) {
 			return nil
 		})
 	return added, err
+}
+
+// groupPollEvery — как часто сверка проходит по чатам групп.
+const groupPollEvery = 10 * time.Minute
+
+var groupPoll struct {
+	sync.Mutex
+	last time.Time
+}
+
+func groupPollDue() bool {
+	groupPoll.Lock()
+	defer groupPoll.Unlock()
+	if time.Since(groupPoll.last) < groupPollEvery {
+		return false
+	}
+	groupPoll.last = time.Now()
+	return true
 }
 
 // feedMu — ленты дописывают и события, и сверка: по очереди.
