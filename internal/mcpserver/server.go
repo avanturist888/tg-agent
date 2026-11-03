@@ -159,10 +159,19 @@ type waitAccessIn struct {
 }
 
 type subscribeIn struct {
-	Chat     string `json:"chat" jsonschema:"alias из tg_list_chats"`
-	AfterID  int    `json:"after_id,omitempty" jsonschema:"последний обработанный id: о более новых сообщат сразу"`
-	Topic    int    `json:"topic,omitempty" jsonschema:"только эта тема форума (0 — все темы)"`
-	Takeover bool   `json:"takeover,omitempty" jsonschema:"забрать чат у другой сессии — только если владелец прямо попросил"`
+	Chat     string   `json:"chat" jsonschema:"alias из tg_list_chats"`
+	AfterID  int      `json:"after_id,omitempty" jsonschema:"последний обработанный id: о более новых сообщат сразу"`
+	Topic    int      `json:"topic,omitempty" jsonschema:"только эта тема форума (0 — все темы)"`
+	From     []string `json:"from,omitempty" jsonschema:"только сообщения этих людей: id (from.id из tg_read_chat) или @username"`
+	Text     []string `json:"text,omitempty" jsonschema:"только сообщения с любым из этих слов или фраз (регистр и ё/е не важны)"`
+	First    bool     `json:"first,omitempty" jsonschema:"встать первым в очереди среди подписок того же охвата — только если владелец прямо попросил"`
+	Takeover bool     `json:"takeover,omitempty" jsonschema:"устарело: то же, что first"`
+}
+
+type passIn struct {
+	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
+	MessageID int    `json:"message_id" jsonschema:"id сообщения, которое тебе назначила подписка"`
+	Note      string `json:"note,omitempty" jsonschema:"почему не твоё — увидит следующий агент"`
 }
 
 type unsubscribeIn struct {
@@ -405,12 +414,21 @@ after_id — твой последний обработанный id: о том,
            сразу. Без него — только о сообщениях после подписки.
 topic    — в чате-форуме: будить только о сообщениях этой темы. Без него
            уведомление скажет, в каких темах новое.
-takeover — забрать чат у другой сессии. Только если владелец прямо попросил.
+from     — только сообщения этих людей: from.id из tg_read_chat или
+           @username.
+text     — только сообщения, где есть хоть одно из этих слов или фраз
+           (регистр и ё/е не важны). С from — должно подойти и то, и другое.
+first    — встать первым среди подписок того же охвата. Только если
+           владелец прямо попросил.
 
-Чат (в форуме — тему) слушает одна сессия. Занят другой живой сессией —
-вернёт ошибку с её именем: скажи владельцу, а не бери takeover сам.
-Подписку сессии, что не отвечает или чей тред закрыт, забирает сама
-(в ответе — taken_from).
+Чат могут слушать несколько сессий, у каждой свой фильтр. В чате, куда
+можно писать, каждое сообщение получает ОДНА сессия — первая в очереди,
+чей фильтр подходит. Очередь: сначала подписки по людям или словам, потом
+на тему, потом на весь чат; при равных — кто подписался раньше. Очередь
+чата — в ответе (queue). Пришло не твоё — не отвечай, а передай дальше:
+tg_pass(chat, message_id, note). В чате только для чтения каждую сессию
+будят обо всём, что подходит под её фильтр. Подписку сессии, что не
+отвечает или чей тред закрыт, снимает сама (в ответе — taken_from).
 
 Подписка живёт, пока жива сессия, и переживает перезапуск службы и
 возобновление сессии. Повторный вызов безопасен — он лишь переставляет
@@ -422,7 +440,25 @@ after_id. На несколько чатов — по вызову на кажд
 шлюза «TG: <чат>» в твоём окружении T3 — служба заводит его сама.`)},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in subscribeIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
-				return core.Subscribe(ctx, s, in.Chat, in.AfterID, in.Topic, in.Takeover)
+				return core.Subscribe(ctx, s, in.Chat, core.SubOpts{After: in.AfterID, Topic: in.Topic, From: in.From, Text: in.Text, First: in.First || in.Takeover})
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_pass", Description: `Передать сообщение, которое подписка назначила тебе, следующей сессии в очереди чата.
+
+Когда чат слушают несколько сессий, каждое сообщение достаётся одной —
+первой в очереди, чей фильтр подходит (см. tg_subscribe). Если оно не по
+твоей задаче — не отвечай на него, а вызови tg_pass: следующая сессия
+получит уведомление с твоей запиской (note — коротко, почему не твоё).
+Дальше в очереди никого — в ответе passed_to = null: сообщение осталось
+без обработчика, как в чате без подписок; если оно ждёт решения
+владельца, скажи ему.
+
+Передать можно только своё сообщение — то, о котором тебе пришло
+уведомление «тебе: …» или «передано тебе …».`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in passIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.Pass(ctx, s, in.Chat, in.MessageID, in.Note)
 			})
 		})
 

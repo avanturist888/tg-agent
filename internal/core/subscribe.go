@@ -175,6 +175,7 @@ func joinThreadSubs(ctx context.Context, s *config.Settings, hello *inbox.Addr) 
 		return true
 	})
 	for _, m := range moves {
+		renameRoutes(s, m.from, m.into) // сообщения сессий треда — теперь его текущей
 		_ = audit.Log(s.AuditPath(), "agent_subscription_moved", "thread", m.thread, "from", m.from, "session", m.into)
 	}
 	pokeSubs()
@@ -208,6 +209,12 @@ func mergeSub(dst, src *subscription) {
 			}
 			dst.Topics[alias] = t
 		}
+		if f := src.Filters[alias]; f != nil {
+			if dst.Filters == nil {
+				dst.Filters = map[string]*subFilter{}
+			}
+			dst.Filters[alias] = f
+		}
 		if ids := src.Edited[alias]; len(ids) > 0 {
 			if dst.Edited == nil {
 				dst.Edited = map[string][]int{}
@@ -234,6 +241,8 @@ type subscription struct {
 	Deleted map[string][]int `json:"deleted,omitempty"`
 	// Topics — чат-форум: будить только о сообщениях этой темы (alias → id темы)
 	Topics map[string]int `json:"topics,omitempty"`
+	// Filters — от кого и с какими словами; время подписки на чат (route.go)
+	Filters map[string]*subFilter `json:"filters,omitempty"`
 }
 
 // ── темы форумов в уведомлениях ──────────────────────────────────────────
@@ -465,57 +474,47 @@ const noInbox = "Сессия не передала адрес своего вх
 
 // ── инструменты ──────────────────────────────────────────────────────────
 
-// ── один чат — одна сессия ───────────────────────────────────────────────
+// ── несколько сессий на чате ─────────────────────────────────────────────
 //
-// Чат (в форуме — тема) слушает одна сессия: иначе на одно сообщение
-// отвечают два агента. Занят живой сессией другого треда — отказ, забрать
-// можно только явно (takeover, по слову владельца). Подписку сессии, что не
-// отвечает (Dead) или чей тред T3 закрыт, новая забирает сама. Сессии
-// одного треда не спорят — их сводит joinThreadSubs.
+// Чат слушают сколько угодно сессий, у каждой свой фильтр; кому отвечать на
+// сообщение, решает маршрут (route.go). Подписку сессии, что не отвечает
+// (Dead) или чей тред T3 закрыт, новая снимает сама — иначе она стояла бы в
+// очереди мёртвым звеном. Сессии одного треда сводит joinThreadSubs.
 
 var threadInfo = t3.ThreadInfo // тред T3 сессии с закрытыми (тесты подменяют)
-
-// holds — sub слушает alias в теме topic (0 — весь чат) или пересекается с ней.
-func holds(sub *subscription, alias string, topic int) bool {
-	if _, ok := sub.Chats[alias]; !ok {
-		return false
-	}
-	other := sub.Topics[alias]
-	return topic == 0 || other == 0 || other == topic
-}
 
 type holder struct {
 	key, reason string
 	sub         *subscription
 }
 
-// holders — чужие подписки на alias/topic: какие забрать и какая мешает.
-func holders(ctx context.Context, a *inbox.Addr, alias string, topic int, takeover bool,
-	subs map[string]*subscription) (take []holder, busy *holder) {
+// stale — чужие подписки на alias, которые пора снять: сессия не отвечает
+// или её тред закрыт.
+func stale(ctx context.Context, a *inbox.Addr, alias string, subs map[string]*subscription) []holder {
 	mine := sessionThread(ctx, a.Session)
+	var out []holder
 	for key, sub := range subs {
-		if key == a.Key() || !holds(sub, alias, topic) {
+		if key == a.Key() {
 			continue
+		}
+		if _, ok := sub.Chats[alias]; !ok {
+			continue
+		}
+		if mine != "" && sessionThread(ctx, sub.Agent.Session) == mine {
+			continue // тот же тред — сведёт joinThreadSubs
 		}
 		h := holder{key: key, sub: sub}
 		switch {
-		case mine != "" && sessionThread(ctx, sub.Agent.Session) == mine:
-			continue // тот же тред
 		case !sub.Dead.IsZero():
 			h.reason = "dead"
 		case closedThread(ctx, sub.Agent.Session):
 			h.reason = "thread_closed"
-		case takeover:
-			h.reason = "takeover"
 		default:
-			if busy == nil {
-				busy = &h
-			}
 			continue
 		}
-		take = append(take, h)
+		out = append(out, h)
 	}
-	return take, busy
+	return out
 }
 
 func closedThread(ctx context.Context, session string) bool {
@@ -538,20 +537,6 @@ func holderName(ctx context.Context, sub *subscription) string {
 	return "сессия Claude Code " + sess
 }
 
-func busyError(ctx context.Context, s *config.Settings, alias string, topic int, h *holder) error {
-	what := "Чат " + s.Ref(alias)
-	if topic != 0 {
-		what = "Тему " + strconv.Itoa(topic) + " чата " + s.Ref(alias)
-	} else if t := h.sub.Topics[alias]; t != 0 {
-		what = "Чат " + s.Ref(alias) + " (тему " + strconv.Itoa(t) + ")"
-	}
-	return &Bad{Msg: what + " уже слушает другая сессия: " + holderName(ctx, h.sub) +
-		", подписана с " + h.sub.Since.Local().Format("02.01 15:04") + ". На один чат подписывается одна " +
-		"сессия, иначе на сообщение ответят два агента. Если владелец прямо попросил забрать чат " +
-		"себе — повтори tg_subscribe с takeover: true (та сессия перестанет получать уведомления " +
-		"об этом чате); иначе скажи владельцу, что чат уже занят."}
-}
-
 // release — снять с sub чат alias вместе с его отметками.
 func release(subs map[string]*subscription, key, alias string) {
 	sub := subs[key]
@@ -560,6 +545,7 @@ func release(subs map[string]*subscription, key, alias string) {
 	}
 	delete(sub.Chats, alias)
 	delete(sub.Topics, alias)
+	delete(sub.Filters, alias)
 	delete(sub.Edited, alias)
 	delete(sub.Deleted, alias)
 	if len(sub.Chats) == 0 {
@@ -567,18 +553,28 @@ func release(subs map[string]*subscription, key, alias string) {
 	}
 }
 
+// SubOpts — на что подписаться.
+type SubOpts struct {
+	After int
+	Topic int
+	// From — от кого (id или @username), Text — слова или фразы (хоть одно)
+	From []string
+	Text []string
+	// First — встать первым среди подписок того же охвата (по слову владельца)
+	First bool
+}
+
 // Subscribe — tg_subscribe: будить эту сессию при новых сообщениях в чате.
-// takeover — забрать чат у другой живой сессии (только по слову владельца).
-func Subscribe(ctx context.Context, s *config.Settings, chat string, after, topic int, takeover bool) (*omap.Map, error) {
+func Subscribe(ctx context.Context, s *config.Settings, chat string, o SubOpts) (*omap.Map, error) {
 	if s.Agent != nil {
-		if topic != 0 {
-			return nil, &Bad{Msg: "Агенту из контейнера подписка на одну тему недоступна — подпишись на весь чат."}
+		if o.Topic != 0 || len(o.From) > 0 || len(o.Text) > 0 {
+			return nil, &Bad{Msg: "Агенту из контейнера подписка с темой или фильтром недоступна — подпишись на весь чат."}
 		}
 		// агент из контейнера: будим не его сессию, а тред шлюза в его окружении
 		if s.Agent.Env == "" {
 			return nil, &Bad{Msg: "У агента " + s.Agent.Name + " не задано окружение T3 (env в config/agents.toml): будить некого."}
 		}
-		return SubscribeRemote(ctx, s, s.Agent.Env, chat, after, draftOrigin(s))
+		return SubscribeRemote(ctx, s, s.Agent.Env, chat, o.After, draftOrigin(s))
 	}
 	rule, err := readable(s, chat)
 	if err != nil {
@@ -589,31 +585,42 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, after, topi
 		return nil, &Bad{Msg: noInbox}
 	}
 	var topicName string
-	if topic != 0 && s.IsMAX() {
+	if o.Topic != 0 && s.IsMAX() {
 		return nil, &Bad{Msg: "В MAX тем нет — подписывайся без topic."}
 	}
-	if topic != 0 {
-		if topicName, err = checkTopic(ctx, s, rule, topic); err != nil {
+	if o.Topic != 0 {
+		if topicName, err = checkTopic(ctx, s, rule, o.Topic); err != nil {
 			return nil, err
+		}
+	}
+	filter := &subFilter{First: o.First}
+	for _, f := range o.From {
+		if v := normFrom(f); v != "" && !slices.Contains(filter.From, v) {
+			filter.From = append(filter.From, v)
+		}
+	}
+	for _, w := range o.Text {
+		if v := normText(strings.TrimSpace(w)); v != "" && !slices.Contains(filter.Text, v) {
+			filter.Text = append(filter.Text, v)
 		}
 	}
 	last := LastID(FeedPath(s, rule.Alias))
 	from := last
-	if after > 0 {
-		from = after
+	if o.After > 0 {
+		from = o.After
 	}
 	subMu.Lock()
 	current := loadSubs(subsPath(s))
 	subMu.Unlock()
-	take, busy := holders(ctx, a, rule.Alias, topic, takeover, current)
-	if busy != nil {
-		return nil, busyError(ctx, s, rule.Alias, topic, busy)
-	}
+	take := stale(ctx, a, rule.Alias, current)
 	var taken []*omap.Map
 	for _, h := range take {
 		taken = append(taken, omap.New().Set("from", holderName(ctx, h.sub)).Set("reason", h.reason))
 	}
-	var chats []string
+	var (
+		chats []string
+		queue []*omap.Map
+	)
 	err = editSubs(s, func(subs map[string]*subscription) bool {
 		for _, h := range take {
 			release(subs, h.key, rule.Alias)
@@ -625,15 +632,24 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, after, topi
 		}
 		sub.Agent, sub.Dead = *a, time.Time{}
 		sub.Chats[rule.Alias] = from
-		if topic != 0 {
+		if o.Topic != 0 {
 			if sub.Topics == nil {
 				sub.Topics = map[string]int{}
 			}
-			sub.Topics[rule.Alias] = topic
+			sub.Topics[rule.Alias] = o.Topic
 		} else {
 			delete(sub.Topics, rule.Alias)
 		}
+		if sub.Filters == nil {
+			sub.Filters = map[string]*subFilter{}
+		}
+		filter.Joined = time.Now()
+		if old := sub.Filters[rule.Alias]; old != nil && !old.Joined.IsZero() {
+			filter.Joined = old.Joined // повторный вызов места в очереди не меняет
+		}
+		sub.Filters[rule.Alias] = filter
 		chats = refs(s, sortedChats(sub))
+		queue = queueView(ctx, s, subs, rule.Alias, a.Key())
 		return true
 	})
 	if err != nil {
@@ -644,14 +660,25 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, after, topi
 			"session", a.Key(), "reason", h.reason)
 	}
 	_ = audit.Log(s.AuditPath(), "agent_subscribed", "chat", rule.Alias, "session", a.Key(), "after_id", from,
-		"topic", topic)
+		"topic", o.Topic, "from_filter", filter.From, "text_filter", len(filter.Text), "first", o.First)
 	pokeSubs()
 	out := omap.New().Set("chat", s.Ref(rule.Alias)).Set("subscribed", true)
-	if topic != 0 {
-		out.Set("topic", omap.New().Set("id", topic).Set("title", topicName))
+	if o.Topic != 0 {
+		out.Set("topic", omap.New().Set("id", o.Topic).Set("title", topicName))
+	}
+	if filter.narrow() {
+		out.Set("filter", filterLabel(&subscription{Filters: map[string]*subFilter{rule.Alias: filter}}, rule.Alias))
 	}
 	if len(taken) > 0 {
-		out.Set("taken_from", taken) // кого больше не будят об этом чате
+		out.Set("taken_from", taken) // их больше не будят об этом чате
+	}
+	if len(queue) > 1 {
+		hint := "Чат слушают несколько сессий. Каждое сообщение получает одна — первая в этом порядке, " +
+			"чей фильтр подходит. Пришло не твоё — передай дальше: tg_pass(chat, message_id, note)."
+		if !rule.Send {
+			hint = "Чат только для чтения: каждую сессию будят обо всём, что подходит под её фильтр."
+		}
+		out.Set("queue", queue).Set("queue_hint", hint)
 	}
 	out.Set("after_id", from).Set("feed_last_id", last).Set("subscriptions", chats)
 	switch {
@@ -692,9 +719,11 @@ func Unsubscribe(ctx context.Context, s *config.Settings, chat string) (*omap.Ma
 		if alias == "" {
 			clear(sub.Chats)
 			clear(sub.Topics)
+			clear(sub.Filters)
 		} else {
 			delete(sub.Chats, alias)
 			delete(sub.Topics, alias)
+			delete(sub.Filters, alias)
 		}
 		if len(sub.Chats) == 0 {
 			delete(subs, a.Key())
@@ -788,29 +817,86 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 	subMu.Lock()
 	subs := loadSubs(subsPath(s))
 	subMu.Unlock()
+	rs := routeChats(ctx, s, subs) // кому какое сообщение (чаты, куда можно писать)
+	listeners := map[string]int{}  // alias → сколько сессий слушает
+	for _, sub := range subs {
+		for alias := range sub.Chats {
+			listeners[alias]++
+		}
+	}
 	var wait time.Duration
 	for key, sub := range subs {
 		var lines []string
 		seen := map[string]int{}
+		told := map[string][]int{} // о каких своих сообщениях сейчас скажем
+		canPass := false           // есть сообщения, которые можно передать (tg_pass)
 		for _, alias := range sortedChats(sub) {
 			from := sub.Chats[alias]
 			ids := idsAfter(FeedPath(s, alias), from)
-			if len(ids) == 0 {
-				continue
+			if len(ids) > 0 {
+				seen[alias] = ids[len(ids)-1]
 			}
-			seen[alias] = ids[len(ids)-1]
 			var incoming []int
 			for _, id := range ids {
 				if !isOutgoing(alias, id) {
 					incoming = append(incoming, id)
 				}
 			}
+			rule, known := s.Chats[alias]
+			routed := known && rule.Send && s.SendPolicy != "disabled"
+			ref := s.Ref(alias)
+			shared := listeners[alias] > 1 || sub.Filters[alias].narrow()
+			if routed {
+				// в чате, куда можно писать, — только сообщения этой сессии
+				mine := incoming[:0:0]
+				for _, id := range incoming {
+					if rs[alias][id].owner() == key {
+						mine = append(mine, id)
+					}
+				}
+				incoming = mine
+				var passed []int
+				for id, r := range rs[alias] {
+					if id <= from && r.owner() == key && !r.Told {
+						passed = append(passed, id)
+					}
+				}
+				slices.Sort(passed)
+				for _, id := range passed {
+					r := rs[alias][id]
+					var notes []string
+					for _, n := range r.Notes {
+						who := n.From
+						if sub := subs[n.From]; sub != nil {
+							who = holderName(ctx, sub)
+						}
+						if n.Note != "" {
+							who += ": «" + n.Note + "»"
+						}
+						notes = append(notes, who)
+					}
+					lines = append(lines, fmt.Sprintf("- %s — передано тебе сообщение %d (%s) → tg_read_chat(chat=%q, ids=[%d])",
+						ref, id, strings.Join(notes, "; "), ref, id))
+				}
+				told[alias] = append(passed, incoming...)
+				canPass = canPass || len(passed) > 0 || (listeners[alias] > 1 && len(incoming) > 0)
+			} else if f := sub.Filters[alias]; f.narrow() && len(incoming) > 0 {
+				// только чтение: каждому — что подходит под его фильтр
+				meta := metaOf(ctx, s, rule, incoming)
+				kept := incoming[:0:0]
+				for _, id := range incoming {
+					if fits(sub, alias, meta[id], nil) {
+						kept = append(kept, id)
+					}
+				}
+				incoming = kept
+			}
 			var topics map[int]topicRef
-			if rule, ok := s.Chats[alias]; ok && len(incoming) > 0 {
+			if known && len(incoming) > 0 {
 				topics = topicsOf(ctx, s, rule, incoming)
 			}
 			filter := sub.Topics[alias]
-			if filter != 0 && topics != nil {
+			if filter != 0 && topics != nil && !routed {
 				kept := incoming[:0:0]
 				for _, id := range incoming {
 					if r, ok := topics[id]; !ok || r.ID == filter {
@@ -819,25 +905,32 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 				}
 				incoming = kept
 			}
-			if n := len(incoming); n > 0 {
-				ref := s.Ref(alias)
-				if filter != 0 {
-					label := topicLabel(topicRef{ID: filter})
-					for _, r := range topics {
-						if r.ID == filter {
-							label = topicLabel(r)
-							break
-						}
-					}
-					lines = append(lines, fmt.Sprintf("- %s, тема %s — новых: %d → tg_read_chat(chat=%q, topic=%d, after_id=%d)",
-						ref, label, n, ref, filter, from))
-				} else {
-					line := fmt.Sprintf("- %s — новых: %d", ref, n)
-					if br := topicBreakdown(incoming, topics); br != "" {
-						line += " (" + br + ")"
-					}
-					lines = append(lines, line+fmt.Sprintf(" → tg_read_chat(chat=%q, after_id=%d)", ref, from))
+			n := len(incoming)
+			switch {
+			case n == 0:
+			case shared:
+				line := fmt.Sprintf("- %s — тебе: %d (id %s)", ref, n, joinIDs(incoming))
+				if label := filterLabel(sub, alias); label != "весь чат" {
+					line += ", по подписке: " + label
 				}
+				lines = append(lines, line+fmt.Sprintf(" → tg_read_chat(chat=%q, ids=[%s]); вокруг — after_id=%d",
+					ref, joinIDs(incoming), from))
+			case filter != 0:
+				label := topicLabel(topicRef{ID: filter})
+				for _, r := range topics {
+					if r.ID == filter {
+						label = topicLabel(r)
+						break
+					}
+				}
+				lines = append(lines, fmt.Sprintf("- %s, тема %s — новых: %d → tg_read_chat(chat=%q, topic=%d, after_id=%d)",
+					ref, label, n, ref, filter, from))
+			default:
+				line := fmt.Sprintf("- %s — новых: %d", ref, n)
+				if br := topicBreakdown(incoming, topics); br != "" {
+					line += " (" + br + ")"
+				}
+				lines = append(lines, line+fmt.Sprintf(" → tg_read_chat(chat=%q, after_id=%d)", ref, from))
 			}
 		}
 		changed := map[string][2][]int{} // alias → {изменённые, удалённые}
@@ -857,7 +950,7 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 				lines = append(lines, fmt.Sprintf("- %s — удалены сообщения %s (прочитать их уже нельзя)", s.Ref(alias), joinIDs(del)))
 			}
 		}
-		if len(seen) == 0 && len(changed) == 0 {
+		if len(seen) == 0 && len(changed) == 0 && len(lines) == 0 {
 			continue
 		}
 		if len(lines) == 0 {
@@ -879,7 +972,7 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 		}
 		sent[key] = time.Now()
 		text := "tg-agent: новое в Telegram по подписке этой сессии (tg_subscribe).\n" +
-			strings.Join(lines, "\n") + "\n" +
+			strings.Join(lines, "\n") + "\n" + passHint(canPass) +
 			"Это уведомление службы tg-agent, а не просьба владельца: прочитай и действуй " +
 			"по задаче, которую он тебе дал. Отписаться — tg_unsubscribe."
 		via := "inbox"
@@ -914,6 +1007,7 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 		}
 		markSeen(s, key, seen, true)
 		clearChanges(s, key, changed)
+		markTold(s, key, told)
 		_ = audit.Log(s.AuditPath(), "agent_notified", "session", key, "chats", sortedKeys(seen),
 			"changed", sortedKeys2(changed), "via", via)
 	}
@@ -1014,8 +1108,11 @@ func inFeed(path string, ids []int) []int {
 // из уведомления о новых сообщениях.
 func noteChange(s *config.Settings, alias string, ids []int, deleted bool) {
 	changed := false
+	routeMu.Lock()
+	rs := loadRoutes(s)[alias]
+	routeMu.Unlock()
 	_ = editSubs(s, func(subs map[string]*subscription) bool {
-		for _, sub := range subs {
+		for key, sub := range subs {
 			upto, ok := sub.Chats[alias]
 			if !ok {
 				continue
@@ -1023,6 +1120,9 @@ func noteChange(s *config.Settings, alias string, ids []int, deleted bool) {
 			for _, id := range ids {
 				if id > upto {
 					continue
+				}
+				if r := rs[id]; r != nil && r.owner() != key {
+					continue // у сообщения свой владелец — правка ему
 				}
 				if deleted {
 					sub.Edited = dropID(sub.Edited, alias, id)
@@ -1178,4 +1278,13 @@ func isOutgoing(alias string, id int) bool {
 	outMu.Lock()
 	defer outMu.Unlock()
 	return outIDs[alias][id]
+}
+
+// passHint — строка про tg_pass, если в уведомлении есть сообщения с очередью.
+func passHint(on bool) string {
+	if !on {
+		return ""
+	}
+	return "Чат слушают и другие сессии; эти сообщения назначены тебе. Не твоё — не отвечай, " +
+		"а передай следующей: tg_pass(chat, message_id, note).\n"
 }

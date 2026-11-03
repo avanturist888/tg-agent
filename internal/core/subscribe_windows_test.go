@@ -95,7 +95,7 @@ func TestSubscribeNotifies(t *testing.T) {
 	addr, got := fakeSession(t)
 	ctx := WithAgent(context.Background(), &addr)
 
-	if _, err := Subscribe(ctx, s, "test", 0, 0, false); err != nil {
+	if _, err := Subscribe(ctx, s, "test", SubOpts{After: 0, Topic: 0, First: false}); err != nil {
 		t.Fatal(err)
 	}
 	sent := map[string]time.Time{}
@@ -128,7 +128,7 @@ func TestSubscribeAfterCatchesUp(t *testing.T) {
 	appendNewer(FeedPath(s, "test"), []int{10, 11, 12})
 	addr, got := fakeSession(t)
 	ctx := WithAgent(context.Background(), &addr)
-	if _, err := Subscribe(ctx, s, "test", 10, 0, false); err != nil {
+	if _, err := Subscribe(ctx, s, "test", SubOpts{After: 10, Topic: 0, First: false}); err != nil {
 		t.Fatal(err)
 	}
 	notifyOnce(ctx, s, map[string]time.Time{})
@@ -143,7 +143,7 @@ func TestSubscribeFollowsResumedSession(t *testing.T) {
 	gone := addr
 	gone.Socket += "-closed" // канала нет: сессия закрыта
 	ctx := WithAgent(context.Background(), &gone)
-	if _, err := Subscribe(ctx, s, "test", 0, 0, false); err != nil {
+	if _, err := Subscribe(ctx, s, "test", SubOpts{After: 0, Topic: 0, First: false}); err != nil {
 		t.Fatal(err)
 	}
 	appendNewer(feed, []int{11})
@@ -167,11 +167,11 @@ func TestSubscribeFollowsResumedSession(t *testing.T) {
 
 func TestSubscribeNeedsSessionAndReadableChat(t *testing.T) {
 	s := watchEnv(t)
-	if _, err := Subscribe(WithAgent(context.Background(), nil), s, "test", 0, 0, false); err == nil {
+	if _, err := Subscribe(WithAgent(context.Background(), nil), s, "test", SubOpts{}); err == nil {
 		t.Fatal("без канала сессии подписка невозможна")
 	}
 	addr, _ := fakeSession(t)
-	if _, err := Subscribe(WithAgent(context.Background(), &addr), s, "nope", 0, 0, false); err == nil {
+	if _, err := Subscribe(WithAgent(context.Background(), &addr), s, "nope", SubOpts{After: 0, Topic: 0}); err == nil {
 		t.Fatal("чат вне списка")
 	}
 	if _, err := Unsubscribe(WithAgent(context.Background(), &addr), s, ""); err != nil {
@@ -186,7 +186,7 @@ func TestSubscribeWakesStoppedT3Session(t *testing.T) {
 	addr, _ := fakeSession(t)
 	addr.Socket += "-closed" // T3 Code остановил процесс сессии
 	ctx := WithAgent(context.Background(), &addr)
-	if _, err := Subscribe(ctx, s, "test", 0, 0, false); err != nil {
+	if _, err := Subscribe(ctx, s, "test", SubOpts{After: 0, Topic: 0, First: false}); err != nil {
 		t.Fatal(err)
 	}
 	var woken []string
@@ -219,7 +219,7 @@ func TestSubscribeReportsEditsAndDeletes(t *testing.T) {
 	appendNewer(feed, []int{10})
 	addr, got := fakeSession(t)
 	ctx := WithAgent(context.Background(), &addr)
-	if _, err := Subscribe(ctx, s, "test", 0, 0, false); err != nil {
+	if _, err := Subscribe(ctx, s, "test", SubOpts{After: 0, Topic: 0, First: false}); err != nil {
 		t.Fatal(err)
 	}
 	sent := map[string]time.Time{}
@@ -277,7 +277,7 @@ func TestSubscribeTopics(t *testing.T) {
 		return "Заказы", nil
 	}
 
-	if _, err := Subscribe(ctx, s, "test", 0, 0, false); err != nil {
+	if _, err := Subscribe(ctx, s, "test", SubOpts{After: 0, Topic: 0, First: false}); err != nil {
 		t.Fatal(err)
 	}
 	sent := map[string]time.Time{}
@@ -286,10 +286,10 @@ func TestSubscribeTopics(t *testing.T) {
 	expectNote(t, got, "новых: 3", "«Заказы» (topic=5) — 2", "«General» (topic=1) — 1")
 
 	// подписка на одну тему: General не будит, правки чужой темы — тоже
-	if _, err := Subscribe(ctx, s, "test", 0, 7, false); err == nil {
+	if _, err := Subscribe(ctx, s, "test", SubOpts{After: 0, Topic: 7, First: false}); err == nil {
 		t.Fatal("несуществующая тема")
 	}
-	out, err := Subscribe(ctx, s, "test", 0, 5, false)
+	out, err := Subscribe(ctx, s, "test", SubOpts{After: 0, Topic: 5, First: false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestSubscriptionsFollowNewT3Session(t *testing.T) {
 	// подписалась прежняя сессия треда; T3 завёл треду новую
 	old, _ := fakeSession(t)
 	old.Session, old.Socket = "old-s", old.Socket+"-closed"
-	if _, err := Subscribe(WithAgent(context.Background(), &old), s, "test", 0, 0, false); err != nil {
+	if _, err := Subscribe(WithAgent(context.Background(), &old), s, "test", SubOpts{After: 0, Topic: 0}); err != nil {
 		t.Fatal(err)
 	}
 	fresh, got := fakeSession(t)
@@ -351,7 +351,7 @@ func TestSubscriptionsFollowNewT3Session(t *testing.T) {
 	expectNote(t, got, "новых: 1", "after_id=10")
 
 	// обе сессии подписаны (новая — сама): будим одну, текущую
-	if _, err := Subscribe(WithAgent(context.Background(), &old), s, "test", 11, 0, false); err != nil {
+	if _, err := Subscribe(WithAgent(context.Background(), &old), s, "test", SubOpts{After: 11, Topic: 0}); err != nil {
 		t.Fatal(err)
 	}
 	appendNewer(feed, []int{12})
@@ -363,71 +363,155 @@ func TestSubscriptionsFollowNewT3Session(t *testing.T) {
 	}
 }
 
-func TestSubscribeOneSessionPerChat(t *testing.T) {
+func TestSubscribeQueue(t *testing.T) {
 	s := watchEnv(t)
-	appendNewer(FeedPath(s, "test"), []int{10})
-	oldCheck := checkTopic
-	t.Cleanup(func() { checkTopic = oldCheck })
-	checkTopic = func(context.Context, *config.Settings, config.ChatRule, int) (string, error) { return "тема", nil }
-	threadInfo = func(_ context.Context, session string) (t3.SessionThread, error) {
-		if session == "s-a" {
-			return t3.SessionThread{ID: "th-a", Title: "мария"}, nil
-		}
-		return t3.SessionThread{}, t3.NoThread
+	rule := s.Chats["test"]
+	rule.Send = true // куда можно писать — у сообщения один владелец
+	s.Chats["test"] = rule
+	feed := FeedPath(s, "test")
+	appendNewer(feed, []int{10})
+	texts := map[int]*msgMeta{
+		11: {FromID: "1", Text: "привет"},
+		12: {FromID: "1", Text: "Выставь СЧЁТ, пожалуйста"},
+		13: {FromID: "2", Username: "ivan", Text: "счёт за октябрь"},
 	}
-	a, _ := fakeSession(t)
-	a.Session = "s-a"
+	oldMeta := metaOf
+	t.Cleanup(func() { metaOf = oldMeta })
+	metaOf = func(_ context.Context, _ *config.Settings, _ config.ChatRule, ids []int) map[int]*msgMeta {
+		out := map[int]*msgMeta{}
+		for _, id := range ids {
+			out[id] = texts[id]
+		}
+		return out
+	}
+	threadInfo = func(_ context.Context, session string) (t3.SessionThread, error) {
+		return t3.SessionThread{ID: "th-" + session, Title: "тред " + session}, nil
+	}
+	a, gotA := fakeSession(t)
+	a.Session = "a"
 	b, gotB := fakeSession(t)
-	b.Session = "s-b"
-	ctxA, ctxB := WithAgent(context.Background(), &a), WithAgent(context.Background(), &b)
+	b.Session = "b"
+	c, gotC := fakeSession(t)
+	c.Session = "c"
+	ctxA, ctxB, ctxC := WithAgent(context.Background(), &a), WithAgent(context.Background(), &b), WithAgent(context.Background(), &c)
 
-	if _, err := Subscribe(ctxA, s, "test", 0, 0, false); err != nil {
+	// широкая подписка не мешает другим: чат больше не «занят»
+	if _, err := Subscribe(ctxA, s, "test", SubOpts{}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := Subscribe(ctxB, s, "test", 0, 0, false)
-	if err == nil || !strings.Contains(err.Error(), "уже слушает") || !strings.Contains(err.Error(), "«мария»") {
-		t.Fatalf("занятый чат — отказ с именем треда: %v", err)
+	out, err := Subscribe(ctxB, s, "test", SubOpts{Text: []string{"счёт"}})
+	if err != nil {
+		t.Fatalf("вторая подписка на чат: %v", err)
 	}
-	// по слову владельца — забирает, первая больше не слушает
-	out, err := Subscribe(ctxB, s, "test", 0, 0, true)
+	if q, _ := out.Get("queue"); q == nil {
+		t.Fatal("в ответе нет очереди")
+	}
+	time.Sleep(10 * time.Millisecond) // c подписан позже b
+	if _, err := Subscribe(ctxC, s, "test", SubOpts{From: []string{"@Ivan"}}); err != nil {
+		t.Fatal(err)
+	}
+	sent := map[string]time.Time{}
+
+	// не по словам b и не от ivan — широкой a
+	appendNewer(feed, []int{11})
+	notifyOnce(context.Background(), s, sent)
+	expectNote(t, gotA, "тебе: 1 (id 11)")
+	expectSilence(t, gotB)
+	expectSilence(t, gotC)
+
+	// «счёт» — узкой b раньше широкой a; ё = е, регистр неважен
+	clear(sent)
+	appendNewer(feed, []int{12})
+	notifyOnce(context.Background(), s, sent)
+	expectNote(t, gotB, "тебе: 1 (id 12)", "tg_pass")
+	expectSilence(t, gotA)
+
+	// чужое передать нельзя
+	if _, err := Pass(ctxA, s, "test", 12, ""); err == nil || !strings.Contains(err.Error(), "не твоё") {
+		t.Fatalf("не владелец не передаёт: %v", err)
+	}
+	// b передаёт — следующей в цепочке, a, с запиской
+	res, err := Pass(ctxB, s, "test", 12, "это не про оплату")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, _ := out.Get("taken_from"); v == nil {
-		t.Fatal("в ответе нет taken_from")
+	if to, _ := res.Get("passed_to"); to == nil {
+		t.Fatalf("некому передать: %v", res)
 	}
-	subs := loadSubs(subsPath(s))
-	if subs["s-a"] != nil || subs["s-b"] == nil {
-		t.Fatalf("чат должен перейти к b: %+v", subs)
-	}
-	appendNewer(FeedPath(s, "test"), []int{11})
-	notifyOnce(context.Background(), s, map[string]time.Time{})
-	expectNote(t, gotB, "новых: 1")
-
-	// темы форума — раздельно; весь чат пересекается с любой темой
-	if _, err := Unsubscribe(ctxB, s, ""); err != nil {
+	clear(sent)
+	notifyOnce(context.Background(), s, sent)
+	expectNote(t, gotA, "передано тебе сообщение 12", "это не про оплату")
+	expectSilence(t, gotB)
+	// a передаёт — дальше никого
+	res, err = Pass(ctxA, s, "test", 12, "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Subscribe(ctxA, s, "test", 0, 5, false); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Subscribe(ctxB, s, "test", 0, 7, false); err != nil {
-		t.Fatalf("другая тема того же чата: %v", err)
-	}
-	if _, err := Subscribe(ctxB, s, "test", 0, 0, false); err == nil {
-		t.Fatal("весь чат пересекается с темой a")
+	if to, _ := res.Get("passed_to"); to != nil {
+		t.Fatalf("цепочка кончилась, а передано %v", to)
 	}
 
-	// тред a закрыт — его подписку b забирает сам
+	// подходит двум узким — первая по времени подписки (b), потом c, потом a
+	clear(sent)
+	appendNewer(feed, []int{13})
+	notifyOnce(context.Background(), s, sent)
+	expectNote(t, gotB, "id 13")
+	expectSilence(t, gotC)
+	expectSilence(t, gotA)
+	if _, err := Pass(ctxB, s, "test", 13, ""); err != nil {
+		t.Fatal(err)
+	}
+	clear(sent)
+	notifyOnce(context.Background(), s, sent)
+	expectNote(t, gotC, "передано тебе сообщение 13")
+	expectSilence(t, gotA)
+
+	// правка сообщения — только его владельцу
+	noteChange(s, "test", []int{13}, false)
+	clear(sent)
+	notifyOnce(context.Background(), s, sent)
+	expectNote(t, gotC, "изменены сообщения 13")
+	expectSilence(t, gotB)
+
+	// тред c закрыт — новая подписка снимает его, его сообщения не теряются
 	threadInfo = func(_ context.Context, session string) (t3.SessionThread, error) {
-		return t3.SessionThread{ID: "th-a", Title: "мария", Closed: session == "s-a"}, nil
+		return t3.SessionThread{ID: "th-" + session, Title: "тред " + session, Closed: session == "c"}, nil
 	}
-	if _, err := Subscribe(ctxB, s, "test", 0, 5, false); err != nil {
-		t.Fatalf("закрытый тред не держит чат: %v", err)
+	if _, err := Subscribe(ctxA, s, "test", SubOpts{}); err != nil {
+		t.Fatal(err)
 	}
-	if subs := loadSubs(subsPath(s)); subs["s-a"] != nil {
-		t.Fatalf("у закрытого треда подписка снята: %+v", subs["s-a"])
+	if subs := loadSubs(subsPath(s)); subs["c"] != nil {
+		t.Fatalf("подписка закрытого треда снята: %+v", subs["c"])
 	}
+}
+
+func TestSubscribeReadOnlyFilters(t *testing.T) {
+	s := watchEnv(t) // чат test — только чтение: маршрутов нет, каждому своё
+	feed := FeedPath(s, "test")
+	appendNewer(feed, []int{10})
+	oldMeta := metaOf
+	t.Cleanup(func() { metaOf = oldMeta })
+	metaOf = func(_ context.Context, _ *config.Settings, _ config.ChatRule, ids []int) map[int]*msgMeta {
+		out := map[int]*msgMeta{}
+		for _, id := range ids {
+			out[id] = &msgMeta{FromID: "7", Text: map[int]string{11: "заказ 5", 12: "привет"}[id]}
+		}
+		return out
+	}
+	a, gotA := fakeSession(t)
+	a.Session = "a"
+	b, gotB := fakeSession(t)
+	b.Session = "b"
+	if _, err := Subscribe(WithAgent(context.Background(), &a), s, "test", SubOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Subscribe(WithAgent(context.Background(), &b), s, "test", SubOpts{Text: []string{"заказ"}}); err != nil {
+		t.Fatal(err)
+	}
+	appendNewer(feed, []int{11, 12})
+	notifyOnce(context.Background(), s, map[string]time.Time{})
+	expectNote(t, gotA, "тебе: 2 (id 11, 12)")
+	expectNote(t, gotB, "тебе: 1 (id 11)")
 }
 
 func TestSubscribeTakesFromDeadSession(t *testing.T) {
@@ -438,14 +522,14 @@ func TestSubscribeTakesFromDeadSession(t *testing.T) {
 	a.Session, a.Socket = "s-a", a.Socket+"-closed"
 	b, _ := fakeSession(t)
 	b.Session = "s-b"
-	if _, err := Subscribe(WithAgent(context.Background(), &a), s, "test", 0, 0, false); err != nil {
+	if _, err := Subscribe(WithAgent(context.Background(), &a), s, "test", SubOpts{}); err != nil {
 		t.Fatal(err)
 	}
 	appendNewer(feed, []int{11})
 	notifyOnce(context.Background(), s, map[string]time.Time{}) // a не отвечает — Dead
-	out, err := Subscribe(WithAgent(context.Background(), &b), s, "test", 0, 0, false)
+	out, err := Subscribe(WithAgent(context.Background(), &b), s, "test", SubOpts{})
 	if err != nil {
-		t.Fatalf("подписку мёртвой сессии забирают без takeover: %v", err)
+		t.Fatalf("подписка рядом с мёртвой сессией: %v", err)
 	}
 	if v, _ := out.Get("taken_from"); v == nil {
 		t.Fatal("в ответе нет taken_from")
