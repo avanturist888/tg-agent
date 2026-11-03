@@ -198,6 +198,35 @@ type draftIn struct {
 	Topic   int      `json:"topic,omitempty" jsonschema:"тема форума, куда писать (id из tg_list_topics); при reply_to — по исходному сообщению"`
 }
 
+type pollIn struct {
+	Chat         string   `json:"chat" jsonschema:"alias из tg_list_chats"`
+	Question     string   `json:"question" jsonschema:"вопрос, до 255 символов"`
+	Options      []string `json:"options" jsonschema:"варианты ответа, от 2 до 12, каждый до 100 символов"`
+	PublicVoters bool     `json:"public_voters,omitempty" jsonschema:"открытый опрос: всем видно, кто как голосовал, и tg_poll_votes отдаст список (по умолчанию анонимный)"`
+	Multiple     bool     `json:"multiple,omitempty" jsonschema:"можно выбрать несколько вариантов"`
+	Quiz         bool     `json:"quiz,omitempty" jsonschema:"викторина: есть верный ответ"`
+	Correct      []int    `json:"correct,omitempty" jsonschema:"у викторины — номера верных вариантов, с 0"`
+	Solution     string   `json:"solution,omitempty" jsonschema:"у викторины — пояснение после ответа, до 200 символов"`
+	ReplyTo      *int64   `json:"reply_to,omitempty" jsonschema:"id сообщения, на которое отвечаем"`
+	Note         string   `json:"note,omitempty" jsonschema:"зачем этот опрос и из какого проекта"`
+	Topic        int      `json:"topic,omitempty" jsonschema:"тема форума (id из tg_list_topics)"`
+}
+
+type pollVotesIn struct {
+	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
+	MessageID int    `json:"message_id" jsonschema:"id сообщения с опросом"`
+	Option    *int   `json:"option,omitempty" jsonschema:"только этот вариант (номер с 0); без него — все"`
+	Limit     int    `json:"limit,omitempty" jsonschema:"сколько голосов вернуть (по умолчанию и максимум 500)"`
+}
+
+type voteIn struct {
+	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
+	MessageID int64  `json:"message_id" jsonschema:"id сообщения с опросом"`
+	Options   []int  `json:"options,omitempty" jsonschema:"номера вариантов с 0 (несколько — только в опросе с multiple)"`
+	Retract   bool   `json:"retract,omitempty" jsonschema:"снять голос владельца"`
+	Note      string `json:"note,omitempty" jsonschema:"почему такой голос — показывается владельцу в карточке"`
+}
+
 type editIn struct {
 	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
 	MessageID int64  `json:"message_id,omitempty" jsonschema:"id своего отправленного сообщения (из tg_wait_approval / tg_send_draft)"`
@@ -586,6 +615,75 @@ topic — в чате-форуме: тема, куда писать (id из tg_
 		func(ctx context.Context, _ *mcp.CallToolRequest, in draftIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 10*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 				return core.DraftMessage(ctx, s, in.Chat, in.Text, in.ReplyTo, in.Note, in.Format, in.Files, in.AsFiles, in.Topic)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_draft_poll", Description: `Подготовить опрос к отправке. Как tg_draft_message: САМ ПО СЕБЕ НЕ ОТПРАВЛЯЕТ —
+кроме чатов с автоотправкой.
+
+Тот же путь, что у сообщения: карточка с опросом уходит владельцу в бот
+(кнопка «Отправить»), дальше — tg_wait_approval(draft_id); в чате с
+auto_send опрос уйдёт сам через окно на отмену (tg_cancel_draft). В ответе
+tg_wait_approval — message_id опроса.
+
+question — вопрос; options — варианты (2–12). Варианты везде нумеруются
+с 0: в correct, в tg_read_chat (poll.options[].index) и в tg_poll_votes.
+public_voters=true — открытый опрос: участники видят, кто как голосовал, и
+tg_poll_votes отдаст список. Нужен список отметившихся («кто придёт»,
+«кто берёт») — делай открытый. По умолчанию анонимный: видно только
+число голосов.
+multiple=true — можно выбрать несколько вариантов.
+quiz=true — викторина: correct — номера верных вариантов, solution —
+пояснение после ответа.
+Вступление или пояснение к опросу — отдельным сообщением (tg_draft_message):
+у опроса нет текста.
+reply_to, topic, note — как в tg_draft_message.
+
+Только Telegram: в MAX опросы через tg-agent пока не создаются.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in pollIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 10*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				p := outbox.PollSpec{Question: in.Question, Options: in.Options, Anonymous: !in.PublicVoters,
+					Multiple: in.Multiple, Quiz: in.Quiz, Correct: in.Correct, Solution: in.Solution}
+				return core.DraftPoll(ctx, s, in.Chat, p, in.ReplyTo, in.Note, in.Topic)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_poll_votes", Annotations: readOnly, Description: `Кто как проголосовал в опросе разрешённого чата.
+
+Сам опрос — вопрос, варианты, сколько голосов за каждый, проголосовал ли
+владелец (chosen), закрыт ли — приходит в tg_read_chat в поле poll любого
+сообщения-опроса. Этот инструмент — список голосов: votes[] — from (кто),
+options (номера вариантов с 0), date; count — сколько всего.
+
+Только для открытых опросов (poll.anonymous = false): в анонимном Telegram
+не показывает голоса никому. Если владелец сам ещё не голосовал, Telegram
+может не отдать голоса — тогда об этом будет сказано в ошибке.
+option — только голоса за этот вариант.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in pollVotesIn) (*mcp.CallToolResult, any, error) {
+			option := -1
+			if in.Option != nil {
+				option = *in.Option
+			}
+			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.PollVotes(ctx, s, in.Chat, in.MessageID, option, in.Limit)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_vote", Description: `Проголосовать в опросе от имени владельца (или снять его голос). САМО ПО СЕБЕ НЕ ГОЛОСУЕТ —
+кроме чатов с автоотправкой.
+
+Голос («приду», «беру») — обещание от имени владельца, поэтому он идёт тем
+же путём, что сообщение: карточка «за что голос» в бот, дальше
+tg_wait_approval(draft_id); в чате с auto_send голос уйдёт сам через окно на
+отмену (tg_cancel_draft). Голосуй по поручению владельца или когда ответ
+следует из его же слов; не угадывай за него.
+
+options — номера вариантов с 0 (из tg_read_chat, poll.options[].index);
+несколько — только если poll.multiple. Новый голос заменяет прежний.
+retract=true — снять голос. В ответе tg_wait_approval — опрос после голоса.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in voteIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 10*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.DraftVote(ctx, s, in.Chat, in.MessageID, in.Options, in.Retract, in.Note)
 			})
 		})
 

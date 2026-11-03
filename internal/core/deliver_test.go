@@ -9,7 +9,10 @@ import (
 	"tgagent/internal/tgc"
 )
 
-type fakeSender struct{ sent, edited, files int }
+type fakeSender struct {
+	sent, edited, files int
+	polls               []tgc.PollOut
+}
 
 func (f *fakeSender) SendMessage(_ context.Context, _ tgc.Target, _ string, _ *int64, format string) (*omap.Map, error) {
 	f.sent++
@@ -19,6 +22,15 @@ func (f *fakeSender) SendMessage(_ context.Context, _ tgc.Target, _ string, _ *i
 func (f *fakeSender) EditMessage(_ context.Context, _ tgc.Target, id int, _, format string) (*omap.Map, error) {
 	f.edited++
 	return omap.New().Set("message_id", id).Set("edited", true).Set("format", format), nil
+}
+
+func (f *fakeSender) SendPoll(_ context.Context, _ tgc.Target, p tgc.PollOut, _ *int64) (*omap.Map, error) {
+	f.polls = append(f.polls, p)
+	return omap.New().Set("message_id", 900).Set("format", "poll"), nil
+}
+
+func (f *fakeSender) SendVote(_ context.Context, _ tgc.Target, msgID int, _ []int) (*omap.Map, error) {
+	return omap.New().Set("message_id", msgID).Set("format", "vote"), nil
 }
 
 func (f *fakeSender) SendFiles(_ context.Context, _ tgc.Target, files []tgc.OutFile, _ *int64) ([]int, error) {
@@ -43,6 +55,8 @@ func TestSendDraftKeepsMessageID(t *testing.T) {
 		{"текст и файл", outbox.Draft{Text: "привет", Files: []outbox.FileSnap{{Path: "a.txt"}}}, 3606036},
 		{"только файлы", outbox.Draft{Files: []outbox.FileSnap{{Path: "a.txt"}, {Path: "b.txt"}}}, 500},
 		{"правка", outbox.Draft{Text: "стало", EditOf: 77}, 77},
+		{"голос", outbox.Draft{Vote: &outbox.VoteSpec{MessageID: 41, Options: []int{0}}}, 41},
+		{"опрос", outbox.Draft{Poll: &outbox.PollSpec{Question: "Кто идёт?", Options: []string{"я", "не я"}}}, 900},
 	}
 	for _, c := range cases {
 		r, err := sendDraft(ctx, &fakeSender{}, tgc.Target{}, &c.d)

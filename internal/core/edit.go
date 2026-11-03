@@ -31,7 +31,7 @@ func editTarget(s *config.Settings, alias string, msgID int64) (*outbox.Draft, e
 	}
 	var found *outbox.Draft
 	for _, d := range drafts {
-		if d.Chat != alias || d.EditOf != 0 || d.MessageID == nil || *d.MessageID != msgID {
+		if d.Chat != alias || d.EditOf != 0 || d.Vote != nil || d.MessageID == nil || *d.MessageID != msgID {
 			continue
 		}
 		found = d
@@ -57,7 +57,7 @@ func EditMessage(ctx context.Context, s *config.Settings, chat string, messageID
 		if err != nil {
 			return nil, err
 		}
-		if d.Chat != rule.Alias || d.Status != outbox.Sent || d.MessageID == nil {
+		if d.Chat != rule.Alias || d.Status != outbox.Sent || d.MessageID == nil || d.Vote != nil {
 			return nil, &Bad{Msg: fmt.Sprintf("Черновик %s не отправлен в этот чат — править нечего.", draftID)}
 		}
 		messageID = *d.MessageID

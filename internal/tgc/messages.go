@@ -595,6 +595,9 @@ func (c *Conn) Serialize(m tg.MessageClass, b *Batch) *omap.Map {
 		if label != "" {
 			out.Set("media", label)
 		}
+		if p := PollInfo(v); p != nil {
+			out.Set("poll", p) // вопрос, варианты с голосами; кто голосовал — tg_poll_votes
+		}
 		if f := File(v); f != nil && PhotoOf(v) == nil && !isSticker(DocumentOf(v)) {
 			var name any
 			if f.Name != "" {

@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -255,7 +256,19 @@ func heading(d *outbox.Draft) string {
 		return who + " просит исправить своё сообщение"
 	}
 	if d.Status == outbox.Scheduled || d.ApprovedBy() == "auto_send" {
+		if d.Poll != nil {
+			return who + " отправляет опрос (автоотправка)"
+		}
+		if d.Vote != nil {
+			return who + " голосует от вашего имени (автоотправка)"
+		}
 		return who + " отправляет сообщение (автоотправка)"
+	}
+	if d.Poll != nil {
+		return who + " просит отправить опрос"
+	}
+	if d.Vote != nil {
+		return who + " просит проголосовать от вашего имени"
 	}
 	return who + " просит отправить сообщение"
 }
@@ -297,7 +310,11 @@ func CardMarkdown(d *outbox.Draft, title, note, status string) string {
 			"**Станет:**")
 	}
 	body := "*без текста — только файлы*"
-	if d.Text != "" {
+	if d.Poll != nil {
+		body = pollMD(d.Poll)
+	} else if d.Vote != nil {
+		body = "🗳 " + MDEscape(voteLine(d.Vote))
+	} else if d.Text != "" {
 		body = d.Text
 		if d.Fmt != "markdown" {
 			body = MDEscape(d.Text)
@@ -308,6 +325,64 @@ func CardMarkdown(d *outbox.Draft, title, note, status string) string {
 		card += "\n\n" + Separator + "\n\n" + status
 	}
 	return card
+}
+
+// voteLine — за что голос: «Вопрос → вариант, вариант» (или снять голос).
+func voteLine(v *outbox.VoteSpec) string {
+	q := fmt.Sprintf("Опрос #%d «%s»", v.MessageID, v.Question)
+	if len(v.Labels) == 0 {
+		return q + " → снять голос владельца"
+	}
+	return q + " → " + strings.Join(v.Labels, ", ")
+}
+
+// pollLines — опрос в карточке: настройки и варианты (верные — ✅).
+func pollLines(p *outbox.PollSpec) (kind string, options []string) {
+	var flags []string
+	if p.Quiz {
+		flags = append(flags, "викторина")
+	}
+	if p.Anonymous {
+		flags = append(flags, "анонимный")
+	} else {
+		flags = append(flags, "открытый: видно, кто как голосовал")
+	}
+	if p.Multiple {
+		flags = append(flags, "можно несколько ответов")
+	}
+	for i, o := range p.Options {
+		mark := fmt.Sprintf("%d.", i+1)
+		if p.Quiz && slices.Contains(p.Correct, i) {
+			mark += " ✅"
+		}
+		options = append(options, mark+" "+o)
+	}
+	return strings.Join(flags, ", "), options
+}
+
+func pollMD(p *outbox.PollSpec) string {
+	kind, options := pollLines(p)
+	for i, o := range options {
+		options[i] = MDEscape(o)
+	}
+	out := "📊 **Опрос:** " + MDEscape(p.Question) + "\n\n" + strings.Join(options, "\n") + "\n\n*" + MDEscape(kind) + "*"
+	if p.Solution != "" {
+		out += "\n\nПояснение: " + MDEscape(p.Solution)
+	}
+	return out
+}
+
+func pollHTML(p *outbox.PollSpec) string {
+	kind, options := pollLines(p)
+	for i, o := range options {
+		options[i] = html.EscapeString(o)
+	}
+	out := "📊 <b>Опрос:</b> " + html.EscapeString(p.Question) + "\n\n" + strings.Join(options, "\n") +
+		"\n\n<i>" + html.EscapeString(kind) + "</i>"
+	if p.Solution != "" {
+		out += "\n\nПояснение: " + html.EscapeString(p.Solution)
+	}
+	return out
 }
 
 // quoteMD — прежний текст цитатой, без разметки (как простой текст).
@@ -345,7 +420,13 @@ func CardHTML(d *outbox.Draft, title, note, status string) string {
 		head = append(head, fmt.Sprintf("Сообщение #%d. <b>Было:</b>\n<blockquote>%s</blockquote>\n<b>Станет:</b>",
 			d.EditOf, html.EscapeString(truncate(d.EditOld, oldShown))))
 	}
-	card := strings.Join(head, "\n") + "\n\n<pre>" + html.EscapeString(d.Text) + "</pre>"
+	body := "<pre>" + html.EscapeString(d.Text) + "</pre>"
+	if d.Poll != nil {
+		body = pollHTML(d.Poll)
+	} else if d.Vote != nil {
+		body = "🗳 " + html.EscapeString(voteLine(d.Vote))
+	}
+	card := strings.Join(head, "\n") + "\n\n" + body
 	if status != "" {
 		card += "\n\n" + htmlFromStatus(status)
 	}
@@ -356,6 +437,9 @@ func CardHTML(d *outbox.Draft, title, note, status string) string {
 func verb(d *outbox.Draft) string {
 	if d.EditOf != 0 {
 		return "Исправить"
+	}
+	if d.Vote != nil {
+		return "Проголосовать"
 	}
 	return "Отправить"
 }

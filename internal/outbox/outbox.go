@@ -57,6 +57,26 @@ type FileSnap struct {
 	Kind   string `json:"kind,omitempty"` // KindPhoto — фото в ленте; пусто — документ без сжатия
 }
 
+// PollSpec — опрос вместо текста (tg_draft_poll). Варианты нумеруются с 0.
+type PollSpec struct {
+	Question  string   `json:"question"`
+	Options   []string `json:"options"`
+	Anonymous bool     `json:"anonymous"`
+	Multiple  bool     `json:"multiple,omitempty"`
+	Quiz      bool     `json:"quiz,omitempty"`
+	Correct   []int    `json:"correct,omitempty"`
+	Solution  string   `json:"solution,omitempty"`
+}
+
+// VoteSpec — голос владельца в опросе (tg_vote). Options пусто — снять голос.
+// Question и Labels — для карточки: за что именно голос.
+type VoteSpec struct {
+	MessageID int64    `json:"message_id"`
+	Options   []int    `json:"options"`
+	Question  string   `json:"question"`
+	Labels    []string `json:"labels"`
+}
+
 // KindPhoto — файл уходит фотографией (Telegram покажет его прямо в ленте).
 const KindPhoto = "photo"
 
@@ -87,6 +107,10 @@ type Draft struct {
 	// EditOld — его текст до правки (для карточки «было → станет»)
 	EditOf  int64
 	EditOld string
+	// Poll — черновик опроса (текста и файлов тогда нет)
+	Poll *PollSpec
+	// Vote — не сообщение, а голос владельца в опросе
+	Vote *VoteSpec
 
 	extra *omap.Map // поля от других версий — возвращаем при записи как есть
 }
@@ -96,6 +120,7 @@ var known = map[string]bool{
 	"status": true, "origin": true, "approved_at": true, "sent_at": true, "message_id": true,
 	"bot_message_id": true, "fmt": true, "files": true, "send_error": true, "note": true,
 	"history": true, "send_at": true, "topic": true, "topic_title": true, "edit_of": true, "edit_old": true,
+	"poll": true, "vote": true,
 }
 
 func (d *Draft) MarshalJSON() ([]byte, error) {
@@ -124,6 +149,12 @@ func (d *Draft) MarshalJSON() ([]byte, error) {
 	}
 	if d.EditOf != 0 {
 		m.Set("edit_of", d.EditOf).Set("edit_old", d.EditOld)
+	}
+	if d.Poll != nil {
+		m.Set("poll", d.Poll)
+	}
+	if d.Vote != nil {
+		m.Set("vote", d.Vote)
 	}
 	return m.MarshalJSON()
 }
@@ -156,6 +187,8 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		TopicTitle   string            `json:"topic_title"`
 		EditOf       int64             `json:"edit_of"`
 		EditOld      string            `json:"edit_old"`
+		Poll         *PollSpec         `json:"poll"`
+		Vote         *VoteSpec         `json:"vote"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
@@ -165,7 +198,7 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		ExpiresAt: aux.ExpiresAt, Status: aux.Status, Origin: aux.Origin, ApprovedAt: aux.ApprovedAt,
 		SentAt: aux.SentAt, MessageID: aux.MessageID, BotMessageID: aux.BotMessageID, Fmt: aux.Fmt,
 		Files: aux.Files, SendError: aux.SendError, Note: aux.Note, History: aux.History, SendAt: aux.SendAt,
-		Topic: aux.Topic, TopicTitle: aux.TopicTitle, EditOf: aux.EditOf, EditOld: aux.EditOld,
+		Topic: aux.Topic, TopicTitle: aux.TopicTitle, EditOf: aux.EditOf, EditOld: aux.EditOld, Poll: aux.Poll, Vote: aux.Vote,
 	}
 	if d.Status == "" {
 		d.Status = Pending
@@ -329,6 +362,10 @@ type CreateOpts struct {
 	// EditOf, EditOld — правка отправленного сообщения (его id и прежний текст)
 	EditOf  int64
 	EditOld string
+	// Poll — опрос вместо текста
+	Poll *PollSpec
+	// Vote — голос в опросе вместо сообщения
+	Vote *VoteSpec
 }
 
 func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
@@ -357,6 +394,8 @@ func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
 		TopicTitle: opts.TopicTitle,
 		EditOf:     opts.EditOf,
 		EditOld:    opts.EditOld,
+		Poll:       opts.Poll,
+		Vote:       opts.Vote,
 	}
 	if opts.SendAt != nil {
 		at := audit.FormatTime(*opts.SendAt)

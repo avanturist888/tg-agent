@@ -833,8 +833,13 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 func finishDraft(ctx context.Context, s *config.Settings, rule config.ChatRule, d *outbox.Draft, out *omap.Map,
 	note string, auto bool) (*omap.Map, error) {
 	what, button := "сообщение УЙДЁТ САМО", "«Отправить» отправляет сообщение само"
-	if d.EditOf != 0 {
+	switch {
+	case d.EditOf != 0:
 		what, button = "правка ПРИМЕНИТСЯ САМА", "«Исправить» применяет правку сама"
+	case d.Poll != nil:
+		what, button = "опрос УЙДЁТ САМ", "«Отправить» отправляет опрос сам"
+	case d.Vote != nil:
+		what, button = "голос УЙДЁТ САМ", "«Проголосовать» голосует само"
 	}
 	if auto {
 		card := s.BotReady() && Notify(ctx, s, d, rule.Title, note) != 0
@@ -955,12 +960,20 @@ type draftSender interface {
 	SendMessage(ctx context.Context, t tgc.Target, text string, reply *int64, format string) (*omap.Map, error)
 	EditMessage(ctx context.Context, t tgc.Target, id int, text, format string) (*omap.Map, error)
 	SendFiles(ctx context.Context, t tgc.Target, files []tgc.OutFile, reply *int64) ([]int, error)
+	SendPoll(ctx context.Context, t tgc.Target, p tgc.PollOut, reply *int64) (*omap.Map, error)
+	SendVote(ctx context.Context, t tgc.Target, msgID int, options []int) (*omap.Map, error)
 }
 
 // sendDraft — отправить черновик (или правку) и вернуть ответ с message_id.
 func sendDraft(ctx context.Context, c draftSender, t tgc.Target, d *outbox.Draft) (*omap.Map, error) {
 	if d.EditOf != 0 { // правка отправленного: только текст
 		return c.EditMessage(ctx, t, int(d.EditOf), d.Text, d.Fmt)
+	}
+	if d.Poll != nil {
+		return c.SendPoll(ctx, t, pollOut(d.Poll), d.ReplyTo)
+	}
+	if d.Vote != nil {
+		return c.SendVote(ctx, t, int(d.Vote.MessageID), d.Vote.Options)
 	}
 	result := omap.New()
 	if d.Text != "" {
@@ -1093,6 +1106,12 @@ func ListDrafts(s *config.Settings, status string) (*omap.Map, error) {
 		}
 		if d.EditOf != 0 {
 			row.Set("edit_of", d.EditOf) // правка отправленного сообщения
+		}
+		if d.Poll != nil {
+			row.Set("poll", d.Poll)
+		}
+		if d.Vote != nil {
+			row.Set("vote", d.Vote)
 		}
 		row.Set("status", d.Status).Set("text", d.Text).
 			Set("created_at", d.CreatedAt).Set("expires_at", d.ExpiresAt).Set("message_id", d.MessageID)
