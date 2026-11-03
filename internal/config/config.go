@@ -88,6 +88,9 @@ type ChatRule struct {
 	Send  bool
 	Auto  bool // auto_send = true: без кнопки, но с окном на отмену
 	Note  string
+	// Via — чат открыт правилом на группу (папка, публичные каналы), а не
+	// своим [[chat]]: подпись групп для агента; "" — свой [[chat]]
+	Via string
 }
 
 // PeerString — peer как строка (id числом, "me" или "@username").
@@ -110,6 +113,15 @@ func (r ChatRule) AsMap() *omap.Map {
 		Set("can_send", r.Send).
 		Set("auto_send", r.AutoSend()).
 		Set("note", r.Note)
+}
+
+// AsMapVia — AsMap с пометкой, через какую группу открыт чат.
+func (r ChatRule) AsMapVia() *omap.Map {
+	m := r.AsMap()
+	if r.Via != "" {
+		m.Set("via", r.Via)
+	}
+	return m
 }
 
 // AutoSend — отправка без кнопки, с окном отмены (auto_send = true вместе с send = true).
@@ -136,7 +148,12 @@ type Settings struct {
 	AutoSendDelaySec   int
 	EditWindowMin      int // сколько минут после отправки агент может править своё сообщение
 	Chats              map[string]ChatRule
-	ChatOrder          []string // порядок из chats.toml
+	ChatOrder          []string // порядок из chats.toml; чаты из групп — в конце
+	// Sets — правила на группы чатов ([[folder]], [public_channels]);
+	// их чаты уже в Chats (с Via)
+	Sets []ChatSet
+	// Manage — права вне белого списка ([manage])
+	Manage Manage
 	// Agent — вызов от агента из контейнера (HTTP): Chats уже урезаны до его
 	// чатов (Restrict). nil — местный агент или владелец.
 	Agent *Agent
@@ -438,6 +455,11 @@ func load(requireCredentials bool) (*Settings, error) {
 	if err != nil {
 		return nil, err
 	}
+	sets, manage, err := LoadSets(ChatsFile())
+	if err != nil {
+		return nil, err
+	}
+	chats, order = mergeSets(chats, order, sets, LoadSetsState())
 	return &Settings{
 		APIID:              id,
 		APIHash:            apiHash,
@@ -459,6 +481,8 @@ func load(requireCredentials bool) (*Settings, error) {
 		EditWindowMin:      envInt("TG_EDIT_WINDOW_MIN", 60),
 		Chats:              chats,
 		ChatOrder:          order,
+		Sets:               sets,
+		Manage:             manage,
 		SharedBot:          shared,
 		Network:            network,
 	}, nil

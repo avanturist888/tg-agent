@@ -366,9 +366,22 @@ func cmdAllow(ctx context.Context, args []string) int {
 	noRead := fs.Bool("no-read", false, "запретить чтение")
 	note := fs.String("note", "", "заметка для агента")
 	limit := fs.Int("limit", 200, "сколько диалогов смотреть для --match")
+	folder := fs.String("folder", "", "открыть папку целиком: id или название (alias не нужен)")
+	public := fs.Bool("public-channels", false, "открыть все публичные каналы на чтение (alias не нужен)")
+	manage := fs.Bool("manage-folders", false, "дать агентам право раскладывать чаты по папкам и архиву")
 	pos, err := parse(fs, args)
+	if err == nil && (*folder != "" || *public || *manage) && len(pos) == 0 {
+		if *auto && !*send {
+			fmt.Fprintln(os.Stderr, "--auto работает только вместе с --send.")
+			return 2
+		}
+		return allowSet(*folder, *public, *manage, !*noRead, *send, *auto, *note)
+	}
 	if err != nil || len(pos) != 1 {
-		fmt.Fprintln(os.Stderr, "Использование: tg allow <alias> [--id X | --match X] [--send [--auto]] [--no-read]")
+		fmt.Fprintln(os.Stderr, "Использование: tg allow <alias> [--id X | --match X] [--send [--auto]] [--no-read]\n"+
+			"            tg allow --folder <id|название> [--send [--auto]]\n"+
+			"            tg allow --public-channels\n"+
+			"            tg allow --manage-folders")
 		return 2
 	}
 	alias := pos[0]
@@ -379,6 +392,15 @@ func cmdAllow(ctx context.Context, args []string) int {
 	s, err := settings()
 	if err != nil {
 		return fail(err)
+	}
+	if rule, exists := findAlias(s, alias); exists && rule.Via != "" {
+		// чат из группы: свои права — отдельным [[chat]] с тем же alias
+		c := chatsfile.Chat{Alias: rule.Alias, Peer: rule.Peer, Title: rule.Title, Read: !*noRead, Send: *send, Auto: *auto, Note: *note}
+		if err := chatsfile.Add(c); err != nil {
+			return fail(err)
+		}
+		fmt.Printf("Чат был открыт группой (%s), теперь у него свои права:%s", rule.Via, chatsfile.Block(c))
+		return 0
 	}
 	if _, exists := findAlias(s, alias); exists {
 		if *id != "" || *match != "" {
@@ -446,6 +468,35 @@ func cmdAllow(ctx context.Context, args []string) int {
 	return 0
 }
 
+// allowSet — tg allow --folder / --public-channels / --manage-folders.
+func allowSet(folder string, public, manage, read, send, auto bool, note string) int {
+	switch {
+	case manage:
+		if err := chatsfile.SetManageFolders(true); err != nil {
+			return fail(err)
+		}
+		fmt.Println("Агенты могут раскладывать чаты по папкам и архиву ([manage] folders = true).")
+	case public:
+		if err := chatsfile.SetPublicChannels(true, note); err != nil {
+			return fail(err)
+		}
+		fmt.Println("Публичные каналы открыты на чтение ([public_channels]). Служба соберёт список за минуту.")
+	default:
+		f := chatsfile.Folder{Read: read, Send: send, Auto: auto, Note: note}
+		if _, err := strconv.Atoi(strings.TrimSpace(folder)); err == nil {
+			f.ID = strings.TrimSpace(folder)
+		} else {
+			f.Name = strings.TrimSpace(folder)
+		}
+		if err := chatsfile.SetFolder(f); err != nil {
+			return fail(err)
+		}
+		fmt.Printf("Папка %s открыта: read = %t, send = %t, auto_send = %t. Служба соберёт её чаты за минуту.\n",
+			folder, read, send, send && auto)
+	}
+	return 0
+}
+
 func findAlias(s *config.Settings, alias string) (config.ChatRule, bool) {
 	for a, r := range s.Chats {
 		if strings.EqualFold(a, alias) {
@@ -457,9 +508,31 @@ func findAlias(s *config.Settings, alias string) (config.ChatRule, bool) {
 
 func cmdDeny(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("deny", flag.ContinueOnError)
+	folder := fs.String("folder", "", "закрыть папку: id или название")
+	public := fs.Bool("public-channels", false, "закрыть публичные каналы")
+	manage := fs.Bool("manage-folders", false, "снять право раскладывать чаты по папкам")
 	pos, err := parse(fs, args)
+	if err == nil && len(pos) == 0 && (*folder != "" || *public || *manage) {
+		switch {
+		case *manage:
+			err = chatsfile.SetManageFolders(false)
+		case *public:
+			err = chatsfile.SetPublicChannels(false, "")
+		default:
+			id, name := "", strings.TrimSpace(*folder)
+			if _, e := strconv.Atoi(name); e == nil {
+				id, name = name, ""
+			}
+			err = chatsfile.RemoveFolder(id, name)
+		}
+		if err != nil {
+			return fail(err)
+		}
+		fmt.Println("Закрыто: агенты больше не видят эти чаты (кроме открытых своим [[chat]]).")
+		return 0
+	}
 	if err != nil || len(pos) != 1 {
-		fmt.Fprintln(os.Stderr, "Использование: tg deny <alias>")
+		fmt.Fprintln(os.Stderr, "Использование: tg deny <alias> | --folder <id|название> | --public-channels | --manage-folders")
 		return 2
 	}
 	if err := chatsfile.Remove(pos[0]); err != nil {

@@ -169,6 +169,11 @@ func (c *Conn) FolderChats(ctx context.Context, f Folder, limit int) ([]DialogRo
 	if err != nil {
 		return nil, err
 	}
+	return c.FolderRows(page, f), nil
+}
+
+// FolderRows — чаты папки из уже полученного списка диалогов.
+func (c *Conn) FolderRows(page *DialogPage, f Folder) []DialogRow {
 	self := c.Peers.SelfID()
 	byID := map[int64]DialogRow{}
 	var order []int64
@@ -190,7 +195,7 @@ func (c *Conn) FolderChats(ctx context.Context, f Folder, limit int) ([]DialogRo
 		used[id] = true
 		out = append(out, row)
 	}
-	return out, nil
+	return out
 }
 
 // ChatInfo — название и тип чата аккаунта по id (формат Bot API) — из

@@ -273,6 +273,9 @@ func maxReadChat(ctx context.Context, s *config.Settings, rule config.ChatRule, 
 		if m.Status == "REMOVED" || (before > 0 && m.ID >= before) || (after > 0 && m.ID <= after) {
 			continue // удалённое агенту не показываем, как и в Telegram
 		}
+		if !o.Since.IsZero() && len(o.IDs) == 0 && m.Time < o.Since.UnixMilli() {
+			continue
+		}
 		kept = append(kept, m)
 	}
 	if len(o.IDs) == 0 && len(kept) > limit {

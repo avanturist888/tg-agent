@@ -79,11 +79,15 @@ func ListFolders(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 		if rules := f.Rules(); len(rules) > 0 {
 			item.Set("rules", rules)
 		}
+		if set, ok := folderSet(s, strconv.Itoa(f.ID), f.Title); ok {
+			item.Set("access", omap.New().Set("can_read", set.Read).Set("can_send", set.Send).Set("auto_send", set.AutoSend()))
+		}
 		list = append(list, item)
 	}
 	logEvent(s, "folders_listed", "count", len(folders))
 	return omap.New().Set("folders", list).Set("hint",
-		"Чаты папки — tg_folder_chats(folder=<id или название>)."), nil
+		"Чаты папки — tg_folder_chats(folder=<id или название>). access — папка открыта агентам целиком; "+
+			"нужна вся папка — tg_request_access(folder=…)."), nil
 }
 
 // FolderChats — tg_folder_chats.
@@ -164,7 +168,12 @@ func FolderChats(ctx context.Context, s *config.Settings, folder string) (*omap.
 // ── запросы доступа ──────────────────────────────────────────────────────
 
 type accessRequest struct {
-	ID       string      `json:"id"`
+	ID string `json:"id"`
+	// Scope — о чём просят: "" — один чат, иначе scopeFolder, scopePublic, scopeManage
+	Scope    string      `json:"scope,omitempty"`
+	Folder   string      `json:"folder,omitempty"` // id папки (scopeFolder)
+	Count    int         `json:"count,omitempty"`  // сколько чатов в группе на момент запроса
+	Sample   []string    `json:"sample,omitempty"` // какие (для карточки)
 	Peer     int64       `json:"peer"`
 	Title    string      `json:"title"`
 	Kind     string      `json:"kind"`
@@ -328,6 +337,9 @@ func kindRu(kind string) string {
 }
 
 func accessCardMarkdown(r *accessRequest, existing *config.ChatRule, status string) string {
+	if r.Scope != "" {
+		return setCardMarkdown(r, status)
+	}
 	var b strings.Builder
 	b.WriteString("🔑 **Агент просит доступ к чату**\n\n")
 	chat := "«" + bot.MDEscape(r.Title) + "» — " + kindRu(r.Kind)
@@ -349,7 +361,9 @@ func accessCardMarkdown(r *accessRequest, existing *config.ChatRule, status stri
 func accessKeyboard(s *config.Settings, r *accessRequest) map[string]any {
 	p := s.CallbackPrefix() + "a:" + r.ID + ":"
 	var rows [][]map[string]string
-	if r.Send {
+	if r.Scope == scopePublic || r.Scope == scopeManage {
+		rows = append(rows, []map[string]string{{"text": "✅ Разрешить", "callback_data": p + "r"}})
+	} else if r.Send {
 		// автоотправку владелец решает здесь же, при допуске: в допущенном чате агент действует сам
 		rows = append(rows,
 			[]map[string]string{{"text": "⚡ Разрешить, отправка без подтверждения", "callback_data": p + "rwa"}},
@@ -419,6 +433,17 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 			bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
 			return
 		}
+		if r.Scope != "" {
+			if err := grantSet(fresh, r, read, send, auto); err != nil {
+				bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
+				logEvent(s, "access_grant_failed", "request_id", id, "error", err.Error())
+				return
+			}
+			r.Status, r.CanRead, r.CanSend, r.CanAuto = accessGranted, read, send, auto
+			status = "✅ **Разрешено:** " + setGranted(r)
+			bot.AnswerCallback(ctx, s, q.ID, "Разрешено.")
+			break
+		}
 		alias, err := grantAccess(fresh, r, read, send, auto)
 		if err != nil {
 			bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
@@ -441,7 +466,7 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 		}
 		return false
 	})
-	logEvent(s, "access_"+r.Status, "request_id", id, "chat_id", r.Peer, "title", r.Title, "alias", r.Alias,
+	logEvent(s, "access_"+r.Status, "request_id", id, "scope", r.Scope, "chat_id", r.Peer, "title", r.Title, "alias", r.Alias,
 		"read", r.CanRead, "send", r.CanSend, "auto_send", r.CanAuto, "by", "telegram_button")
 	finishAccessCard(ctx, s, r, status)
 	go afterAccess(context.WithoutCancel(ctx), r)
@@ -461,6 +486,13 @@ func grantedRights(r *accessRequest) string {
 // grantAccess — дописать чат в белый список (или расширить права). Возвращает alias.
 func grantAccess(s *config.Settings, r *accessRequest, read, send, auto bool) (string, error) {
 	for _, rule := range s.Rules() {
+		if rulePeerID(rule) == r.Peer && rule.Via != "" {
+			// чат открыт через группу — свои права ему даёт отдельный [[chat]]
+			// с тем же alias: явное правило главнее группы
+			note := fmt.Sprintf("Открыт по запросу агента %s: %s", time.Now().Format("02.01.2006"), r.Reason)
+			return rule.Alias, chatsfile.Add(chatsfile.Chat{Alias: rule.Alias, Peer: r.Peer, Title: r.Title,
+				Read: rule.Read || read, Send: rule.Send || send, Auto: rule.AutoSend() || (send && auto), Note: note})
+		}
 		if rulePeerID(rule) == r.Peer {
 			return rule.Alias, chatsfile.Update(rule.Alias, rule.Read || read, rule.Send || send, rule.AutoSend() || auto, nil, nil)
 		}
@@ -490,7 +522,15 @@ func afterAccess(ctx context.Context, r *accessRequest) {
 	if err != nil {
 		return
 	}
-	if r.Status == accessGranted && r.CanRead {
+	if r.Status == accessGranted && (r.Scope == scopeFolder || r.Scope == scopePublic) {
+		if _, err := RefreshSets(ctx, s, true); err != nil {
+			logEvent(s, "chat_sets_failed", "error", err.Error())
+		}
+		if s, err = config.Load(); err != nil {
+			return
+		}
+	}
+	if r.Status == accessGranted && r.CanRead && r.Scope != scopeManage {
 		if s.IsMAX() {
 			maxCatchup(ctx, s)
 		} else {
@@ -501,7 +541,9 @@ func afterAccess(ctx context.Context, r *accessRequest) {
 		return
 	}
 	text := fmt.Sprintf("tg-agent: владелец отказал в доступе к чату «%s» (запрос %s). Не проси снова без новой просьбы владельца.", r.Title, r.ID)
-	if r.Status == accessGranted {
+	if r.Scope != "" {
+		text = setDecisionText(s, r)
+	} else if r.Status == accessGranted {
 		text = fmt.Sprintf("tg-agent: владелец открыл чат «%s» (запрос %s): alias %q, %s. "+
 			"Обращайся к нему по alias, правила — в tg_list_chats.", r.Title, r.ID, s.Ref(r.Alias), grantedRights(r))
 	}
@@ -540,6 +582,9 @@ func WaitAccess(ctx context.Context, s *config.Settings, id string, timeoutSec i
 	r := loadAccess(accessPath(s))[id]
 	if r == nil {
 		return nil, errors.New("запрос пропал")
+	}
+	if r.Scope != "" {
+		return setWaitResult(s, r), nil
 	}
 	out := omap.New().Set("request_id", id).Set("chat_id", r.Peer).Set("title", r.Title).Set("status", r.Status)
 	switch r.Status {

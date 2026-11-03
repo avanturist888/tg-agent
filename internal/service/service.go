@@ -40,7 +40,7 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	done := make(chan struct{}, 7)
+	done := make(chan struct{}, 8)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		_ = srv.Serve(ctx)
@@ -56,6 +56,10 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 	go func() {
 		defer func() { done <- struct{}{} }()
 		runHTTP(ctx, loader) // MCP по HTTP для агентов из контейнеров
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		core.RunSets(ctx, loader) // состав папок и публичных каналов, открытых одним правилом
 	}()
 	go func() {
 		defer func() { done <- struct{}{} }()
@@ -102,7 +106,7 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 		core.RecoverInterrupted(ctx, s) // у своего бота это делает RunButtons
 	}
 	<-ctx.Done()
-	for range 7 {
+	for range 8 {
 		<-done
 	}
 	_ = audit.Log(s.AuditPath(), "service_stop")

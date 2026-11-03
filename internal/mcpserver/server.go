@@ -113,7 +113,8 @@ func localPaths(doc string) string {
 // ── входные параметры инструментов ─────────────────────────────────────
 
 type listChatsIn struct {
-	WithStatus bool `json:"with_status,omitempty" jsonschema:"ещё и непрочитанные и превью последнего сообщения"`
+	WithStatus  bool   `json:"with_status,omitempty" jsonschema:"ещё и непрочитанные и превью последнего сообщения"`
+	ActiveSince string `json:"active_since,omitempty" jsonschema:"только чаты, где писали с этого времени: 24h, 2d или дата 2026-11-02 (вместе со статусом)"`
 }
 
 type readChatIn struct {
@@ -123,6 +124,7 @@ type readChatIn struct {
 	AfterID  int    `json:"after_id,omitempty" jsonschema:"вернуть сообщения НОВЕЕ этого id"`
 	IDs      []int  `json:"ids,omitempty" jsonschema:"конкретные сообщения по id (тогда limit, before_id, after_id не нужны)"`
 	Topic    int    `json:"topic,omitempty" jsonschema:"только эта тема форума (id из tg_list_topics; General — 1)"`
+	Since    string `json:"since,omitempty" jsonschema:"только сообщения с этого времени: 24h, 90m, 2d, 1w или дата 2026-11-02 / 2026-11-02T10:00 (местное время)"`
 }
 
 type topicsIn struct {
@@ -148,9 +150,35 @@ type accountNoteIn struct {
 
 type requestAccessIn struct {
 	Account string `json:"account,omitempty" jsonschema:"аккаунт, чей чат (по умолчанию основной)"`
-	ChatID  int64  `json:"chat_id" jsonschema:"id чата из tg_folder_chats"`
+	ChatID  int64  `json:"chat_id,omitempty" jsonschema:"id чата из tg_folder_chats (один чат)"`
+	Folder  string `json:"folder,omitempty" jsonschema:"вместо чата — папка целиком (id или название из tg_list_folders)"`
+	Public  bool   `json:"public_channels,omitempty" jsonschema:"вместо чата — все публичные каналы аккаунта (только чтение)"`
+	Manage  bool   `json:"manage_folders,omitempty" jsonschema:"вместо чата — право раскладывать чаты по папкам и архиву"`
 	Send    bool   `json:"send,omitempty" jsonschema:"нужна ещё и отправка (по умолчанию — только чтение)"`
-	Reason  string `json:"reason" jsonschema:"зачем чат и для какого проекта — владелец решает по этому"`
+	Reason  string `json:"reason" jsonschema:"зачем доступ и для какого проекта — владелец решает по этому"`
+}
+
+type markReadIn struct {
+	Chat string `json:"chat" jsonschema:"alias канала из tg_list_chats"`
+	UpTo int    `json:"up_to_id" jsonschema:"id последнего обработанного поста: он и все до него станут прочитанными"`
+}
+
+type unfiledIn struct {
+	Account  string `json:"account,omitempty" jsonschema:"аккаунт (по умолчанию основной)"`
+	Archived string `json:"archived,omitempty" jsonschema:"only — только архив, no — без архива; по умолчанию все"`
+}
+
+type moveChatIn struct {
+	Account    string `json:"account,omitempty" jsonschema:"аккаунт (по умолчанию основной)"`
+	ChatID     int64  `json:"chat_id" jsonschema:"id чата из tg_folder_chats или tg_unfiled_chats"`
+	ToFolder   string `json:"to_folder,omitempty" jsonschema:"куда положить: id или название папки"`
+	FromFolder string `json:"from_folder,omitempty" jsonschema:"откуда вынуть: id или название папки"`
+}
+
+type archiveChatIn struct {
+	Account   string `json:"account,omitempty" jsonschema:"аккаунт (по умолчанию основной)"`
+	ChatID    int64  `json:"chat_id" jsonschema:"id чата из tg_folder_chats или tg_unfiled_chats"`
+	Unarchive bool   `json:"unarchive,omitempty" jsonschema:"true — достать из архива; по умолчанию убрать в архив"`
 }
 
 type waitAccessIn struct {
@@ -288,6 +316,13 @@ tg_cancel_draft, потом оно отправляется само.
 
 with_status=true дополнительно тянет число непрочитанных и превью
 последнего сообщения (медленнее, один запрос к Telegram).
+active_since="24h" (или дата) — только чаты, где писали с этого времени,
+сразу со статусом: так видно, какие каналы читать за сутки.
+
+Чат с via открыт не сам по себе, а правилом на группу: папку или все
+публичные каналы (sets — какие группы открыты). Состав группы служба
+обновляет сама: новый канал или чат, положенный владельцем в папку,
+появляется здесь без запроса доступа.
 
 У читаемых чатов есть feed: path — локальный файл, куда служба сразу по
 приходу дописывает id новых сообщений (по одному на строку), last_id —
@@ -307,7 +342,11 @@ notes (заметки владельца и агентов об аккаунте
 Пока аккаунт один, ответ прежний; заметки к нему — в account_notes.`)},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in listChatsIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
-				return core.ListChats(ctx, s, in.WithStatus)
+				since, err := core.ParseSince(in.ActiveSince, time.Now())
+				if err != nil {
+					return nil, err
+				}
+				return core.ListChatsSince(ctx, s, in.WithStatus, since)
 			})
 		})
 
@@ -366,6 +405,13 @@ delete_id — убрать заметку с этим id (только заме�
 
 chat_id — id из tg_folder_chats; send=true — нужна и отправка; reason —
 зачем чат и для какого проекта, коротко и честно: владелец решает по нему.
+
+Вместо одного чата можно просить группу — одним решением владельца:
+folder — папку целиком (id или название из tg_list_folders; её новые чаты
+откроются сами), public_channels=true — все публичные каналы аккаунта (с
+@username, только чтение), manage_folders=true — право раскладывать чаты
+по папкам и архиву (tg_unfiled_chats, tg_move_chat, tg_archive_chat;
+сообщений оно не открывает).
 Владелец может разрешить с автоотправкой (сообщения уходят сами, с окном
 на отмену), разрешить с подтверждением каждого сообщения, разрешить только
 чтение или отказать; что выбрал — auto_send в ответе. Разрешил —
@@ -378,7 +424,71 @@ chat_id — id из tg_folder_chats; send=true — нужна и отправк�
 				if err := checkAccount(in.Account); err != nil {
 					return nil, err
 				}
+				if in.Folder != "" || in.Public || in.Manage {
+					return core.RequestSetAccess(ctx, s, core.SetAccessOpts{Folder: in.Folder, Public: in.Public,
+						Manage: in.Manage, Send: in.Send, Reason: in.Reason})
+				}
 				return core.RequestAccess(ctx, s, in.ChatID, true, in.Send, in.Reason)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_mark_read", Description: `Отметить посты канала прочитанными — до up_to_id включительно (как пролистать канал в Telegram).
+
+Для сводок: обработал посты — отметь, чтобы владелец не перечитывал их в
+Telegram. Отмечай только то, что действительно вошло в твою работу.
+Только каналы: в личках и группах «прочитано» видят собеседники, там
+инструмент откажет.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in markReadIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.MarkRead(ctx, s, in.Chat, in.UpTo)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_unfiled_chats", Annotations: readOnly, Description: `Чаты владельца, которых нет ни в одной папке Telegram: название, тип, непрочитанные, archived.
+
+Только список, без сообщений. Нужно право раскладывать чаты
+(tg_request_access(manage_folders=true)). archived="only" — только архив,
+"no" — без архива. alias = null — чата нет в белом списке.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in unfiledIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				if err := checkAccount(in.Account); err != nil {
+					return nil, err
+				}
+				return core.UnfiledChats(ctx, s, in.Archived)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_move_chat", Description: `Переложить чат между папками Telegram владельца.
+
+to_folder — положить в эту папку, from_folder — вынуть из этой; можно
+одно из двух или оба (перенос). Папка — id или название из
+tg_list_folders. Чат, попадающий в папку по её правилам («все каналы»),
+при выносе попадает в её исключения — как в клиентах Telegram. Папку-ссылку
+менять нельзя. Нужно право раскладывать чаты
+(tg_request_access(manage_folders=true)).
+
+Если папка открыта агентам (via в tg_list_chats), положенный тобой чат
+доступа к своим сообщениям не даёт: о допуске решает владелец.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in moveChatIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				if err := checkAccount(in.Account); err != nil {
+					return nil, err
+				}
+				return core.MoveChat(ctx, s, in.ChatID, in.FromFolder, in.ToFolder)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_archive_chat", Description: `Убрать чат владельца в архив Telegram или достать из него (unarchive=true).
+
+Нужно право раскладывать чаты (tg_request_access(manage_folders=true)).
+Чат, который после этого попал в открытую агентам папку, доступа к
+сообщениям не даёт.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in archiveChatIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				if err := checkAccount(in.Account); err != nil {
+					return nil, err
+				}
+				return core.ArchiveChat(ctx, s, in.ChatID, !in.Unarchive)
 			})
 		})
 
@@ -479,6 +589,9 @@ before_id — вернуть сообщения СТАРШЕ этого id (по
 after_id  — вернуть сообщения НОВЕЕ этого id (что нового с прошлого раза)
 ids       — конкретные сообщения по id, например [3585092, 3585000]
 topic     — только эта тема форума (id из tg_list_topics; General — 1)
+since     — только сообщения с этого времени: "24h", "2d" или дата
+            "2026-11-02" / "2026-11-02T10:00" (местное время); limit тогда
+            по умолчанию — потолок; не влезло — more подскажет before_id
 
 Сообщения приходят в хронологическом порядке, старые сверху.
 Чтение не помечает чат прочитанным.
@@ -508,8 +621,12 @@ transcript полный; pending — готово только начало (tra
 скачай через tg_download_file и расшифруй своим STT.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in readChatIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				since, err := core.ParseSince(in.Since, time.Now())
+				if err != nil {
+					return nil, err
+				}
 				return core.ReadChat(ctx, s, in.Chat, core.ReadOpts{Limit: in.Limit, BeforeID: in.BeforeID,
-					AfterID: in.AfterID, IDs: in.IDs, Transcribe: true, Topic: in.Topic})
+					AfterID: in.AfterID, IDs: in.IDs, Transcribe: true, Topic: in.Topic, Since: since})
 			})
 		})
 

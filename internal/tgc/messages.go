@@ -490,6 +490,14 @@ func chatTitle(ch tg.ChatClass) (title, username string) {
 	case *tg.Chat:
 		return v.Title, ""
 	case *tg.Channel:
+		if v.Username == "" {
+			// у канала могут быть только коллекционные имена (Fragment)
+			for _, u := range v.Usernames {
+				if u.Active {
+					return v.Title, u.Username
+				}
+			}
+		}
 		return v.Title, v.Username
 	case *tg.ChatForbidden:
 		return v.Title, ""
@@ -678,11 +686,10 @@ func (c *Conn) ChatStatus(ctx context.Context, rules []config.ChatRule) (map[str
 	if len(peers) == 0 {
 		return status, nil
 	}
-	res, err := c.API.MessagesGetPeerDialogs(ctx, peers)
+	res, err := c.peerDialogs(ctx, peers)
 	if err != nil {
 		return nil, err
 	}
-	c.Peers.Remember(res.Users, res.Chats)
 	msgs := map[string]tg.MessageClass{}
 	for _, m := range res.Messages {
 		msgs[msgKey(m)] = m
@@ -712,6 +719,41 @@ func (c *Conn) ChatStatus(ctx context.Context, rules []config.ChatRule) (map[str
 	return status, nil
 }
 
+// peerDialogs — messages.getPeerDialogs частями: чатов из групп (папка,
+// каналы) бывает больше, чем Telegram принимает за раз.
+func (c *Conn) peerDialogs(ctx context.Context, peers []tg.InputDialogPeerClass) (*tg.MessagesPeerDialogs, error) {
+	const chunk = 100
+	all := &tg.MessagesPeerDialogs{}
+	for start := 0; start < len(peers); start += chunk {
+		res, err := c.API.MessagesGetPeerDialogs(ctx, peers[start:min(start+chunk, len(peers))])
+		if err != nil {
+			return nil, err
+		}
+		c.Peers.Remember(res.Users, res.Chats)
+		all.Dialogs = append(all.Dialogs, res.Dialogs...)
+		all.Messages = append(all.Messages, res.Messages...)
+		all.Users = append(all.Users, res.Users...)
+		all.Chats = append(all.Chats, res.Chats...)
+	}
+	return all, nil
+}
+
+// IDBefore — id последнего сообщения чата раньше date (Unix); 0 — таких нет.
+// По нему чтение «с такого-то времени» становится чтением после id.
+func (c *Conn) IDBefore(ctx context.Context, t Target, date int) (int, error) {
+	res, err := c.API.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: t.Input, OffsetDate: date, Limit: 1})
+	if err != nil {
+		return 0, err
+	}
+	b := c.unpack(res)
+	for _, m := range b.Messages {
+		if messageDate(m) < date {
+			return m.GetID(), nil
+		}
+	}
+	return 0, nil
+}
+
 // TopMessages — id последнего сообщения в каждом из чатов (для лент).
 func (c *Conn) TopMessages(ctx context.Context, targets map[string]Target) (map[string]int, error) {
 	var peers []tg.InputDialogPeerClass
@@ -723,7 +765,7 @@ func (c *Conn) TopMessages(ctx context.Context, targets map[string]Target) (map[
 	if len(peers) == 0 {
 		return map[string]int{}, nil
 	}
-	res, err := c.API.MessagesGetPeerDialogs(ctx, peers)
+	res, err := c.peerDialogs(ctx, peers)
 	if err != nil {
 		return nil, err
 	}

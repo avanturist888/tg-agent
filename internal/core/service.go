@@ -63,9 +63,18 @@ func sendable(s *config.Settings, chat string) (config.ChatRule, error) {
 
 // ListChats — tg_list_chats.
 func ListChats(ctx context.Context, s *config.Settings, withStatus bool) (*omap.Map, error) {
+	return ListChatsSince(ctx, s, withStatus, time.Time{})
+}
+
+// ListChatsSince — tg_list_chats; activeSince не ноль — только чаты, где
+// последнее сообщение не раньше него (вместе со статусом).
+func ListChatsSince(ctx context.Context, s *config.Settings, withStatus bool, activeSince time.Time) (*omap.Map, error) {
+	if !activeSince.IsZero() {
+		withStatus = true
+	}
 	var chats []*omap.Map
 	for _, rule := range s.Rules() {
-		item := rule.AsMap().Set("alias", s.Ref(rule.Alias))
+		item := rule.AsMapVia().Set("alias", s.Ref(rule.Alias))
 		if rule.Read {
 			path := FeedPath(s, rule.Alias)
 			feed := omap.New().Set("path", path).Set("last_id", LastID(path))
@@ -94,6 +103,17 @@ func ListChats(ctx context.Context, s *config.Settings, withStatus bool) (*omap.
 		for i, rule := range s.Rules() {
 			chats[i].Merge(status[rule.Alias])
 		}
+		if !activeSince.IsZero() {
+			var active []*omap.Map
+			for _, item := range chats {
+				v, _ := item.Get("last_message_at")
+				at, err := time.Parse(time.RFC3339, fmt.Sprint(v))
+				if err == nil && !at.Before(activeSince) {
+					active = append(active, item)
+				}
+			}
+			chats = active
+		}
 	}
 	if chats == nil {
 		chats = []*omap.Map{}
@@ -107,7 +127,33 @@ func ListChats(ctx context.Context, s *config.Settings, withStatus bool) (*omap.
 	case len(notes) > 0:
 		out.Set("account_notes", notesView(notes))
 	}
-	return out.Set("send_policy", s.SendPolicy).Set("chats", chats), nil
+	out.Set("send_policy", s.SendPolicy)
+	if !activeSince.IsZero() {
+		out.Set("active_since", activeSince.UTC().Format(time.RFC3339)).Set("total_chats", len(s.Rules()))
+	}
+	if len(s.Sets) > 0 {
+		out.Set("sets", setsView(s))
+	}
+	return out.Set("chats", chats), nil
+}
+
+// setsView — какие группы чатов открыты и сколько в них сейчас.
+func setsView(s *config.Settings) []*omap.Map {
+	st := config.LoadSetsState()
+	var out []*omap.Map
+	for _, set := range s.Sets {
+		state := st.Sets[set.Key]
+		item := omap.New().Set("set", set.Label()).Set("can_read", set.Read).Set("can_send", set.Send).
+			Set("auto_send", set.AutoSend()).Set("chats", len(state.Members))
+		if state.Error != "" {
+			item.Set("error", state.Error)
+		}
+		if set.Note != "" {
+			item.Set("note", set.Note)
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 // ReadOpts — что читать.
@@ -121,6 +167,8 @@ type ReadOpts struct {
 	Transcribe bool
 	// Topic — только эта тема форума (0 — все)
 	Topic int
+	// Since — только сообщения не раньше этого времени (ноль — без границы)
+	Since time.Time
 }
 
 // ReadChat — tg_read_chat / tg_search_chat.
@@ -132,6 +180,9 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 	rule, err := readable(s, chat)
 	if err != nil {
 		return nil, err
+	}
+	if !o.Since.IsZero() && o.Limit <= 0 {
+		o.Limit = s.MaxLimit // «за сутки» — сколько можно за раз, а не 50
 	}
 	limit := clamp(o.Limit, s)
 	if len(o.IDs) > s.MaxLimit {
@@ -161,6 +212,9 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 	if o.Topic != 0 {
 		kv = append(kv, "topic", o.Topic)
 	}
+	if !o.Since.IsZero() {
+		kv = append(kv, "since", o.Since)
+	}
 	logEvent(s, "read", kv...)
 	var oldest, newest any
 	if len(messages) > 0 {
@@ -177,8 +231,15 @@ func ReadChat(ctx context.Context, s *config.Settings, chat string, o ReadOpts) 
 	if topic != nil {
 		out.Set("topic", topic)
 	}
-	return out.Set("count", len(messages)).
-		Set("oldest_id", oldest).Set("newest_id", newest).Set("messages", messages), nil
+	out.Set("count", len(messages)).Set("oldest_id", oldest).Set("newest_id", newest)
+	if !o.Since.IsZero() {
+		out.Set("since", o.Since.UTC().Format(time.RFC3339))
+		if len(messages) >= limit {
+			out.Set("more", fmt.Sprintf("Это последние %d; есть и старше, но позже since — "+
+				"tg_read_chat(chat=%q, since=…, before_id=%v).", limit, s.Ref(rule.Alias), oldest))
+		}
+	}
+	return out.Set("messages", messages), nil
 }
 
 // readTelegram — тело ReadChat для Telegram.
@@ -195,6 +256,14 @@ func readTelegram(ctx context.Context, s *config.Settings, rule config.ChatRule,
 				return err
 			}
 			*topic = omap.New().Set("id", o.Topic).Set("title", title)
+		}
+		if !o.Since.IsZero() && len(o.IDs) == 0 {
+			// «с такого-то времени» = после последнего сообщения раньше него
+			edge, err := c.IDBefore(ctx, t, int(o.Since.Unix()))
+			if err != nil {
+				return err
+			}
+			o.AfterID = max(o.AfterID, edge)
 		}
 		var batch *tgc.Batch
 		if len(o.IDs) > 0 {

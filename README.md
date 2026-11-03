@@ -168,6 +168,29 @@ send = false              # писать нельзя
 note = "Только чтение задач"
 ```
 
+Группа чатов — одним правилом: их состав служба пересчитывает сама (раз в
+10 минут и сразу после правки), новые чаты группы открываются без запроса:
+
+```toml
+[[folder]]                # папка Telegram (id из tg_list_folders; можно name = "…")
+id = 3
+name = "Новости"
+read = true
+send = false
+exclude = [-1001234567890, "@spam"]   # кроме этих
+
+[public_channels]         # все каналы с @username, на которые подписан; только чтение
+read = true
+
+[manage]
+folders = true            # агенты раскладывают чаты по папкам и архиву (без доступа к сообщениям)
+```
+
+Чат со своим `[[chat]]` живёт по своим правам, а не по группе. Чат, который
+агент сам положил в открытую папку или достал из архива, через группу не
+открывается (`data/chat_sets.json`, `blocked`); открыть такие — заново
+открыть папку (`tg allow --folder …` или кнопка) либо отдельным `[[chat]]`.
+
 Проверить настройку целиком:
 
 ```powershell
@@ -252,7 +275,11 @@ tg dialogs [--filter x]      все диалоги (вкл. архив) — ис
 tg allow <alias> --match x   найти чат по имени и добавить в белый список
 tg allow <alias> --id -100…  то же, но по готовому id
 tg allow <alias> [--send [--auto]] [--no-read]   поменять права
+tg allow --folder <id|имя> [--send [--auto]]     открыть папку целиком
+tg allow --public-channels   открыть все публичные каналы на чтение
+tg allow --manage-folders    агенты раскладывают чаты по папкам и архиву
 tg deny <alias>              убрать чат из белого списка
+tg deny --folder X | --public-channels | --manage-folders   закрыть
 tg chats [--status]          что разрешено агентам (+ непрочитанные)
 tg read <alias> [--limit N] [--search x]
 tg drafts [--status pending] очередь черновиков от агентов
