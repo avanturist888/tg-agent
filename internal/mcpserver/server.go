@@ -114,7 +114,8 @@ func localPaths(doc string) string {
 
 type listChatsIn struct {
 	WithStatus  bool   `json:"with_status,omitempty" jsonschema:"ещё и непрочитанные и превью последнего сообщения"`
-	ActiveSince string `json:"active_since,omitempty" jsonschema:"только чаты, где писали с этого времени: 24h, 2d или дата 2026-11-02 (вместе со статусом)"`
+	ActiveSince string `json:"active_since,omitempty" jsonschema:"только чаты, где писали с этого времени: 24h, 2d или дата 2026-11-02 (вместе со статусом), включая чаты групп"`
+	Set         string `json:"set,omitempty" jsonschema:"чаты группы из sets: название папки или public_channels; all — все чаты"`
 }
 
 type readChatIn struct {
@@ -319,10 +320,12 @@ with_status=true дополнительно тянет число непрочи
 active_since="24h" (или дата) — только чаты, где писали с этого времени,
 сразу со статусом: так видно, какие каналы читать за сутки.
 
-Чат с via открыт не сам по себе, а правилом на группу: папку или все
-публичные каналы (sets — какие группы открыты). Состав группы служба
-обновляет сама: новый канал или чат, положенный владельцем в папку,
-появляется здесь без запроса доступа.
+Группы чатов (sets): владелец может открыть папку или все публичные
+каналы одним правилом — их бывают сотни, поэтому по умолчанию в chats
+только отдельно открытые чаты, а у групп — число чатов. Чаты группы —
+set="<папка>" / set="public_channels" (all — все сразу) или active_since:
+у них via — через какую группу открыт. Состав группы служба обновляет
+сама; обращаться к такому чату можно и не видя его в списке.
 
 У читаемых чатов есть feed: path — локальный файл, куда служба сразу по
 приходу дописывает id новых сообщений (по одному на строку), last_id —
@@ -346,7 +349,7 @@ notes (заметки владельца и агентов об аккаунте
 				if err != nil {
 					return nil, err
 				}
-				return core.ListChatsSince(ctx, s, in.WithStatus, since)
+				return core.ListChatsWith(ctx, s, core.ListOpts{WithStatus: in.WithStatus, ActiveSince: since, Set: in.Set})
 			})
 		})
 

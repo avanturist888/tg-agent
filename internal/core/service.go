@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -63,22 +64,73 @@ func sendable(s *config.Settings, chat string) (config.ChatRule, error) {
 
 // ListChats — tg_list_chats.
 func ListChats(ctx context.Context, s *config.Settings, withStatus bool) (*omap.Map, error) {
-	return ListChatsSince(ctx, s, withStatus, time.Time{})
+	return ListChatsWith(ctx, s, ListOpts{WithStatus: withStatus})
 }
 
-// ListChatsSince — tg_list_chats; activeSince не ноль — только чаты, где
-// последнее сообщение не раньше него (вместе со статусом).
-func ListChatsSince(ctx context.Context, s *config.Settings, withStatus bool, activeSince time.Time) (*omap.Map, error) {
-	if !activeSince.IsZero() {
-		withStatus = true
+// ListOpts — что показать в tg_list_chats.
+type ListOpts struct {
+	WithStatus bool
+	// ActiveSince не ноль — только чаты, где последнее сообщение не раньше
+	// него (вместе со статусом), в том числе чаты групп
+	ActiveSince time.Time
+	// Set — чаты этой группы (название папки, её id, public_channels) или
+	// "all" — все. Без Set и ActiveSince чаты групп не перечисляются: их
+	// бывают сотни, а список читает каждый агент первым делом
+	Set string
+}
+
+// listedRules — правила, которые попадут в список.
+func listedRules(s *config.Settings, o ListOpts) ([]config.ChatRule, error) {
+	var label string
+	switch set := strings.TrimSpace(o.Set); {
+	case set == "" || strings.EqualFold(set, "all"):
+	default:
+		for _, cs := range s.Sets {
+			if strings.EqualFold(set, cs.Key) || strings.EqualFold(set, cs.Folder) || strings.EqualFold(set, cs.Name) ||
+				strings.EqualFold(set, cs.Label()) || (cs.Public && strings.EqualFold(set, "public_channels")) {
+				label = cs.Label()
+			}
+		}
+		if label == "" {
+			var names []string
+			for _, cs := range s.Sets {
+				names = append(names, cs.Label())
+			}
+			return nil, &Bad{Msg: fmt.Sprintf("Группы «%s» нет. Открыты: %s; все сразу — set=\"all\".", set, strings.Join(names, ", "))}
+		}
+	}
+	var out []config.ChatRule
+	for _, r := range s.Rules() {
+		switch {
+		case label != "":
+			if !slices.Contains(strings.Split(r.Via, ", "), label) {
+				continue
+			}
+		case r.Via != "" && o.Set == "" && o.ActiveSince.IsZero():
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// ListChatsWith — tg_list_chats.
+func ListChatsWith(ctx context.Context, s *config.Settings, o ListOpts) (*omap.Map, error) {
+	withStatus := o.WithStatus || !o.ActiveSince.IsZero()
+	rules, err := listedRules(s, o)
+	if err != nil {
+		return nil, err
 	}
 	var chats []*omap.Map
-	for _, rule := range s.Rules() {
+	for _, rule := range rules {
 		item := rule.AsMapVia().Set("alias", s.Ref(rule.Alias))
+		if rule.Via != "" {
+			item.Delete("note") // заметка группы — в sets, а не у каждого из сотни чатов
+		}
 		if rule.Read {
 			path := FeedPath(s, rule.Alias)
 			feed := omap.New().Set("path", path).Set("last_id", LastID(path))
-			if s.Agent != nil {
+			if s.Agent != nil || rule.Via != "" {
 				feed = omap.New().Set("last_id", LastID(path)) // путь на диске шлюза агенту ни к чему
 			}
 			item.Set("feed", feed)
@@ -93,22 +145,22 @@ func ListChatsSince(ctx context.Context, s *config.Settings, withStatus bool, ac
 		} else {
 			err = tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
 				var err error
-				status, err = c.ChatStatus(ctx, s.Rules())
+				status, err = c.ChatStatus(ctx, rules)
 				return err
 			})
 		}
 		if err != nil {
 			return nil, err
 		}
-		for i, rule := range s.Rules() {
+		for i, rule := range rules {
 			chats[i].Merge(status[rule.Alias])
 		}
-		if !activeSince.IsZero() {
+		if !o.ActiveSince.IsZero() {
 			var active []*omap.Map
 			for _, item := range chats {
 				v, _ := item.Get("last_message_at")
 				at, err := time.Parse(time.RFC3339, fmt.Sprint(v))
-				if err == nil && !at.Before(activeSince) {
+				if err == nil && !at.Before(o.ActiveSince) {
 					active = append(active, item)
 				}
 			}
@@ -128,13 +180,23 @@ func ListChatsSince(ctx context.Context, s *config.Settings, withStatus bool, ac
 		out.Set("account_notes", notesView(notes))
 	}
 	out.Set("send_policy", s.SendPolicy)
-	if !activeSince.IsZero() {
-		out.Set("active_since", activeSince.UTC().Format(time.RFC3339)).Set("total_chats", len(s.Rules()))
+	if !o.ActiveSince.IsZero() {
+		out.Set("active_since", o.ActiveSince.UTC().Format(time.RFC3339)).Set("total_chats", len(rules))
 	}
 	if len(s.Sets) > 0 {
 		out.Set("sets", setsView(s))
 	}
 	return out.Set("chats", chats), nil
+}
+
+func setRef(set config.ChatSet) string {
+	switch {
+	case set.Public:
+		return "public_channels"
+	case set.Name != "":
+		return set.Name
+	}
+	return set.Folder
 }
 
 // setsView — какие группы чатов открыты и сколько в них сейчас.
@@ -144,7 +206,8 @@ func setsView(s *config.Settings) []*omap.Map {
 	for _, set := range s.Sets {
 		state := st.Sets[set.Key]
 		item := omap.New().Set("set", set.Label()).Set("can_read", set.Read).Set("can_send", set.Send).
-			Set("auto_send", set.AutoSend()).Set("chats", len(state.Members))
+			Set("auto_send", set.AutoSend()).Set("chats", len(state.Members)).
+			Set("list", fmt.Sprintf("tg_list_chats(set=%q) или active_since", setRef(set)))
 		if state.Error != "" {
 			item.Set("error", state.Error)
 		}

@@ -76,7 +76,7 @@ func TestManageNeedsRight(t *testing.T) {
 	ctx := context.Background()
 	var d *Denied
 	for name, s := range map[string]*config.Settings{
-		"без права":  {},
+		"без права": {},
 		"контейнер": {Agent: &config.Agent{Name: "bala"}, Manage: config.Manage{Folders: true}},
 	} {
 		if _, err := UnfiledChats(ctx, s, ""); !errors.As(err, &d) {

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ func TestParseSince(t *testing.T) {
 func TestAssignSetAliases(t *testing.T) {
 	s := &config.Settings{
 		Chats: map[string]config.ChatRule{
-			"durov":    {Alias: "durov"},                           // явный — занят
+			"durov":    {Alias: "durov"},                             // явный — занят
 			"chat1003": {Alias: "chat1003", Via: "публичные каналы"}, // временный из группы — не занимает
 		},
 		Sets: []config.ChatSet{{Key: "folder:1"}, {Key: config.PublicChannelsKey, Public: true}},
@@ -81,5 +82,47 @@ func TestMemberDiff(t *testing.T) {
 	added, removed := memberDiff(was, now)
 	if len(added) != 1 || added[0].Peer != 3 || len(removed) != 1 || removed[0].Peer != 1 {
 		t.Fatalf("added %v removed %v", added, removed)
+	}
+}
+
+func TestListedRules(t *testing.T) {
+	s := &config.Settings{
+		Chats: map[string]config.ChatRule{
+			"saved": {Alias: "saved"},
+			"news":  {Alias: "news", Via: "папка «Новости»"},
+			"both":  {Alias: "both", Via: "папка «Новости», публичные каналы"},
+			"chan":  {Alias: "chan", Via: "публичные каналы"},
+		},
+		ChatOrder: []string{"saved", "news", "both", "chan"},
+		Sets:      []config.ChatSet{{Key: "folder:3", Folder: "3", Name: "Новости"}, {Key: config.PublicChannelsKey, Public: true}},
+	}
+	aliases := func(o ListOpts) string {
+		rules, err := listedRules(s, o)
+		if err != nil {
+			return "ошибка: " + err.Error()
+		}
+		var out []string
+		for _, r := range rules {
+			out = append(out, r.Alias)
+		}
+		return strings.Join(out, ",")
+	}
+	for _, c := range []struct {
+		o    ListOpts
+		want string
+	}{
+		{ListOpts{}, "saved"},
+		{ListOpts{Set: "all"}, "saved,news,both,chan"},
+		{ListOpts{Set: "Новости"}, "news,both"},
+		{ListOpts{Set: "3"}, "news,both"},
+		{ListOpts{Set: "public_channels"}, "both,chan"},
+		{ListOpts{ActiveSince: time.Now()}, "saved,news,both,chan"},
+	} {
+		if got := aliases(c.o); got != c.want {
+			t.Errorf("%+v → %s, ждали %s", c.o, got, c.want)
+		}
+	}
+	if got := aliases(ListOpts{Set: "нет"}); !strings.HasPrefix(got, "ошибка") {
+		t.Errorf("неизвестная группа: %s", got)
 	}
 }
