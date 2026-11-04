@@ -972,6 +972,8 @@ func finishDraft(ctx context.Context, s *config.Settings, rule config.ChatRule, 
 		what, button = "опрос УЙДЁТ САМ", "«Отправить» отправляет опрос сам"
 	case d.Vote != nil:
 		what, button = "голос УЙДЁТ САМ", "«Проголосовать» голосует само"
+	case d.Bot != nil:
+		what, button = "действие в BotFather ВЫПОЛНИТСЯ САМО", "«Выполнить» проводит диалог с BotFather само"
 	}
 	if auto {
 		card := s.BotReady() && Notify(ctx, s, d, rule.Title, note) != 0
@@ -1076,6 +1078,14 @@ func deliverTelegram(ctx context.Context, s *config.Settings, rule config.ChatRu
 			return err
 		}
 		t.Topic = d.Topic
+		if d.Bot != nil { // действие в BotFather: диалог ведёт служба, токен — в хранилище
+			r, err := runBotOp(ctx, s, c, t, d)
+			if err != nil {
+				return err
+			}
+			result.Merge(r)
+			return nil
+		}
 		r, err := sendDraft(ctx, c, t, d)
 		if err != nil {
 			return err

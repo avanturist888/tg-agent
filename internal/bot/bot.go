@@ -262,6 +262,9 @@ func heading(d *outbox.Draft) string {
 		if d.Vote != nil {
 			return who + " голосует от вашего имени (автоотправка)"
 		}
+		if d.Bot != nil {
+			return who + " выполняет действие в BotFather (автоотправка)"
+		}
 		return who + " отправляет сообщение (автоотправка)"
 	}
 	if d.Poll != nil {
@@ -269,6 +272,9 @@ func heading(d *outbox.Draft) string {
 	}
 	if d.Vote != nil {
 		return who + " просит проголосовать от вашего имени"
+	}
+	if d.Bot != nil {
+		return who + " просит выполнить действие в BotFather"
 	}
 	return who + " просит отправить сообщение"
 }
@@ -314,6 +320,8 @@ func CardMarkdown(d *outbox.Draft, title, note, status string) string {
 		body = pollMD(d.Poll)
 	} else if d.Vote != nil {
 		body = "🗳 " + MDEscape(voteLine(d.Vote))
+	} else if d.Bot != nil {
+		body = "🤖 " + MDEscape(BotLine(d.Bot))
 	} else if d.Text != "" {
 		body = d.Text
 		if d.Fmt != "markdown" {
@@ -325,6 +333,32 @@ func CardMarkdown(d *outbox.Draft, title, note, status string) string {
 		card += "\n\n" + Separator + "\n\n" + status
 	}
 	return card
+}
+
+// BotLine — что агент сделает в BotFather (для карточки).
+func BotLine(b *outbox.BotSpec) string {
+	token := "; токен — в хранилище tg-agent, сообщение BotFather с ним будет удалено из чата"
+	env := ""
+	if b.EnvFile != "" {
+		env = fmt.Sprintf("; ещё и в %s (%s)", b.EnvFile, b.EnvKey)
+	}
+	switch b.Action {
+	case "newbot":
+		return fmt.Sprintf("Новый бот «%s» @%s%s%s", b.Name, strings.TrimPrefix(b.Username, "@"), token, env)
+	case "token":
+		return "Взять действующий токен " + b.Bot + token + env
+	case "revoke":
+		return "Перевыпустить токен " + b.Bot + " (прежний перестанет работать)" + token + env
+	case "deletebot":
+		return "УДАЛИТЬ бота " + b.Bot + " навсегда"
+	case "purge_tokens":
+		return "Убрать из чата BotFather все сообщения с токенами (действующие — сначала в хранилище tg-agent)"
+	}
+	line := "/" + b.Action + " для " + b.Bot
+	if b.Value != "" {
+		line += ": «" + truncate(b.Value, 500) + "»"
+	}
+	return line
 }
 
 // voteLine — за что голос: «Вопрос → вариант, вариант» (или снять голос).
@@ -425,6 +459,8 @@ func CardHTML(d *outbox.Draft, title, note, status string) string {
 		body = pollHTML(d.Poll)
 	} else if d.Vote != nil {
 		body = "🗳 " + html.EscapeString(voteLine(d.Vote))
+	} else if d.Bot != nil {
+		body = "🤖 " + html.EscapeString(BotLine(d.Bot))
 	}
 	card := strings.Join(head, "\n") + "\n\n" + body
 	if status != "" {
@@ -440,6 +476,9 @@ func verb(d *outbox.Draft) string {
 	}
 	if d.Vote != nil {
 		return "Проголосовать"
+	}
+	if d.Bot != nil {
+		return "Выполнить"
 	}
 	return "Отправить"
 }

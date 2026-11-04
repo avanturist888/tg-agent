@@ -77,6 +77,18 @@ type VoteSpec struct {
 	Labels    []string `json:"labels"`
 }
 
+// BotSpec — не сообщение, а действие в BotFather (tg_botfather): служба сама
+// ведёт диалог, токен из ответа кладёт в хранилище и удаляет из чата.
+type BotSpec struct {
+	Action   string `json:"action"`             // newbot, token, revoke, setname, …, purge_tokens
+	Bot      string `json:"bot,omitempty"`      // @username бота (кроме newbot и purge_tokens)
+	Name     string `json:"name,omitempty"`     // newbot: отображаемое имя
+	Username string `json:"username,omitempty"` // newbot: username, кончается на bot
+	Value    string `json:"value,omitempty"`    // новое значение для set*
+	EnvFile  string `json:"env_file,omitempty"` // куда ещё записать токен (KEY=… в .env)
+	EnvKey   string `json:"env_key,omitempty"`
+}
+
 // KindPhoto — файл уходит фотографией (Telegram покажет его прямо в ленте).
 const KindPhoto = "photo"
 
@@ -111,6 +123,8 @@ type Draft struct {
 	Poll *PollSpec
 	// Vote — не сообщение, а голос владельца в опросе
 	Vote *VoteSpec
+	// Bot — не сообщение, а действие в BotFather
+	Bot *BotSpec
 
 	extra *omap.Map // поля от других версий — возвращаем при записи как есть
 }
@@ -120,7 +134,7 @@ var known = map[string]bool{
 	"status": true, "origin": true, "approved_at": true, "sent_at": true, "message_id": true,
 	"bot_message_id": true, "fmt": true, "files": true, "send_error": true, "note": true,
 	"history": true, "send_at": true, "topic": true, "topic_title": true, "edit_of": true, "edit_old": true,
-	"poll": true, "vote": true,
+	"poll": true, "vote": true, "bot": true,
 }
 
 func (d *Draft) MarshalJSON() ([]byte, error) {
@@ -156,6 +170,9 @@ func (d *Draft) MarshalJSON() ([]byte, error) {
 	if d.Vote != nil {
 		m.Set("vote", d.Vote)
 	}
+	if d.Bot != nil {
+		m.Set("bot", d.Bot)
+	}
 	return m.MarshalJSON()
 }
 
@@ -189,6 +206,7 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		EditOld      string            `json:"edit_old"`
 		Poll         *PollSpec         `json:"poll"`
 		Vote         *VoteSpec         `json:"vote"`
+		Bot          *BotSpec          `json:"bot"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
@@ -199,6 +217,7 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		SentAt: aux.SentAt, MessageID: aux.MessageID, BotMessageID: aux.BotMessageID, Fmt: aux.Fmt,
 		Files: aux.Files, SendError: aux.SendError, Note: aux.Note, History: aux.History, SendAt: aux.SendAt,
 		Topic: aux.Topic, TopicTitle: aux.TopicTitle, EditOf: aux.EditOf, EditOld: aux.EditOld, Poll: aux.Poll, Vote: aux.Vote,
+		Bot: aux.Bot,
 	}
 	if d.Status == "" {
 		d.Status = Pending
@@ -366,6 +385,8 @@ type CreateOpts struct {
 	Poll *PollSpec
 	// Vote — голос в опросе вместо сообщения
 	Vote *VoteSpec
+	// Bot — действие в BotFather вместо сообщения
+	Bot *BotSpec
 }
 
 func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
@@ -396,6 +417,7 @@ func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
 		EditOld:    opts.EditOld,
 		Poll:       opts.Poll,
 		Vote:       opts.Vote,
+		Bot:        opts.Bot,
 	}
 	if opts.SendAt != nil {
 		at := audit.FormatTime(*opts.SendAt)

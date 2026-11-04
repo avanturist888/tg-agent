@@ -262,6 +262,17 @@ type pollVotesIn struct {
 	Limit     int    `json:"limit,omitempty" jsonschema:"сколько голосов вернуть (по умолчанию и максимум 500)"`
 }
 
+type botFatherIn struct {
+	Action   string `json:"action" jsonschema:"newbot, token, revoke, setname, setdescription, setabouttext, setcommands, deletecommands, setprivacy, setjoingroups, setinline, deletebot, purge_tokens"`
+	Bot      string `json:"bot,omitempty" jsonschema:"@username бота (кроме newbot и purge_tokens)"`
+	Name     string `json:"name,omitempty" jsonschema:"newbot: отображаемое имя"`
+	Username string `json:"username,omitempty" jsonschema:"newbot: username, латиница, кончается на bot"`
+	Value    string `json:"value,omitempty" jsonschema:"новое значение для set*: имя, описание, строки «команда - описание», Enable/Disable"`
+	EnvFile  string `json:"env_file,omitempty" jsonschema:"newbot/token/revoke: ещё и записать токен в этот .env (абсолютный путь)"`
+	EnvKey   string `json:"env_key,omitempty" jsonschema:"имя переменной в env_file, например TG_BOT_TOKEN"`
+	Note     string `json:"note,omitempty" jsonschema:"зачем — показывается владельцу в карточке"`
+}
+
 type voteIn struct {
 	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
 	MessageID int64  `json:"message_id" jsonschema:"id сообщения с опросом"`
@@ -830,7 +841,47 @@ option — только голоса за этот вариант.`},
 			})
 		})
 
-	mcp.AddTool(server, &mcp.Tool{Name: "tg_vote", Description: `Проголосовать в опросе от имени владельца (или снять его голос). САМО ПО СЕБЕ НЕ ГОЛОСУЕТ —
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_botfather", Description: `Действие с ботами Telegram владельца через BotFather. САМО ПО СЕБЕ НЕ ВЫПОЛНЯЕТ — это черновик, как сообщение.
+
+Диалог с BotFather ведёт служба, а не ты: команды и ответы на вопросы
+BotFather уходят по одной, ответы ты получишь в итоге (botfather_replies).
+Токен бота из ответа служба проверяет (getMe), кладёт в хранилище tg-agent
+и сразу удаляет сообщение с ним из чата — ни тебе, ни в чат он не попадает.
+
+action:
+  newbot (name, username) — завести бота; token (bot) — взять действующий
+  токен в хранилище; revoke (bot) — перевыпустить токен (прежний перестанет
+  работать); setname / setdescription / setabouttext / setcommands /
+  setprivacy / setjoingroups / setinline (bot, value); deletecommands (bot);
+  deletebot (bot) — удалить навсегда, только кнопкой владельца;
+  purge_tokens — убрать из чата все сообщения с токенами (действующие
+  сначала — в хранилище).
+env_file + env_key — для newbot/token/revoke: ещё и записать токен строкой
+KEY=… в этот .env на этой машине. Иначе токен — трубой:
+bin\tg.exe bot-token @бот | <куда> (не печатай его). Боты в хранилище —
+tg_bots.
+
+Дальше — tg_wait_approval(draft_id): в ответе botfather — что ответил
+BotFather (токены скрыты), token_saved — какой бот сохранён. Нужен чат
+BotFather с отправкой (если нет — tg_request_access(chat_id=93372553, send=true)).`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in botFatherIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.DraftBotOp(ctx, s, outbox.BotSpec{Action: in.Action, Bot: in.Bot, Name: in.Name,
+					Username: in.Username, Value: in.Value, EnvFile: in.EnvFile, EnvKey: in.EnvKey}, in.Note)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_bots", Annotations: readOnly, Description: `Боты владельца, чьи токены лежат в хранилище tg-agent: @username, id, когда и откуда сохранён, куда ещё записан.
+
+Токенов не показывает. Взять токен — только трубой: bin\tg.exe bot-token @бот | …
+Пополняется tg_botfather (newbot, token, revoke, purge_tokens).`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 30*time.Second, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.ListBots(s)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_vote",Description: `Проголосовать в опросе от имени владельца (или снять его голос). САМО ПО СЕБЕ НЕ ГОЛОСУЕТ —
 кроме чатов с автоотправкой.
 
 Голос («приду», «беру») — обещание от имени владельца, поэтому он идёт тем

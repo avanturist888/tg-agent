@@ -564,8 +564,22 @@ func cmdBotToken(ctx context.Context, args []string) int {
 	limit := fs.Int("limit", 10, "сколько последних сообщений смотреть")
 	pos, err := parse(fs, args)
 	if err != nil || len(pos) != 1 {
-		fmt.Fprintln(os.Stderr, "Использование: tg bot-token <alias> [--limit N] | <куда положить токен>")
+		fmt.Fprintln(os.Stderr, "Использование: tg bot-token @бот | <куда положить токен>   (из хранилища, см. tg_bots)\n"+
+			"            tg bot-token <alias чата> [--limit N] | …        (самый свежий токен в последних сообщениях)")
 		return 2
+	}
+	if strings.HasPrefix(pos[0], "@") {
+		if _, err := settings(); err != nil { // профиль и пути данных
+			return fail(err)
+		}
+		tok, ok := core.VaultToken(pos[0])
+		if !ok {
+			fmt.Fprintf(os.Stderr, "Бота %s нет в хранилище — tg_botfather(action=\"token\", bot=%q) положит его туда.\n", pos[0], pos[0])
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "токен %s из хранилища (в stdout, без перевода строки)\n", pos[0])
+		fmt.Print(tok)
+		return 0
 	}
 	var res service.BotToken
 	if err := service.Do(ctx, "bot_token", service.BotTokenArgs{Chat: pos[0], Limit: *limit}, &res); err != nil {

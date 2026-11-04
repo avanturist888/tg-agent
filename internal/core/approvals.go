@@ -540,6 +540,12 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 		}
 		return nil, err
 	}
+	if d.Status == outbox.Approved && d.SendError != nil && d.Bot != nil {
+		return omap.New().Set("draft_id", draftID).Set("chat", s.Ref(d.Chat)).Set("status", "send_failed").
+			Set("error", *d.SendError).Set("botfather", botOpResult(s, draftID)).Set("hint",
+			"Действие в BotFather не вышло (error, botfather_replies). Повтор — tg_send_draft(draft_id) "+
+				"или новый tg_botfather, если BotFather отказал по существу."), nil
+	}
 	if d.Status == outbox.Approved && d.SendError != nil {
 		return omap.New().Set("draft_id", draftID).Set("chat", s.Ref(d.Chat)).Set("status", "send_failed").
 			Set("error", *d.SendError).Set("hint",
@@ -571,8 +577,14 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 	default:
 		hint = "Человек пока не нажал кнопку. Карточка в боте жива: сообщи об этом и займись другим."
 	}
-	return omap.New().Set("draft_id", draftID).Set("chat", s.Ref(d.Chat)).Set("status", status).
-		Set("message_id", d.MessageID).Set("hint", hint), nil
+	out := omap.New().Set("draft_id", draftID).Set("chat", s.Ref(d.Chat)).Set("status", status).
+		Set("message_id", d.MessageID).Set("hint", hint)
+	if d.Bot != nil {
+		if r := botOpResult(s, draftID); r != nil {
+			out.Set("botfather", r)
+		}
+	}
+	return out, nil
 }
 
 // RecoverInterrupted досылает то, что одобрили кнопкой (или автоотправкой),
