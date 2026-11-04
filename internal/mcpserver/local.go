@@ -8,6 +8,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"tgagent/internal/omap"
+	"tgagent/internal/secret"
 )
 
 // Инструменты можно вызывать и без stdio: служба и `tg tool-call` поднимают
@@ -64,7 +65,7 @@ func CallTool(ctx context.Context, name string, args json.RawMessage) (*mcp.Call
 
 // Failed — результат-ошибка в том же виде, что у инструментов.
 func Failed(err error) *mcp.CallToolResult {
-	text := omap.Pretty(omap.New().Set("error", ErrorKind(err)).Set("message", err.Error()))
+	text := secret.Mask(omap.Pretty(omap.New().Set("error", ErrorKind(err)).Set("message", err.Error())))
 	return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: text}}}
 }
 

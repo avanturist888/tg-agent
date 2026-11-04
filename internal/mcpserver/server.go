@@ -16,6 +16,7 @@ import (
 	"tgagent/internal/core"
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
+	"tgagent/internal/secret"
 	"tgagent/internal/outbox"
 	"tgagent/internal/svc"
 	"tgagent/internal/tgc"
@@ -78,8 +79,12 @@ func errorText(err error) string {
 	return omap.Pretty(omap.New().Set("error", ErrorKind(err)).Set("message", err.Error()))
 }
 
+// text — ответ агенту. Всё, что уходит агенту текстом, проходит здесь
+// (или через Failed): токены ботов из сообщений (BotFather) прячем, иначе
+// они попадают в контекст и транскрипт каждой сессии, открывшей чат или
+// хотя бы список чатов с превью.
 func text(s string) *mcp.CallToolResult {
-	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: s}}}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: secret.Mask(s)}}}
 }
 
 // run — единая точка входа: конфиг, вызов, человекочитаемая ошибка вместо трейса.
@@ -668,7 +673,7 @@ pinned, hidden. У General id = 1. Если чат добавлен в белы�
 				return text(errorText(err)), nil, nil
 			}
 			return &mcp.CallToolResult{Content: []mcp.Content{
-				&mcp.TextContent{Text: omap.Pretty(meta)},
+				&mcp.TextContent{Text: secret.Mask(omap.Pretty(meta))},
 				&mcp.ImageContent{Data: img.Data, MIMEType: "image/" + img.Format},
 			}}, nil, nil
 		})

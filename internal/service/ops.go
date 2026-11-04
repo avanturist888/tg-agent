@@ -40,6 +40,16 @@ type ToolArgs struct {
 	Local bool `json:"local,omitempty"`
 }
 
+type BotTokenArgs struct {
+	Chat  string `json:"chat"`
+	Limit int    `json:"limit"`
+}
+
+type BotToken struct {
+	Token     string `json:"token"`
+	MessageID int    `json:"message_id"`
+}
+
 type LimitArgs struct {
 	Limit int `json:"limit"`
 }
@@ -175,6 +185,11 @@ func init() {
 		"max_status": {local: true, fn: func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return core.MaxState(ctx)
 		}},
+		// токен бота из ответа BotFather — только трубой в настройки (tg bot-token)
+		"bot_token": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, a BotTokenArgs) (any, error) {
+			tok, id, err := core.LastBotToken(ctx, s, a.Chat, a.Limit)
+			return BotToken{Token: tok, MessageID: id}, err
+		})},
 		"dialogs": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, a LimitArgs) (any, error) {
 			if s.IsMAX() {
 				return maxDialogRows(ctx)

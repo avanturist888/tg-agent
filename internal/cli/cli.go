@@ -82,6 +82,7 @@ func init() {
 		{name: "deny", help: "убрать чат из белого списка", run: cmdDeny},
 		{name: "chats", help: "что разрешено агентам (+ непрочитанные)", run: cmdChats},
 		{name: "read", help: "прочитать чат", run: cmdRead},
+		{name: "bot-token", help: "токен бота из ответа BotFather — только в трубу: tg bot-token botfather | …", run: cmdBotToken},
 		{name: "drafts", help: "очередь черновиков от агентов", run: cmdDrafts},
 		{name: "pending", help: "что ждёт нажатия кнопки", run: cmdPending},
 		{name: "serve", help: "служба: соединение с Telegram, ленты, кнопки бота (её запускает Планировщик)", run: cmdServe},
@@ -554,6 +555,25 @@ func cmdChats(ctx context.Context, args []string) int {
 	}
 	_ = s
 	return runTool(ctx, "tg_list_chats", map[string]any{"with_status": *status})
+}
+
+// cmdBotToken печатает только токен (агентам через инструменты он не виден):
+// его место — труба прямо в настройки, а не экран и не лог.
+func cmdBotToken(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("bot-token", flag.ContinueOnError)
+	limit := fs.Int("limit", 10, "сколько последних сообщений смотреть")
+	pos, err := parse(fs, args)
+	if err != nil || len(pos) != 1 {
+		fmt.Fprintln(os.Stderr, "Использование: tg bot-token <alias> [--limit N] | <куда положить токен>")
+		return 2
+	}
+	var res service.BotToken
+	if err := service.Do(ctx, "bot_token", service.BotTokenArgs{Chat: pos[0], Limit: *limit}, &res); err != nil {
+		return fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "токен из сообщения %d (в stdout, без перевода строки)\n", res.MessageID)
+	fmt.Print(res.Token)
+	return 0
 }
 
 func cmdRead(ctx context.Context, args []string) int {
