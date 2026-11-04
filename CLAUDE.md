@@ -388,7 +388,7 @@ tg-agent убирает владельца из цепочки её достав
   черновик с `Draft.Bot` (тот же путь подтверждения; `deletebot` — всегда
   кнопкой), диалог ведёт служба (`BotDialog`: шаг → ждать ответ до 30 с;
   отказ BotFather — `/cancel` и `Denied`, без повторов), токен из ответа —
-  `getMe` → хранилище `data/bot_tokens.json` (+ по просьбе `env_file`), и
+  `getMe` → хранилище: сам токен — в диспетчере учётных данных Windows (`internal/wincred`, запись `tg-agent/bot/<username>`, как у `~/nestor/tools/cred.ps1`), в `data/bot_tokens.json` — только сведения о боте; старые записи с токеном в файле переезжают при чтении (+ по просьбе `env_file`), и
   сообщение с ним удаляется из чата (`DeleteMessages`, revoke). Итог для
   `tg_wait_approval` — `data/bot_ops.json`. `purge_tokens` чистит историю:
   действующие токены сначала в хранилище, не проверенный getMe — не

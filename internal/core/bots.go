@@ -30,6 +30,7 @@ import (
 	"tgagent/internal/outbox"
 	"tgagent/internal/secret"
 	"tgagent/internal/tgc"
+	"tgagent/internal/wincred"
 )
 
 const botFatherID int64 = 93372553
@@ -307,7 +308,7 @@ func purgeTokens(ctx context.Context, s *config.Settings, c botConn, t tgc.Targe
 			if kept[botID] {
 				continue
 			}
-			if v := vaultByID(botID); v != nil && v.Token == tok {
+			if vaultHas(botID, tok) {
 				kept[botID] = true
 				continue
 			}
@@ -345,12 +346,14 @@ func messageText(m any) (int, string, bool) {
 
 // ── хранилище токенов ────────────────────────────────────────────────────
 
-// BotEntry — бот в хранилище (data/bot_tokens.json).
+// BotEntry — бот в хранилище: сведения — data/bot_tokens.json, сам токен —
+// в диспетчере учётных данных Windows (botCredTarget), не файлом: так он не
+// уходит в бэкап и копию папки и не находится поиском по data/.
 type BotEntry struct {
 	Username string   `json:"username"`
 	BotID    string   `json:"bot_id"`
 	Name     string   `json:"name,omitempty"`
-	Token    string   `json:"token"`
+	Token    string   `json:"token,omitempty"` // только у старых записей: при чтении переезжает в диспетчер
 	SavedAt  string   `json:"saved_at"`
 	Source   string   `json:"source"`
 	Env      []string `json:"env,omitempty"` // куда ещё записан
@@ -360,12 +363,42 @@ var vaultMu sync.Mutex
 
 func vaultPath() string { return filepath.Join(config.DataPath(), "bot_tokens.json") }
 
+// botCredTarget — имя записи токена в диспетчере учётных данных.
+func botCredTarget(key string) string { return "tg-agent/bot/" + key }
+
+// credSet, credGet — диспетчер учётных данных (в тестах — подделка).
+var (
+	credSet = wincred.Set
+	credGet = wincred.Get
+)
+
+// loadVault — сведения о ботах; токены, ещё лежащие в файле, переносит в
+// диспетчер и убирает из файла. Вызывать под vaultMu.
 func loadVault() map[string]*BotEntry {
 	out := map[string]*BotEntry{}
 	if raw, err := os.ReadFile(vaultPath()); err == nil {
 		_ = json.Unmarshal(raw, &out)
 	}
+	moved := false
+	for key, e := range out {
+		if e.Token == "" {
+			continue
+		}
+		if err := credSet(botCredTarget(key), e.Token); err != nil {
+			continue // не перенёсся — пусть остаётся в файле, чем пропадёт
+		}
+		e.Token, moved = "", true
+	}
+	if moved {
+		_ = writeVault(out)
+	}
 	return out
+}
+
+// vaultToken — токен бота по ключу (username в нижнем регистре).
+func vaultToken(key string) (string, bool) {
+	tok, err := credGet(botCredTarget(key))
+	return tok, err == nil && tok != ""
 }
 
 func writeVault(v map[string]*BotEntry) error {
@@ -380,15 +413,17 @@ func writeVault(v map[string]*BotEntry) error {
 	return os.Rename(tmp, vaultPath())
 }
 
-func vaultByID(botID string) *BotEntry {
+// vaultHas — у бота с этим id в хранилище ровно этот токен.
+func vaultHas(botID, tok string) bool {
 	vaultMu.Lock()
 	defer vaultMu.Unlock()
-	for _, e := range loadVault() {
+	for key, e := range loadVault() {
 		if e.BotID == botID {
-			return e
+			cur, ok := vaultToken(key)
+			return ok && cur == tok
 		}
 	}
-	return nil
+	return false
 }
 
 type botMe struct {
@@ -429,10 +464,13 @@ func saveBotToken(ctx context.Context, s *config.Settings, tok, source string) (
 		v[key] = e
 	}
 	e.Username, e.BotID, e.Name = "@"+me.Username, strconv.FormatInt(me.ID, 10), me.FirstName
-	if e.Token != tok {
+	if cur, _ := vaultToken(key); cur != tok {
 		e.Env = nil // старый токен в тех файлах больше не действует
 	}
-	e.Token, e.SavedAt, e.Source = tok, time.Now().Format(time.RFC3339), source
+	if err := credSet(botCredTarget(key), tok); err != nil {
+		return "", fmt.Errorf("токен не записан в диспетчер учётных данных Windows: %w", err)
+	}
+	e.SavedAt, e.Source = time.Now().Format(time.RFC3339), source
 	if err := writeVault(v); err != nil {
 		return "", err
 	}
@@ -454,11 +492,11 @@ func noteEnv(username, where string) {
 func VaultToken(username string) (string, bool) {
 	vaultMu.Lock()
 	defer vaultMu.Unlock()
-	e := loadVault()[strings.ToLower(strings.TrimPrefix(strings.TrimSpace(username), "@"))]
-	if e == nil {
+	key := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(username), "@"))
+	if loadVault()[key] == nil {
 		return "", false
 	}
-	return e.Token, true
+	return vaultToken(key)
 }
 
 // ListBots — tg_bots: боты в хранилище, без токенов.

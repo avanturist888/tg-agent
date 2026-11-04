@@ -14,6 +14,7 @@ import (
 	"tgagent/internal/config"
 	"tgagent/internal/outbox"
 	"tgagent/internal/tgc"
+	"tgagent/internal/wincred"
 )
 
 const (
@@ -68,7 +69,29 @@ func botTestEnv(t *testing.T) *config.Settings {
 		return botMe{}, errors.New("getMe: Unauthorized")
 	}
 	t.Cleanup(func() { botGetMe = oldMe })
+	creds := map[string]string{} // настоящий диспетчер учётных данных тесты не трогают
+	oldSet, oldGet := credSet, credGet
+	credSet = func(target, secret string) error { creds[target] = secret; return nil }
+	credGet = func(target string) (string, error) {
+		if v, ok := creds[target]; ok {
+			return v, nil
+		}
+		return "", wincred.ErrNotFound
+	}
+	t.Cleanup(func() { credSet, credGet = oldSet, oldGet })
 	return &config.Settings{}
+}
+
+func TestVaultKeepsTokensOutOfFile(t *testing.T) {
+	botTestEnv(t)
+	// старая запись с токеном в файле переезжает в диспетчер
+	os.WriteFile(vaultPath(), []byte(`{"old_bot":{"username":"@old_bot","bot_id":"1","token":"`+liveTok+`"}}`), 0o600)
+	if tok, ok := VaultToken("@old_bot"); !ok || tok != liveTok {
+		t.Fatalf("после переезда: %q %v", tok, ok)
+	}
+	if raw, _ := os.ReadFile(vaultPath()); strings.Contains(string(raw), "AAH") {
+		t.Fatalf("токен остался в файле: %s", raw)
+	}
 }
 
 func TestRunBotOpRevoke(t *testing.T) {
@@ -96,6 +119,9 @@ func TestRunBotOpRevoke(t *testing.T) {
 	}
 	if tok, ok := VaultToken("@fresh_bot"); !ok || tok != newTok {
 		t.Fatal("нет в хранилище")
+	}
+	if raw, _ := os.ReadFile(vaultPath()); strings.Contains(string(raw), "AAHnew") {
+		t.Fatalf("токен в файле хранилища: %s", raw)
 	}
 	if b, _ := os.ReadFile(env); string(b) != "A=1\nTG_BOT_TOKEN="+newTok+"\n" {
 		t.Fatalf(".env: %q", b)
