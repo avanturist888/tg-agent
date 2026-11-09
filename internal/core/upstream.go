@@ -1,8 +1,8 @@
 package core
 
-// Слежение за обновлениями того, от чего зависит клиент MAX (internal/upstream):
-// служба основного профиля раз в час проверяет веб-клиент MAX, каталог сборок
-// Android-клиента и PyMax. Изменение сначала разбирает агент, а не владелец
+// Слежение за обновлениями того, от чего зависят клиенты MAX и Telegram
+// (internal/upstream): служба основного профиля раз в час проверяет веб-клиент
+// MAX, каталог сборок Android-клиента, PyMax и релизы gotd. Изменение сначала разбирает агент, а не владелец
 // (он не передатчик): карточка уходит в бот без звука и закрепления, а агент
 // проекта просыпается в новом треде (через Нестора) — проверяет, чинит сам и
 // снимает карточку (tg updates ack) или зовёт владельца (tg updates escalate:
@@ -243,7 +243,7 @@ func upstreamKeyboard(s *config.Settings) map[string]any {
 // upstreamBrief — изменение для агента, простым текстом.
 func upstreamBrief(r upstream.Result) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Слежение за обновлениями MAX: изменение у источника «%s» (%s).\n", r.Source.Title, r.Source.ID)
+	fmt.Fprintf(&b, "Слежение за обновлениями: изменение у источника «%s» (%s).\n", r.Source.Title, r.Source.ID)
 	for _, d := range r.Diffs {
 		fmt.Fprintf(&b, "%s: %s → %s\n", d.Label, d.Old, d.New)
 	}
@@ -279,9 +279,14 @@ func sendPinned(ctx context.Context, s *config.Settings, text, source, title, br
 	}
 	card := pinnedCard{ID: sent.MessageID, Text: text, Agent: toAgent}
 	if toAgent {
+		check := "Проверь, затрагивает ли это клиент MAX (internal/maxc, core/max*.go) и слежение (internal/upstream)."
+		for _, src := range upstream.Sources() {
+			if src.ID == source && src.Task != "" {
+				check = src.Task
+			}
+		}
 		task := brief + "\nКарточка в боте подтверждений (сообщение " + fmt.Sprint(sent.MessageID) + "). " +
-			"Проверь, затрагивает ли это клиент MAX (internal/maxc, core/max*.go) и слежение (internal/upstream). " +
-			"Нужна правка — сделай её сам по правилам проекта (CLAUDE.md). Потом: внимания владельца не нужно — " +
+			check + " Нужна правка — сделай её сам по правилам проекта (CLAUDE.md). Потом: внимания владельца не нужно — " +
 			"bin\\tg.exe updates ack " + source + " \"<вывод одной-двумя фразами>\"; нужно его решение — " +
 			"bin\\tg.exe updates escalate " + source + " \"<что именно решить>\"."
 		if err := upstreamWake(ctx, s, title, task); err != nil {

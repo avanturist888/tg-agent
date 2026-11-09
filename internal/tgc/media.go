@@ -30,6 +30,7 @@ type Image struct {
 	Format  string
 	Kind    string
 	Caption string
+	HTML    string // у виджета вместо картинки — его HTML
 }
 
 func largestPhotoSize(sizes []tg.PhotoSizeClass) (typ string, inline []byte, size int) {
@@ -90,6 +91,14 @@ func (c *Conn) FetchImage(ctx context.Context, t Target, msgID int) (*Image, err
 		mimeType = f.MIME
 	}
 	img := &Image{Caption: msg.Message}
+	if w := WidgetOf(msg); w != nil {
+		src, err := WidgetHTML(w)
+		if err != nil {
+			return nil, &Bad{fmt.Sprintf("Виджет в сообщении %d: %v.", msgID, err)}
+		}
+		img.Kind, img.HTML = "widget", src
+		return img, nil
+	}
 	var buf bytes.Buffer
 	switch {
 	case PhotoOf(msg) != nil:

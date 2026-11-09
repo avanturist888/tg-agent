@@ -1,7 +1,7 @@
 // Package upstream следит за тем, от чего зависит клиент MAX: веб-клиент MAX
 // (его версию клиент называет при входе, адрес WebSocket — оттуда же),
 // каталог сборок Android-клиента и репозиторий PyMax, с которого переносится
-// протокол. Здесь только проверки и сравнение с прошлым; расписание, бот и
+// протокол, а для Telegram — релизы gotd (новые слои схемы). Здесь только проверки и сравнение с прошлым; расписание, бот и
 // закрепление карточек — core/upstream.go.
 package upstream
 
@@ -32,6 +32,8 @@ type Source struct {
 	// (полный sha, список версий), их изменение карточку не шлёт.
 	Labels []Label
 	Check  func(ctx context.Context, c *Client, prev Values) (Values, []string, error)
+	// Task — что проверить агенту при изменении; пусто — сверить клиент MAX.
+	Task string
 }
 
 type Label struct{ Key, Text string }

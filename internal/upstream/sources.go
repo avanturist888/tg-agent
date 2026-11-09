@@ -12,7 +12,9 @@ import (
 )
 
 // Sources — что проверяем, в порядке карточек.
-func Sources() []*Source { return []*Source{MaxWeb, AndroidBuilds, PyMaxRelease, PyMaxCommits} }
+func Sources() []*Source {
+	return []*Source{MaxWeb, AndroidBuilds, PyMaxRelease, PyMaxCommits, GotdRelease}
+}
 
 const pymaxRepo = "MaxApiTeam/PyMax"
 
@@ -178,7 +180,25 @@ func checkAndroid(ctx context.Context, c *Client, prev Values) (Values, []string
 var PyMaxRelease = &Source{
 	ID: "pymax-release", Title: "релиз PyMax", URL: "https://github.com/" + pymaxRepo + "/releases",
 	Labels: []Label{{"tag", "релиз"}},
-	Check:  checkRelease,
+	Check:  releaseCheck(pymaxRepo),
+}
+
+// ── gotd (MTProto для Telegram) ─────────────────────────────────────────
+
+const gotdRepo = "gotd/td"
+
+// GotdRelease — релизы gotd/td: с ними приходят новые слои схемы Telegram.
+// 09.11.2026 go.mod стоит на коммите PR #1872 (слой 233, виджеты) до релиза.
+var GotdRelease = &Source{
+	ID: "gotd-release", Title: "релиз gotd (MTProto Telegram)", URL: "https://github.com/" + gotdRepo + "/releases",
+	Labels: []Label{{"tag", "релиз"}},
+	Check:  releaseCheck(gotdRepo),
+	Task: "Это библиотека MTProto, на которой стоит весь клиент Telegram (internal/tgc). " +
+		"Если go.mod ещё на псевдоверсии (коммит PR #1872, слой 233) — переведи его на этот релиз, " +
+		"если в нём слой не ниже (const Layer в tg/tl_registry_gen.go): go get github.com/gotd/td@<тег>, " +
+		"scripts\\build.ps1, живая проверка чтения в saved, коммит и пуш. Если go.mod уже на теге — " +
+		"посмотри, что нового в схеме (новые типы медиа, сообщений, действий), и стоит ли дать это агентам " +
+		"(принцип 4 философии): обновись так же, нужное доделай сам или отметь в выводе.",
 }
 
 var PyMaxCommits = &Source{
@@ -189,8 +209,14 @@ var PyMaxCommits = &Source{
 
 var ghHeaders = map[string]string{"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
 
-func checkRelease(ctx context.Context, c *Client, prev Values) (Values, []string, error) {
-	raw, err := c.get(ctx, c.GitHub+"/repos/"+pymaxRepo+"/releases/latest", ghHeaders)
+func releaseCheck(repo string) func(context.Context, *Client, Values) (Values, []string, error) {
+	return func(ctx context.Context, c *Client, prev Values) (Values, []string, error) {
+		return checkRelease(ctx, c, repo)
+	}
+}
+
+func checkRelease(ctx context.Context, c *Client, repo string) (Values, []string, error) {
+	raw, err := c.get(ctx, c.GitHub+"/repos/"+repo+"/releases/latest", ghHeaders)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -201,7 +227,7 @@ func checkRelease(ctx context.Context, c *Client, prev Values) (Values, []string
 		Body string `json:"body"`
 	}
 	if err := json.Unmarshal(raw, &rel); err != nil || rel.Tag == "" {
-		return nil, nil, fmt.Errorf("релиз PyMax: нет тега")
+		return nil, nil, fmt.Errorf("релиз %s: нет тега", repo)
 	}
 	cur := Values{"tag": rel.Tag, "url": rel.URL}
 	var details []string

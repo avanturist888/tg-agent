@@ -358,6 +358,9 @@ func MediaLabel(m *tg.Message) string {
 	if _, ok := m.Media.(*tg.MessageMediaPoll); ok {
 		return "poll"
 	}
+	if WidgetOf(m) != nil {
+		return "widget"
+	}
 	if doc != nil {
 		if name := fileName(doc); name != "" {
 			return "file:" + name
@@ -605,6 +608,9 @@ func (c *Conn) Serialize(m tg.MessageClass, b *Batch) *omap.Map {
 		}
 		if p := PollInfo(v); p != nil {
 			out.Set("poll", p) // вопрос, варианты с голосами; кто голосовал — tg_poll_votes
+		}
+		if w := WidgetOf(v); w != nil {
+			out.Set("widget", WidgetInfo(w)) // HTML-сообщение бота; сам HTML — tg_view_media
 		}
 		if f := File(v); f != nil && PhotoOf(v) == nil && !isSticker(DocumentOf(v)) {
 			var name any
