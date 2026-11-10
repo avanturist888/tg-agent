@@ -548,18 +548,29 @@ func (c *Conn) AudioURL(ctx context.Context, chatID, messageID, audioID int64, t
 var ErrTooLarge = errors.New("maxc: файл больше предела")
 
 // Download — скачать адрес в файл, не больше limit байт.
-func Download(ctx context.Context, src, dst string, limit int64) (int64, error) {
+// agent — User-Agent соединения (Conn.Agent): так качает браузер веб-клиента.
+func Download(ctx context.Context, src, dst string, limit int64, agent string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
 	if err != nil {
 		return 0, err
 	}
+	if agent != "" {
+		req.Header.Set("User-Agent", agent)
+	}
+	req.Header.Set("Referer", DefaultOrigin+"/")
 	res, err := HTTP.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("maxc: скачивание: %w", err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode/100 != 2 {
-		return 0, fmt.Errorf("maxc: скачивание: ответ %d", res.StatusCode)
+		// адрес подписан — его не показываем, только хост и что ответил сервер
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 300))
+		msg := strings.Join(strings.Fields(string(body)), " ")
+		if msg != "" {
+			msg = ": " + msg
+		}
+		return 0, fmt.Errorf("maxc: скачивание с %s: ответ %d%s", req.URL.Host, res.StatusCode, msg)
 	}
 	if limit > 0 && res.ContentLength > limit {
 		return 0, ErrTooLarge

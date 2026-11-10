@@ -124,6 +124,16 @@ func Dial(ctx context.Context, opts Options) (*Conn, error) {
 	return c, nil
 }
 
+// Agent — User-Agent, которым представлено соединение (браузер веб-клиента).
+// С ним же надо качать файлы: ссылки видео на okcdn подписаны под браузер
+// (srcAg), с чужим User-Agent CDN отвечает 400 «10».
+func (c *Conn) Agent() string {
+	if c.opts.UserAgent != "" {
+		return c.opts.UserAgent
+	}
+	return WebUserAgent("").HeaderUserAgent
+}
+
 // Done — закрывается вместе с соединением; причина — Err.
 func (c *Conn) Done() <-chan struct{} { return c.done }
 

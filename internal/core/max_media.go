@@ -181,12 +181,27 @@ func maxChatInfo(ctx context.Context, chatID int64) (tgc.DialogRow, error) {
 	maxRT.Lock()
 	ch, ok := maxRT.chats[chatID]
 	maxRT.Unlock()
-	if !ok {
+	// чата, которого не было в списке при входе, событие заводит заготовкой —
+	// без названия и участников (maxTrack); тогда спросить сервер, иначе
+	// владелец увидел бы в карточке id вместо названия (10.11.2026)
+	if !ok || (ch.Title == "" && len(ch.Participants) == 0 && chatID != maxc.SavedChat) {
 		chats, err := c.ChatsInfo(ctx, []int64{chatID})
 		if err != nil || len(chats) == 0 {
-			return tgc.DialogRow{}, &Bad{Msg: fmt.Sprintf("Чат %d не найден среди чатов аккаунта MAX.", chatID)}
+			if !ok {
+				return tgc.DialogRow{}, &Bad{Msg: fmt.Sprintf("Чат %d не найден среди чатов аккаунта MAX.", chatID)}
+			}
+		} else {
+			full := chats[0]
+			if ok { // последнее сообщение и непрочитанные — из событий, они свежее
+				full.LastMessage, full.LastEventTime, full.NewMessages = ch.LastMessage, ch.LastEventTime, ch.NewMessages
+			}
+			ch = full
+			maxRT.Lock()
+			if maxRT.chats != nil {
+				maxRT.chats[chatID] = ch
+			}
+			maxRT.Unlock()
 		}
-		ch = chats[0]
 	}
 	return tgc.DialogRow{ID: ch.ID, Title: maxChatTitle(ctx, c, ch), Kind: maxKind(ch.Type), Unread: ch.NewMessages}, nil
 }
@@ -366,7 +381,7 @@ func maxDownload(ctx context.Context, c *maxc.Conn, chatID int64, m *maxc.Messag
 	if st, err := os.Stat(got.Path); err == nil && st.Size() > 0 {
 		got.Size, got.Cached = st.Size(), true
 	} else {
-		n, err := maxc.Download(ctx, src, got.Path, limit)
+		n, err := maxc.Download(ctx, src, got.Path, limit, c.Agent())
 		if err != nil {
 			return nil, err
 		}
@@ -444,7 +459,7 @@ func maxViewMedia(ctx context.Context, s *config.Settings, rule config.ChatRule,
 	dir := filepath.Join(s.DownloadsDir(), rule.Alias)
 	p := filepath.Join(dir, fmt.Sprintf("%d-%s.img", m.ID, kind))
 	if _, err := os.Stat(p); err != nil {
-		if _, err := maxc.Download(ctx, src, p, 20<<20); err != nil {
+		if _, err := maxc.Download(ctx, src, p, 20<<20, c.Agent()); err != nil {
 			return nil, nil, err
 		}
 	}
