@@ -121,6 +121,16 @@ tg-agent убирает владельца из цепочки её достав
   Автора и текст для фильтров служба читает по id (`metaOf`) и держит
   только в памяти. Подписку сессии с `Dead` или из закрытого треда новая
   снимает сама (`agent_subscription_taken` в аудите).
+  Треды Codex в T3 (с 10.11.2026): у MCP Codex нет ни переменных канала
+  сессии Claude, ни `T3CODE_THREAD_ID`, зато в каждом `tools/call` есть
+  `_meta` с номером треда Codex (`threadId`, `x-codex-turn-metadata`).
+  Прослойка без своего канала передаёт `_meta` службе (`ToolArgs.Meta`),
+  служба делает из него `inbox.Addr{Session: <тред Codex>, Kind: codex}`
+  (`core.AgentFromMeta`, признаёт, только если T3 знает тред — тот же
+  `nativeThreadRef.nativeId`). Канала у него нет (`inbox.ErrNoSocket`) —
+  будит его только T3 (`wakeT3`); любой вызов из треда снимает `Dead`
+  (`Hello`). Прослойки Codex, запущенные до сборки с этим, `_meta` не
+  передают — их тредам нужен новый процесс MCP.
 - T3 Code сам останавливает процесс Claude у треда, простоявшего 30 минут
   (`ProviderSessionReaper`), — канала сессии больше нет. Запасной путь
   (`internal/t3`): тред ищется по id сессии в базе десктопа (`t3.ThreadOf`).

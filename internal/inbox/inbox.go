@@ -17,15 +17,72 @@ package inbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 )
+
+// ErrNoSocket — у сессии нет входящего канала (тред Codex).
+var ErrNoSocket = errors.New("inbox: у сессии нет входящего канала")
 
 // Addr — входящий канал сессии Claude Code.
 type Addr struct {
 	Session string `json:"session,omitempty"` // CLAUDE_CODE_SESSION_ID: не меняется при возобновлении
 	Socket  string `json:"socket"`
 	Token   string `json:"token"`
+	// Kind — "codex": тред Codex в T3. Входящего канала у него нет (Codex —
+	// один общий процесс на все треды, переменных сессии у его MCP нет), а
+	// Session — номер его треда из _meta вызова; будят его только через T3.
+	Kind string `json:"kind,omitempty"`
+}
+
+// Codex — тред Codex: будить только через T3 Code.
+func (a Addr) Codex() bool { return a.Kind == KindCodex }
+
+const KindCodex = "codex"
+
+var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// FromMeta — тред Codex из _meta вызова инструмента: Codex кладёт туда свой
+// номер треда (threadId, thread_id, в том числе внутри JSON-строки
+// x-codex-turn-metadata). nil — не Codex.
+func FromMeta(meta map[string]any) *Addr {
+	if len(meta) == 0 {
+		return nil
+	}
+	var found string
+	var walk func(any)
+	walk = func(v any) {
+		if found != "" {
+			return
+		}
+		switch x := v.(type) {
+		case map[string]any:
+			for _, k := range []string{"threadId", "thread_id"} {
+				if s, ok := x[k].(string); ok && uuidRe.MatchString(s) {
+					found = s
+					return
+				}
+			}
+			for _, val := range x {
+				walk(val)
+			}
+		case string:
+			if t := strings.TrimSpace(x); strings.HasPrefix(t, "{") {
+				var m any
+				if json.Unmarshal([]byte(t), &m) == nil {
+					walk(m)
+				}
+			}
+		}
+	}
+	walk(meta)
+	if found == "" {
+		return nil
+	}
+	return &Addr{Session: found, Kind: KindCodex}
 }
 
 // FromEnv — канал сессии, потомком которой запущен этот процесс (nil — нет).
@@ -51,6 +108,9 @@ func (a Addr) Key() string {
 
 // Send — доставить сообщение в сессию. from — подпись отправителя.
 func Send(ctx context.Context, a Addr, from, text string) error {
+	if a.Socket == "" {
+		return ErrNoSocket
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	conn, err := dial(ctx, a.Socket)

@@ -446,6 +446,21 @@ func WithAgent(ctx context.Context, a *inbox.Addr) context.Context {
 	return context.WithValue(ctx, agentKey{}, a)
 }
 
+// AgentFromMeta — тред Codex, от которого вызов: у MCP Codex нет переменных
+// сессии, номер треда — в _meta вызова (inbox.FromMeta). Признаём его, только
+// если T3 знает такой тред: будить Codex можно лишь через T3. Вызов из треда —
+// заодно знак, что он жив (Hello снимает Dead).
+func AgentFromMeta(ctx context.Context, s *config.Settings, meta map[string]any) *inbox.Addr {
+	a := inbox.FromMeta(meta)
+	if a == nil || sessionThread(ctx, a.Session) == "" {
+		return nil
+	}
+	if s != nil {
+		_ = Hello(s, *a)
+	}
+	return a
+}
+
 // AgentOf — сессия, от которой вызов (для передачи в службу другого аккаунта).
 func AgentOf(ctx context.Context) *inbox.Addr { return agentFrom(ctx) }
 
@@ -732,7 +747,7 @@ func Unsubscribe(ctx context.Context, s *config.Settings, chat string) (*omap.Ma
 // Hello — прослойка напоминает адрес канала своей сессии: после
 // возобновления он новый, а подписка та же.
 func Hello(s *config.Settings, a inbox.Addr) error {
-	if a.Socket == "" || a.Token == "" {
+	if (a.Socket == "" || a.Token == "") && !a.Codex() {
 		return nil
 	}
 	changed := false

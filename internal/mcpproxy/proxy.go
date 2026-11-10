@@ -123,7 +123,12 @@ func (p *proxy) handler(name string) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := json.RawMessage(req.Params.Arguments)
 		var res mcp.CallToolResult
-		build, err := svc.Call(ctx, "tool", service.ToolArgs{Name: name, Args: args, Agent: p.agent}, &res)
+		ta := service.ToolArgs{Name: name, Args: args, Agent: p.agent}
+		if p.agent == nil && req.Params != nil {
+			// Codex: один процесс на все треды, сессию называет только _meta вызова
+			ta.Meta = req.Params.GetMeta()
+		}
+		build, err := svc.Call(ctx, "tool", ta, &res)
 		if err == nil {
 			p.noticeBuild(build)
 			return &res, nil

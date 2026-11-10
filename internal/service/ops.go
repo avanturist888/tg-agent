@@ -35,6 +35,8 @@ type ToolArgs struct {
 	Args json.RawMessage `json:"args,omitempty"`
 	// Agent — входящий канал сессии Claude Code, от которой вызов (для tg_subscribe)
 	Agent *inbox.Addr `json:"agent,omitempty"`
+	// Meta — _meta вызова: у Codex там номер треда (Agent тогда нет)
+	Meta map[string]any `json:"meta,omitempty"`
 	// Local — вызов передала служба другого аккаунта: выполнить у себя, не
 	// маршрутизируя дальше (mcpserver/route.go)
 	Local bool `json:"local,omitempty"`
@@ -141,6 +143,16 @@ func init() {
 			a, err := decode[ToolArgs](raw)
 			if err != nil {
 				return nil, &core.Bad{Msg: "аргументы: " + err.Error()}
+			}
+			if a.Agent == nil && len(a.Meta) > 0 {
+				if s, err := config.Load(); err == nil {
+					a.Agent = core.AgentFromMeta(ctx, s, a.Meta)
+				}
+			} else if a.Agent != nil && a.Agent.Codex() {
+				// вызов передала служба другого аккаунта: тред жив и здесь
+				if s, err := config.Load(); err == nil {
+					_ = core.Hello(s, *a.Agent)
+				}
 			}
 			ctx = core.WithAgent(ctx, a.Agent)
 			if a.Local {
