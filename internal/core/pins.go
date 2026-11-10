@@ -18,6 +18,7 @@ import (
 
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 	"tgagent/internal/outbox"
 )
 
@@ -46,11 +47,7 @@ func editPins(s *config.Settings, f func(map[string]int64)) error {
 	}
 	f(pins)
 	raw, _ = json.MarshalIndent(pins, "", "  ")
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsx.WriteFile(path, raw, 0o600)
 }
 
 // pinDraftCard — закрепить карточку, которая ждёт владельца.

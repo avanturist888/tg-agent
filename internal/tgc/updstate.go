@@ -22,6 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"tgagent/internal/fsx"
+
 	"github.com/gotd/td/telegram/updates"
 )
 
@@ -86,10 +88,7 @@ func (u *updState) flush() {
 	if err != nil {
 		return
 	}
-	tmp := u.path + ".tmp"
-	if os.WriteFile(tmp, raw, 0o600) == nil {
-		_ = os.Rename(tmp, u.path)
-	}
+	_ = fsx.WriteFile(u.path, raw, 0o600)
 }
 
 // keep — сбрасывать на диск, пока служба жива, и в конце.

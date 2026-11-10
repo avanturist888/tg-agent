@@ -14,6 +14,7 @@ import (
 	"github.com/gotd/td/tg"
 
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 	"tgagent/internal/lock"
 )
 
@@ -83,11 +84,7 @@ func (c *PeerCache) Save() {
 		if err != nil {
 			return err
 		}
-		tmp := c.path + ".tmp"
-		if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-			return err
-		}
-		return os.Rename(tmp, c.path)
+		return fsx.WriteFile(c.path, raw, 0o600)
 	})
 }
 

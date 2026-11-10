@@ -15,6 +15,7 @@ import (
 	"tgagent/internal/audit"
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
@@ -78,7 +79,7 @@ func tagOffset(s *config.Settings) {
 
 func writeOffset(s *config.Settings, offset int64) {
 	raw, _ := json.Marshal(map[string]any{"offset": offset, "bot": botID(s)})
-	_ = os.WriteFile(s.OffsetPath(), raw, 0o600)
+	_ = fsx.WriteFile(s.OffsetPath(), raw, 0o600)
 }
 
 // Notify показывает черновик в боте; 0 — бот молчит.

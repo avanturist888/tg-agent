@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"tgagent/internal/fsx"
+
 	"github.com/gotd/td/tg"
 )
 
@@ -81,10 +83,7 @@ func (t *editTracker) save(now time.Time) {
 	if err != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if os.WriteFile(tmp, raw, 0o600) == nil {
-		_ = os.Rename(tmp, path)
-	}
+	_ = fsx.WriteFile(path, raw, 0o600)
 }
 
 // keep — отмечать на диске, что служба жива (и сбрасывать даты правок).

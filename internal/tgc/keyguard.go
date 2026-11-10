@@ -14,6 +14,7 @@ import (
 
 	"tgagent/internal/audit"
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 )
 
 // Защита ключа сессии.
@@ -56,15 +57,22 @@ func (g *guardedStorage) LoadSession(ctx context.Context) ([]byte, error) {
 	return g.file.LoadSession(ctx)
 }
 
+// store — запись сессии. gotd (FileStorage) пишет поверх файла: сбой питания
+// в этот момент оставил бы обрывок или нули, а войти заново может только
+// владелец. Поэтому — атомарно, со сбросом на диск.
+func (g *guardedStorage) store(data []byte) error {
+	return fsx.WriteFile(g.file.Path, data, 0o600)
+}
+
 func (g *guardedStorage) StoreSession(ctx context.Context, data []byte) error {
 	old, err := g.file.LoadSession(ctx)
 	if err != nil || len(old) == 0 {
-		return g.file.StoreSession(ctx, data)
+		return g.store(data)
 	}
 	was, now := authKeyID(old), authKeyID(data)
 	if len(was) == 0 || bytes.Equal(was, now) {
 		_ = os.Remove(g.lossPath()) // прежний ключ снова в деле
-		return g.file.StoreSession(ctx, data)
+		return g.store(data)
 	}
 	if !g.login {
 		since := g.lossSince()
@@ -82,10 +90,10 @@ func (g *guardedStorage) StoreSession(ctx context.Context, data []byte) error {
 	}
 	// сдаёмся (или это вход): прежний ключ — рядом, на случай разбирательства
 	lost := g.s.SessionPath + ".lost-" + time.Now().Format("0102-150405")
-	_ = os.WriteFile(lost, old, 0o600)
+	_ = fsx.WriteFile(lost, old, 0o600)
 	_ = os.Remove(g.lossPath())
 	_ = audit.Log(g.s.AuditPath(), "auth_key_replaced", "login", g.login, "old", lost)
-	return g.file.StoreSession(ctx, data)
+	return g.store(data)
 }
 
 func (g *guardedStorage) lossPath() string { return g.s.SessionPath + ".keyloss" }

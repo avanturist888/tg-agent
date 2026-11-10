@@ -35,6 +35,8 @@ import (
 	"strings"
 	"time"
 
+	"tgagent/internal/fsx"
+
 	"github.com/BurntSushi/toml"
 )
 
@@ -241,11 +243,7 @@ func SaveSetsState(st SetsState) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsx.WriteFile(path, raw, 0o600)
 }
 
 // IsBlocked — чат попал в группу из-за агента.

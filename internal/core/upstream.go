@@ -27,6 +27,7 @@ import (
 
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 	"tgagent/internal/upstream"
 )
 
@@ -84,11 +85,7 @@ func updatePinned(s *config.Settings, f func(map[string]pinnedCard)) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsx.WriteFile(path, raw, 0o600)
 }
 
 // RunUpstream — проверки по расписанию; одна на установку — в службе

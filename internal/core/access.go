@@ -24,6 +24,7 @@ import (
 	"tgagent/internal/bot"
 	"tgagent/internal/chatsfile"
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 	"tgagent/internal/inbox"
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
@@ -220,11 +221,7 @@ func editAccess(s *config.Settings, fn func(m map[string]*accessRequest) bool) e
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsx.WriteFile(path, raw, 0o600)
 }
 
 func rights(read, send bool) string {

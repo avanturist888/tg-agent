@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 )
 
 // Chat — запись белого списка для правки.
@@ -77,7 +78,7 @@ func load(path string) ([]string, error) {
 
 // save пишет файл и проверяет, что он читается; иначе возвращает старый.
 func save(path string, lines []string, old []byte) error {
-	if err := os.WriteFile(path, []byte(strings.Join(lines, "")), 0o600); err != nil {
+	if err := fsx.WriteFile(path, []byte(strings.Join(lines, "")), 0o600); err != nil {
 		return err
 	}
 	_, _, err := config.LoadChats(path)
@@ -85,7 +86,7 @@ func save(path string, lines []string, old []byte) error {
 		_, _, err = config.LoadSets(path)
 	}
 	if err != nil {
-		_ = os.WriteFile(path, old, 0o600)
+		_ = fsx.WriteFile(path, old, 0o600)
 		return fmt.Errorf("правка сломала бы %s, отменена: %w", path, err)
 	}
 	return nil

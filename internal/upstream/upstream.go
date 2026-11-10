@@ -14,6 +14,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"tgagent/internal/fsx"
 )
 
 // Values — что видно у источника сейчас: ключ → значение.
@@ -89,11 +91,7 @@ func (st *State) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsx.WriteFile(path, raw, 0o600)
 }
 
 // Check — проверить источники; состояние не трогает.

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 	"tgagent/internal/tgc"
@@ -81,11 +82,7 @@ func editNotes(fn func(map[string][]AccountNote) error) error {
 		if err != nil {
 			return err
 		}
-		tmp := path + ".tmp"
-		if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-			return err
-		}
-		return os.Rename(tmp, path)
+		return fsx.WriteFile(path, raw, 0o600)
 	})
 }
 
@@ -245,7 +242,7 @@ func selfLabel(ctx context.Context, s *config.Settings) string {
 		return ""
 	}
 	if raw, err := json.Marshal(u); err == nil {
-		_ = os.WriteFile(userPath(config.AccountName()), raw, 0o600)
+		_ = fsx.WriteFile(userPath(config.AccountName()), raw, 0o600)
 	}
 	return u.label()
 }

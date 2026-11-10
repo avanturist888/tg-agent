@@ -4,6 +4,8 @@ package envfile
 import (
 	"os"
 	"strings"
+
+	"tgagent/internal/fsx"
 )
 
 // Read — значения из файла (без учёта окружения процесса).
@@ -42,7 +44,7 @@ func Set(path, key, value string) error {
 		s := strings.TrimSpace(l)
 		if k, _, ok := strings.Cut(s, "="); ok && strings.TrimSpace(k) == key {
 			lines[i] = line
-			return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
+			return fsx.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
 		}
 		if strings.HasPrefix(s, "#") {
 			if k, _, ok := strings.Cut(strings.TrimSpace(strings.TrimPrefix(s, "#")), "="); ok && strings.TrimSpace(k) == key && commented < 0 {
@@ -58,5 +60,5 @@ func Set(path, key, value string) error {
 		}
 		lines = append(lines, line, "")
 	}
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
+	return fsx.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
 }

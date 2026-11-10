@@ -26,6 +26,7 @@ import (
 
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
 	"tgagent/internal/secret"
@@ -406,11 +407,7 @@ func writeVault(v map[string]*BotEntry) error {
 	if err != nil {
 		return err
 	}
-	tmp := vaultPath() + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, vaultPath())
+	return fsx.WriteFile(vaultPath(), raw, 0o600)
 }
 
 // vaultHas — у бота с этим id в хранилище ровно этот токен.
@@ -551,7 +548,7 @@ func writeEnv(path, key, value string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
+	return fsx.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
 }
 
 // ── итог действия для tg_wait_approval ───────────────────────────────────
@@ -583,7 +580,7 @@ func saveBotOp(s *config.Settings, draftID string, r *omap.Map) {
 		}
 	}
 	out, _ := json.MarshalIndent(all, "", "  ")
-	_ = os.WriteFile(botOpsPath(s), out, 0o600)
+	_ = fsx.WriteFile(botOpsPath(s), out, 0o600)
 }
 
 func secretSafe(b []byte) json.RawMessage { return json.RawMessage(secret.Mask(string(b))) }

@@ -40,17 +40,27 @@ func LastID(path string) int {
 	if err != nil {
 		return 0
 	}
-	start := max(0, st.Size()-64)
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
-		return 0
+	// после сбоя питания хвост дописанного файла бывает в нулях: их
+	// пропускаем, иначе лента сочла бы себя пустой
+	for _, back := range []int64{64, 64 << 10} {
+		if _, err := f.Seek(max(0, st.Size()-back), io.SeekStart); err != nil {
+			return 0
+		}
+		tail, _ := io.ReadAll(f)
+		fields := strings.Fields(strings.ReplaceAll(string(tail), "\x00", " "))
+		for i := len(fields) - 1; i >= 0; i-- {
+			if i == 0 && back < st.Size() {
+				break // первое поле могло начаться до границы чтения
+			}
+			if n, err := strconv.Atoi(fields[i]); err == nil {
+				return n
+			}
+		}
+		if back >= st.Size() {
+			break
+		}
 	}
-	tail, _ := io.ReadAll(f)
-	fields := strings.Fields(string(tail))
-	if len(fields) == 0 {
-		return 0
-	}
-	n, _ := strconv.Atoi(fields[len(fields)-1])
-	return n
+	return 0
 }
 
 func appendIDs(path string, ids []int) error {

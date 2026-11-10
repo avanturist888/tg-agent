@@ -26,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"tgagent/internal/fsx"
 )
 
 // Ошибки окружения.
@@ -335,11 +337,7 @@ func credential(out []byte) string {
 }
 
 func writePrivate(path string, raw []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsx.WriteFile(path, raw, 0o600)
 }
 
 // ── треды ────────────────────────────────────────────────────────────────

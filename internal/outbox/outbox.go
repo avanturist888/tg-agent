@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"tgagent/internal/audit"
+	"tgagent/internal/fsx"
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 )
@@ -309,7 +310,16 @@ func (o *Outbox) read() ([]*Draft, error) {
 	}
 	var drafts []*Draft
 	if err := json.Unmarshal(data, &drafts); err != nil {
-		return nil, fmt.Errorf("outbox.json повреждён: %w", err)
+		// Испорченный файл не должен останавливать отправку у всех агентов
+		// (9.11.2026 outbox.json обнулился при сбое питания, и отправка
+		// стояла до утра): откладываем его рядом, не удаляя, и начинаем заново.
+		moved, qerr := fsx.Quarantine(o.Path)
+		if qerr != nil {
+			return nil, fmt.Errorf("outbox.json повреждён (%v), отложить его не вышло: %w", err, qerr)
+		}
+		_ = audit.Log(filepath.Join(filepath.Dir(o.Path), "audit.jsonl"), "outbox_corrupt",
+			"error", err.Error(), "zeroed", fsx.Zeroed(data), "moved_to", moved)
+		return nil, nil
 	}
 	return drafts, nil
 }
@@ -326,19 +336,7 @@ func (o *Outbox) write(drafts []*Draft) error {
 	if err := json.Indent(&buf, raw, "", "  "); err != nil {
 		return err
 	}
-	tmp := o.Path[:len(o.Path)-len(filepath.Ext(o.Path))] + ".tmp"
-	if err := os.WriteFile(tmp, buf.Bytes(), 0o600); err != nil {
-		return err
-	}
-	// на Windows замена может упереться в читающего соседа — переждём
-	var rerr error
-	for i := 0; i < 40; i++ {
-		if rerr = os.Rename(tmp, o.Path); rerr == nil {
-			return nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return rerr
+	return fsx.WriteFile(o.Path, buf.Bytes(), 0o600)
 }
 
 func touchExpired(drafts []*Draft) {

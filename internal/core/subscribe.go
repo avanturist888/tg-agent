@@ -29,6 +29,7 @@ import (
 
 	"tgagent/internal/audit"
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 	"tgagent/internal/inbox"
 	"tgagent/internal/omap"
 	"tgagent/internal/t3"
@@ -422,18 +423,7 @@ func saveSubs(path string, subs any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	// на Windows замена может упереться в читающего соседа — переждём
-	for i := 0; ; i++ {
-		err := os.Rename(tmp, path)
-		if err == nil || i == 40 {
-			return err
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	return fsx.WriteFile(path, raw, 0o600)
 }
 
 // editSubs — прочитать, поменять и записать подписки под замком.

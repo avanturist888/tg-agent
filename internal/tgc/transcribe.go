@@ -10,6 +10,7 @@ import (
 	"github.com/gotd/td/tg"
 
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 )
@@ -63,11 +64,7 @@ func (c TranscriptCache) Put(key string, got Transcript) {
 		if err != nil {
 			return err
 		}
-		tmp := c.Path[:len(c.Path)-len(".json")] + ".tmp"
-		if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-			return err
-		}
-		return os.Rename(tmp, c.Path)
+		return fsx.WriteFile(c.Path, raw, 0o600)
 	})
 }
 

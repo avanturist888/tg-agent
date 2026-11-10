@@ -12,6 +12,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 )
 
 // cmdInit — заготовка именованного профиля: каталоги, .env с ключами
@@ -61,7 +62,7 @@ func cmdInit(ctx context.Context, args []string) int {
 			fmt.Fprintf(&b, "#   %s approve <id> --send   (или в окне: tgw.exe --profile %s gui)\n", tg, prof)
 			b.WriteString("TG_SEND_POLICY=human_approval\n")
 		}
-		if err := os.WriteFile(config.EnvPath(), []byte(b.String()), 0o600); err != nil {
+		if err := fsx.WriteFile(config.EnvPath(), []byte(b.String()), 0o600); err != nil {
 			return fail(err)
 		}
 		created = append(created, config.EnvPath())
@@ -79,7 +80,7 @@ read = true
 send = true
 note = "Избранное аккаунта профиля — песочница для проверок"
 `, prof, tg, tg, prof)
-		if err := os.WriteFile(config.ChatsFile(), []byte(body), 0o600); err != nil {
+		if err := fsx.WriteFile(config.ChatsFile(), []byte(body), 0o600); err != nil {
 			return fail(err)
 		}
 		created = append(created, config.ChatsFile())
