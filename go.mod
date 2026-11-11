@@ -7,10 +7,10 @@ require (
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/coder/websocket v1.8.15
 	github.com/gotd/log v0.1.0
-	github.com/gotd/td v0.163.1-0.20261108143138-726e17ff3902
+	github.com/gotd/td v0.164.0
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/joho/godotenv v1.5.1
-	github.com/klauspost/compress v1.19.1
+	github.com/klauspost/compress v1.19.2
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/vmihailenco/msgpack/v5 v5.4.1

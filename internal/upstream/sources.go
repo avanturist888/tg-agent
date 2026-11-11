@@ -188,17 +188,16 @@ var PyMaxRelease = &Source{
 const gotdRepo = "gotd/td"
 
 // GotdRelease — релизы gotd/td: с ними приходят новые слои схемы Telegram.
-// 09.11.2026 go.mod стоит на коммите PR #1872 (слой 233, виджеты) до релиза.
+// С 11.11.2026 go.mod на теге v0.164.0 (слой 233); до него стоял на коммите PR #1872.
 var GotdRelease = &Source{
 	ID: "gotd-release", Title: "релиз gotd (MTProto Telegram)", URL: "https://github.com/" + gotdRepo + "/releases",
 	Labels: []Label{{"tag", "релиз"}},
 	Check:  releaseCheck(gotdRepo),
 	Task: "Это библиотека MTProto, на которой стоит весь клиент Telegram (internal/tgc). " +
-		"Если go.mod ещё на псевдоверсии (коммит PR #1872, слой 233) — переведи его на этот релиз, " +
-		"если в нём слой не ниже (const Layer в tg/tl_registry_gen.go): go get github.com/gotd/td@<тег>, " +
-		"scripts\\build.ps1, живая проверка чтения в saved, коммит и пуш. Если go.mod уже на теге — " +
-		"посмотри, что нового в схеме (новые типы медиа, сообщений, действий), и стоит ли дать это агентам " +
-		"(принцип 4 философии): обновись так же, нужное доделай сам или отметь в выводе.",
+		"Обнови go.mod на этот релиз (go get github.com/gotd/td@<тег>), scripts\\build.ps1, " +
+		"живая проверка чтения в saved, коммит и пуш. Посмотри, что нового в схеме (const Layer в " +
+		"tg/tl_registry_gen.go, _schema/telegram.tl: новые типы медиа, сообщений, действий) и в API клиента, " +
+		"и стоит ли дать это агентам (принцип 4 философии): нужное доделай сам или отметь в выводе.",
 }
 
 var PyMaxCommits = &Source{
