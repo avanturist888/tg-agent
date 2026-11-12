@@ -532,20 +532,23 @@ func TestMigrateKeepsClaimAsAttempt(t *testing.T) {
 	}
 }
 
-// Лок отправки, оставшийся от старой сборки (её процесс умер посреди
-// отправки), переносится попыткой: такой черновик сам не уйдёт второй раз.
-func TestLegacyDeadSendLockIsAttempt(t *testing.T) {
+// Старая сборка не отмечала начало отправки: approved в её файле — уже
+// взятое в отправку, с локом отправки или без. Такой черновик — попытка
+// («могло уйти»), ждущий решения — нет.
+func TestLegacyApprovedIsAttempt(t *testing.T) {
 	dir := t.TempDir()
 	t.Cleanup(closeAll)
 	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "approved", "expires_at": "2099-01-01T00:00:00Z"},
-		{"id": "b", "status": "approved", "expires_at": "2099-01-01T00:00:00Z"}]`)
+		{"id": "b", "status": "approved", "expires_at": "2099-01-01T00:00:00Z"},
+		{"id": "c", "status": "pending", "expires_at": "2099-01-01T00:00:00Z"}]`)
 	write(t, filepath.Join(dir, "sending", "a.lock"), `{"pid": 999999, "ts": 1}`)
 	db, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, b := count(t, db, "SELECT send_attempts FROM drafts WHERE id = 'a'"), count(t, db, "SELECT send_attempts FROM drafts WHERE id = 'b'"); a != 1 || b != 0 {
-		t.Fatalf("попытки: a %d, b %d", a, b)
+	q := func(id string) int { return count(t, db, "SELECT send_attempts FROM drafts WHERE id = '"+id+"'") }
+	if a, b, c := q("a"), q("b"), q("c"); a != 1 || b != 1 || c != 0 {
+		t.Fatalf("попытки: a %d, b %d, c %d", a, b, c)
 	}
 }
 

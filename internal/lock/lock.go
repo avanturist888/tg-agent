@@ -15,8 +15,18 @@
 // удаляет (иначе файлы карточек копились бы), а захват проверяет, что путь
 // всё ещё ведёт к тому файлу, который он запер: иначе запер удалённый, и
 // захват начинается заново. Не удалился файл — не беда, его запрут заново.
-// Пока лок взят, в файле — {"pid": …, "ts": …}: для диагностики и для сборок
-// до OS-локов, которые узнают живой лок по pid.
+// Пока лок взят, в файле — {"pid": …, "ts": …, "os": true}: для диагностики
+// и для сборок до OS-локов, которые узнают живой лок по pid. Отпущенный —
+// {"os": true}.
+//
+// Совместимость со сборками до OS-локов (файл с O_EXCL, внутри pid, файл
+// не держится открытым). Пока такая сборка жива (обновление: exe уже
+// заменены, а старые процессы ещё доживают — tg cutover), её лок — только
+// запись в файле. Поэтому, заперев файл, захват читает его: запись без
+// "os" с живым pid другого процесса — лок старой сборки, он занят. Пустой
+// файл, созданный не нами, — занят, пока молод (freshEmpty): старая сборка
+// пишет pid сразу после создания, а сборка с OS-локами — сразу после
+// блокировки. Давний пустой — брошенный, свободен.
 package lock
 
 import (
@@ -25,6 +35,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -54,8 +65,37 @@ func New(path string, timeout time.Duration) *File {
 }
 
 type meta struct {
-	PID int     `json:"pid"`
-	TS  float64 `json:"ts"`
+	PID int     `json:"pid,omitempty"`
+	TS  float64 `json:"ts,omitempty"`
+	OS  bool    `json:"os,omitempty"` // записан сборкой с OS-локами
+}
+
+// released — запись отпущенного лока.
+var released = []byte(`{"os":true}`)
+
+// freshEmpty — сколько пустой файл, созданный не нами, считается занятым
+// (его создатель вот-вот запишет владельца).
+const freshEmpty = 5 * time.Second
+
+// oldOwner — файл, возможно, держит процесс сборки до OS-локов (или его
+// только что создал другой процесс и ещё не записал владельца).
+func oldOwner(f *os.File, created bool) bool {
+	raw, err := readAll(f)
+	if err != nil {
+		return true // не прочесть — не судить: следующая попытка
+	}
+	if len(raw) == 0 {
+		if created {
+			return false
+		}
+		st, err := f.Stat()
+		return err != nil || time.Since(st.ModTime()) < freshEmpty
+	}
+	var m meta
+	if json.Unmarshal(raw, &m) != nil || m.OS || m.PID == 0 || m.PID == os.Getpid() {
+		return false
+	}
+	return pidAlive(m.PID, m.TS)
 }
 
 // tryAcquire — одна попытка без ожидания.
@@ -63,10 +103,13 @@ func (l *File) tryAcquire() (bool, error) {
 	if l.f != nil {
 		return false, fmt.Errorf("лок %s уже взят этим же объектом", l.Path)
 	}
-	f, err := openLock(l.Path, true)
+	f, created, err := openLock(l.Path, true)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) || busyOpen(err) {
 			return false, nil // файл как раз удаляют, отпуская лок
+		}
+		if _, derr := os.Stat(filepath.Dir(l.Path)); errors.Is(err, os.ErrNotExist) && derr == nil {
+			return false, nil // его раз за разом удаляли между открытиями
 		}
 		return false, err
 	}
@@ -77,12 +120,12 @@ func (l *File) tryAcquire() (bool, error) {
 	}
 	// прежний держатель мог удалить файл, пока мы его открывали: тогда
 	// заперт удалённый, а по пути уже лежит (или вот-вот ляжет) новый
-	if !samePath(f, l.Path) {
+	if !samePath(f, l.Path) || oldOwner(f, created) {
 		unlock(f)
 		_ = f.Close()
 		return false, nil
 	}
-	body, _ := json.Marshal(meta{PID: os.Getpid(), TS: float64(time.Now().UnixNano()) / 1e9})
+	body, _ := json.Marshal(meta{PID: os.Getpid(), TS: float64(time.Now().UnixNano()) / 1e9, OS: true})
 	if f.Truncate(0) == nil {
 		_, _ = f.WriteAt(body, 0) // только сведения: лок держит блокировка
 	}
@@ -132,8 +175,11 @@ func (l *File) Release() {
 	l.f = nil
 	// файл удаляем, пока он заперт нами: тот, кто запрёт его после нас,
 	// увидит, что путь ведёт уже не к нему, и начнёт заново. Не удалился
-	// (его читают) — останется пустым, без нашего pid, и пригодится следующему
-	_ = f.Truncate(0)
+	// (его читают) — останется отпущенным, без нашего pid, и пригодится
+	// следующему
+	if f.Truncate(0) == nil {
+		_, _ = f.WriteAt(released, 0)
+	}
 	_ = os.Remove(l.Path)
 	unlock(f)
 	_ = f.Close()
@@ -165,12 +211,13 @@ func Held(path string) bool {
 
 // Peek — лок path, не трогая файл: есть ли он и жив ли его владелец.
 // В отличие от Held не удаляет файл — он остаётся следом (например,
-// прерванной отправки старой сборки). Заперт — владелец жив. Не заперт —
-// судим по записи сборки до OS-локов: pid жив — жив; владельца не записали —
-// по возрасту (его как раз пишут или процесс упал между созданием и записью).
+// прерванной отправки старой сборки). Заперт — владелец жив. Не заперт и
+// записан сборкой с OS-локами — свободен. Иначе судим по записи сборки до
+// OS-локов: pid жив — жив; владельца не записали — по возрасту (его как раз
+// пишут или процесс упал между созданием и записью).
 func Peek(path string) (present, alive bool) {
 	p := path + ".lock"
-	f, err := openLock(p, false)
+	f, _, err := openLock(p, false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, false
@@ -188,7 +235,10 @@ func Peek(path string) (present, alive bool) {
 		return true, true
 	}
 	var m meta
-	if json.Unmarshal(raw, &m) != nil || m.PID == 0 {
+	if json.Unmarshal(raw, &m) == nil && m.OS {
+		return true, false
+	}
+	if m.PID == 0 {
 		st, err := f.Stat()
 		return true, err != nil || time.Since(st.ModTime()) <= StaleAfter
 	}

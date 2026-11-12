@@ -8,12 +8,24 @@ import (
 	"syscall"
 )
 
-func openLock(path string, create bool) (*os.File, error) {
-	flag := os.O_RDWR
-	if create {
-		flag |= os.O_CREATE
+func openLock(path string, create bool) (*os.File, bool, error) {
+	// O_CLOEXEC Go ставит сам
+	for i := 0; ; i++ {
+		if create {
+			f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+			if err == nil {
+				return f, true, nil
+			}
+			if !errors.Is(err, os.ErrExist) {
+				return nil, false, err
+			}
+		}
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		// между двумя открытиями файл удалил отпустивший лок — создать заново
+		if err == nil || !create || i >= 9 || !errors.Is(err, os.ErrNotExist) {
+			return f, false, err
+		}
 	}
-	return os.OpenFile(path, flag, 0o600) // O_CLOEXEC — Go ставит сам
 }
 
 func busyOpen(error) bool { return false }

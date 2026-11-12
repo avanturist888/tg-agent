@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -53,7 +54,7 @@ func TestReplacedFileNotTaken(t *testing.T) {
 	if err := a.Acquire(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	stale, err := openLock(p+".lock", true) // ждущий: файл открыт, лок не взят
+	stale, _, err := openLock(p+".lock", true) // ждущий: файл открыт, лок не взят
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,5 +186,60 @@ func TestLockExclusiveInProcess(t *testing.T) {
 	wg.Wait()
 	if worst.Load() != 1 {
 		t.Fatalf("под локом одновременно %d", worst.Load())
+	}
+}
+
+// Лок сборки до OS-локов — только запись в файле: живой владелец в ней
+// исключает нас, мёртвый — нет. Пустой молодой файл, созданный не нами, —
+// его как раз пишут; давний пустой — брошен.
+func TestOldBuildOwner(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "x")
+	put := func(body string, age time.Duration) {
+		if err := os.WriteFile(p+".lock", []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		at := time.Now().Add(-age)
+		if err := os.Chtimes(p+".lock", at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	try := func() bool {
+		l := New(p, 0)
+		ok, err := l.tryAcquire()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			l.Release()
+		}
+		return ok
+	}
+	now := float64(time.Now().Unix())
+	put(fmt.Sprintf(`{"pid": %d, "ts": %f}`, os.Getppid(), now), 0)
+	if try() {
+		t.Fatal("взят лок живого процесса старой сборки")
+	}
+	if present, alive := Peek(p); !present || !alive {
+		t.Fatal("Peek: лок старой сборки не живой")
+	}
+	put(`{"pid": 999999, "ts": 1}`, 0)
+	if !try() {
+		t.Fatal("лок умершего процесса старой сборки не взят")
+	}
+	put("", 0)
+	if try() {
+		t.Fatal("только что созданный чужой пустой файл принят за свободный")
+	}
+	put("", time.Minute)
+	if !try() {
+		t.Fatal("давний пустой файл не взят")
+	}
+	put(fmt.Sprintf(`{"pid": %d, "ts": %f, "os": true}`, os.Getppid(), now), 0)
+	if !try() {
+		t.Fatal("незапертый файл сборки с OS-локами принят за занятый")
+	}
+	put(`{"os": true}`, 0)
+	if present, alive := Peek(p); !present || alive {
+		t.Fatal("Peek: отпущенный лок живой")
 	}
 }

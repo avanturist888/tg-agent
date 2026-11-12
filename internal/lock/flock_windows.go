@@ -16,23 +16,37 @@ const lockOffsetHigh = 0x40000000
 
 // openLock — открыть файл лока так, чтобы другие могли его и читать, и
 // удалять (держатель удаляет его, отпуская лок, пока ждущие держат свои
-// дескрипторы). Дескриптор не наследуется дочерними процессами.
-func openLock(path string, create bool) (*os.File, error) {
+// дескрипторы). create — создать, если нет; created — создали его мы.
+// Дескриптор не наследуется дочерними процессами.
+func openLock(path string, create bool) (f *os.File, created bool, err error) {
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	disp := uint32(windows.OPEN_EXISTING)
-	if create {
-		disp = windows.OPEN_ALWAYS
+	open := func(disp uint32) (windows.Handle, error) {
+		return windows.CreateFile(p, windows.GENERIC_READ|windows.GENERIC_WRITE,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+			nil, disp, windows.FILE_ATTRIBUTE_NORMAL, 0)
 	}
-	h, err := windows.CreateFile(p, windows.GENERIC_READ|windows.GENERIC_WRITE,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil, disp, windows.FILE_ATTRIBUTE_NORMAL, 0)
-	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	for i := 0; ; i++ {
+		if create {
+			h, err := open(windows.CREATE_NEW)
+			if err == nil {
+				return os.NewFile(uintptr(h), path), true, nil
+			}
+			if !errors.Is(err, windows.ERROR_FILE_EXISTS) {
+				return nil, false, &os.PathError{Op: "open", Path: path, Err: err}
+			}
+		}
+		h, err := open(windows.OPEN_EXISTING)
+		if err == nil {
+			return os.NewFile(uintptr(h), path), false, nil
+		}
+		// между двумя открытиями файл удалил отпустивший лок — создать заново
+		if !create || i >= 9 || !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			return nil, false, &os.PathError{Op: "open", Path: path, Err: err}
+		}
 	}
-	return os.NewFile(uintptr(h), path), nil
 }
 
 // busyOpen — файл не открыть, потому что его как раз удаляют (держатель

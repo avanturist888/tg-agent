@@ -138,12 +138,16 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 
 // showCard — показать итог в карточке. Порядок итогов держит номер версии
 // из базы (nextCardVersion): его выдают, когда итог появился, — раньше, чем
-// путь начнёт ждать лок карточки. Под локом итог, у которого уже есть более
-// новый принятый (показанный или ждущий показа), не показывается: путь мог
-// застрять перед локом или в очереди к нему, а лок не держит порядок
-// пришедших. Не показанный уходит в очередь (rememberCard). Лок не
-// отпускается между показом и записью: иначе уборка успела бы показать
-// прежний итог поверх этого.
+// путь начнёт ждать лок карточки. Под локом итог не показывается, если
+//   - уже принят итог новее (показанный или ждущий): путь мог застрять перед
+//     локом или в очереди к нему, а лок не держит порядок пришедших;
+//   - он больше не правда о черновике (outcomeFits по свежему черновику из
+//     базы): итог могли собрать по старому снимку (refreshFailedCards,
+//     автоотправка), а черновик с тех пор, например, ушёл повтором.
+// Итог сначала принимается (ждёт показа), потом показывается, потом
+// отмечается показанным: упади процесс между ними — уборка покажет его, а не
+// прежний ждущий поверх. Лок не отпускается между показом и записью: иначе
+// уборка успела бы показать прежний итог поверх этого.
 func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID int64, status string) {
 	db, err := stateDB(s)
 	var ver int64
@@ -169,8 +173,48 @@ func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID i
 	if cur, ok, err := cardStates.Get(ctx, db.Q(), d.ID); err == nil && ok && cur.Ver > ver {
 		return // уже принят итог новее — этот устарел, пока ждал
 	}
+	if !stillTrue(s, d.ID, status) {
+		_ = audit.Log(s.AuditPath(), "card_stale", "draft_id", d.ID)
+		return
+	}
+	rememberCard(ctx, s, db, d.ID, cardID, status, ver, false) // промежуточный — не ждёт
 	shown := finishCard(ctx, s, cardID, d, title(s, d), status, d.Note)
-	rememberCard(ctx, s, db, d.ID, cardID, status, ver, shown)
+	if shown {
+		rememberCard(ctx, s, db, d.ID, cardID, status, ver, true)
+	}
+}
+
+// stillTrue — итог status всё ещё правда о черновике id (по базе). Черновика
+// нет — показывать некуда; базу не прочесть — не мешать показу.
+func stillTrue(s *config.Settings, id, status string) bool {
+	d, err := outbox.New(s.DataDir()).Get(id)
+	var nf *outbox.NotFound
+	if errors.As(err, &nf) {
+		return false
+	}
+	return err != nil || outcomeFits(s, status, d)
+}
+
+// outcomeFits — подходит ли итог status (по его значку) к состоянию
+// черновика d: «Отправлено» — только отправленному (и ушедшему, чья
+// отметка ещё не легла в базу, — sent-unsaved), «Не отправлено» и
+// «Отправляю…» — только одобренному (ещё не ушедшему), «Отменено» —
+// отменённому, «Протухло» — протухшему. Прочие итоги не проверяются.
+func outcomeFits(s *config.Settings, status string, d *outbox.Draft) bool {
+	switch {
+	case strings.HasPrefix(status, "✅"):
+		if _, sent := unsavedSent(s, d.ID); sent {
+			return true
+		}
+		return d.Status == outbox.Sent
+	case strings.HasPrefix(status, "⚠️"), intermediate(status):
+		return d.Status == outbox.Approved
+	case strings.HasPrefix(status, "✋"):
+		return d.Status == outbox.Cancelled
+	case strings.HasPrefix(status, "⌛"):
+		return d.Status == outbox.Expired || d.IsExpired(time.Now())
+	}
+	return true
 }
 
 // lockCard — итог в карточку одного черновика показывают по одному, во всех
@@ -314,7 +358,23 @@ func retryCard(ctx context.Context, s *config.Settings, db *store.DB, box *outbo
 		_ = cardStates.Delete(ctx, db.Q(), id) // черновика нет — и карточку держать незачем
 		return
 	}
-	if err != nil || !finishCard(ctx, s, st.Card, d, title(s, d), st.Status, d.Note) {
+	if err != nil {
+		return
+	}
+	if !outcomeFits(s, st.Status, d) {
+		// ждущий итог больше не правда (черновик с тех пор ушёл, отменён):
+		// не показывать; свой итог новое состояние покажет само
+		_ = editCardState(ctx, db, id, func(cur cardState, ok bool) (cardState, bool) {
+			if !ok || cur.Ver != st.Ver {
+				return cur, false
+			}
+			cur.Status = ""
+			return cur, true
+		})
+		_ = audit.Log(s.AuditPath(), "card_stale", "draft_id", id)
+		return
+	}
+	if !finishCard(ctx, s, st.Card, d, title(s, d), st.Status, d.Note) {
 		return
 	}
 	_ = editCardState(ctx, db, id, func(cur cardState, ok bool) (cardState, bool) {

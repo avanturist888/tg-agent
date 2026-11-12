@@ -505,16 +505,6 @@ func importOutbox(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 	// в базе у него не было бы отметки захвата, и новая служба отправила бы
 	// его второй раз — ждём, пока старая закончит (её итог будет в файле)
 	sending := filepath.Join(filepath.Dir(path), "sending")
-	// мёртвый лок отправки — след прерванной отправки: её процесс мог уже
-	// отправить (живые — ждём ниже)
-	left := map[string]bool{}
-	if entries, err := os.ReadDir(sending); err == nil {
-		for _, e := range entries {
-			if id, ok := strings.CutSuffix(e.Name(), ".lock"); ok {
-				left[id] = true
-			}
-		}
-	}
 	if who := liveSenders(sending); who != "" {
 		return 0, fmt.Errorf("%w: старая сборка ещё отправляет черновик %s", ErrRetry, who)
 	}
@@ -543,10 +533,15 @@ func importOutbox(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 		err := tx.QueryRowContext(ctx, "SELECT status FROM drafts WHERE id = ?", d.ID).Scan(&cur)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			// лок отправки старой сборки остался (живых здесь нет — их ждали
-			// выше): её процесс умер посреди отправки, сообщение могло уйти
+			// approved в файле старой сборки — уже взятое в отправку (кнопка,
+			// автоотправка и tg approve сразу отправляют), а начало отправки
+			// она не отмечала: её процесс мог умереть или быть остановлен
+			// обновлением, уже отправив. Отсутствие лока отправки — не
+			// доказательство, что попытки не было, поэтому такой черновик —
+			// «могло уйти»: автоматически не отправляется, повтор — только
+			// явный (tg_send_draft), после проверки чата
 			attempts := 0
-			if left[d.ID] && d.Status == "approved" {
+			if d.Status == "approved" {
 				attempts = 1
 			}
 			if _, err := tx.ExecContext(ctx, "INSERT INTO drafts(id, status, expires, send_at, body, send_attempts) VALUES(?, ?, ?, ?, ?, ?)",

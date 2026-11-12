@@ -480,13 +480,13 @@ func TestCardDelayedOlderRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	card(ctx, s, &cardID, d, "✅ B")
+	card(ctx, s, &cardID, d, "⚠️ B")
 	rememberCard(ctx, s, db, d.ID, cardID, "⚠️ A", vA, false)
-	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); st.pending() || st.Status != "✅ B" {
+	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); st.pending() || st.Status != "⚠️ B" {
 		t.Fatalf("старый итог принят поверх нового: %+v", st)
 	}
 	retryCards(ctx, s)
-	if len(shown) != 1 || shown[0] != "✅ B" {
+	if len(shown) != 1 || shown[0] != "⚠️ B" {
 		t.Fatalf("показано: %q", shown)
 	}
 
@@ -514,13 +514,13 @@ func TestCardDelayedOlderRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rememberCard(ctx, s, db, d.ID, cardID, "✅ B2", vB, true)
+	rememberCard(ctx, s, db, d.ID, cardID, "⚠️ B2", vB, true)
 	other.Release()
 	<-done
 	if len(shown) != 0 {
 		t.Fatalf("опоздавший итог показан поверх нового: %q", shown)
 	}
-	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); st.pending() || st.Status != "✅ B2" {
+	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); st.pending() || st.Status != "⚠️ B2" {
 		t.Fatalf("состояние: %+v", st)
 	}
 }
@@ -541,5 +541,85 @@ func TestCardStateForgottenWithDraft(t *testing.T) {
 	retryCards(ctx, s)
 	if _, ok, _ := cardStates.Get(ctx, db.Q(), "nonexistent"); ok {
 		t.Fatal("состояние карточки удалённого черновика осталось")
+	}
+}
+
+// Итог принимается до показа: упади процесс сразу после показа — в базе уже
+// он (ждущий), а не прежний несостоявшийся, и уборка не покажет прежний
+// поверх.
+func TestCardAcceptedBeforeShown(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	db, err := stateDB(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	cardID := int64(55)
+	up := false
+	var during cardState
+	old := finishCard
+	finishCard = func(context.Context, *config.Settings, int64, *outbox.Draft, string, string, string) bool {
+		if up {
+			during, _, _ = cardStates.Get(ctx, db.Q(), d.ID)
+		}
+		return up
+	}
+	t.Cleanup(func() { finishCard = old })
+	card(ctx, s, &cardID, d, "⚠️ первый") // не показался — ждёт
+	up = true
+	card(ctx, s, &cardID, d, "⚠️ второй")
+	if during.Status != "⚠️ второй" || !during.pending() {
+		t.Fatalf("во время показа в базе: %+v", during)
+	}
+}
+
+// Итог, собранный по старому снимку черновика (refreshFailedCards), не
+// показывается, если черновик с тех пор ушёл: «Не отправлено» поверх
+// «Отправлено» — неправда.
+func TestCardStaleSnapshotNotShown(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	if _, err := box.MarkSendError(d.ID, "сбой"); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := box.Get(d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shown []string
+	old := finishCard
+	finishCard = func(_ context.Context, _ *config.Settings, _ int64, _ *outbox.Draft, _, status, _ string) bool {
+		shown = append(shown, status)
+		return true
+	}
+	t.Cleanup(func() { finishCard = old })
+	cardID := int64(55)
+	if _, err := box.MarkSent(d.ID, 7, "2026-11-12T10:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	card(context.Background(), s, &cardID, snap, "⚠️ **Не отправлено** — сбой")
+	if len(shown) != 0 {
+		t.Fatalf("устаревший итог показан: %q", shown)
+	}
+	// и ждущий в очереди, ставший неправдой, уборка не показывает
+	db, err := stateDB(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	v, err := nextCardVersion(ctx, db, d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rememberCard(ctx, s, db, d.ID, cardID, "⚠️ ждущий", v, false)
+	retryCards(ctx, s)
+	if len(shown) != 0 {
+		t.Fatalf("уборка показала неправду: %q", shown)
+	}
+	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); st.pending() {
+		t.Fatalf("неправда осталась в очереди: %+v", st)
 	}
 }
