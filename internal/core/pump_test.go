@@ -230,3 +230,38 @@ func TestAccessTellPartial(t *testing.T) {
 		t.Fatalf("после повтора: %+v, агенту %d", got, told)
 	}
 }
+
+// Карточка запроса не ушла (или ответ Bot API потерялся) — запрос не
+// удаляется, а становится сиротой: карточку пришлёт уборка.
+func TestPublishAccessFailureKeepsRequest(t *testing.T) {
+	s := watchEnv(t)
+	old := sendAccessCard
+	sendAccessCard = func(context.Context, *config.Settings, *accessRequest, *config.ChatRule) (int64, error) {
+		return 0, errors.New("timeout")
+	}
+	t.Cleanup(func() { sendAccessCard = old })
+	req := &accessRequest{ID: "x", Peer: 5, Status: accessPending, Created: time.Now()}
+	sent, err := publishAccess(context.Background(), s, req, nil)
+	if err != nil || sent {
+		t.Fatalf("сбой карточки: sent %v, err %v", sent, err)
+	}
+	if r := loadAccess(s)[req.ID]; r == nil || !r.orphaned() {
+		t.Fatalf("запрос после сбоя карточки: %+v", r)
+	}
+}
+
+// Владелец решил раньше, чем номер карточки записался: итог в карточку не
+// считается показанным, его доведёт уборка.
+func TestAccessCardRecordedAfterDecision(t *testing.T) {
+	s := watchEnv(t)
+	r := &accessRequest{ID: "y", Peer: 6, Status: accessDenied, Result: "✋", CardShown: true, AgentTold: true, Told: true, Decided: time.Now()}
+	if err := editAccess(s, func(m map[string]*accessRequest) bool { m[r.ID] = r; return true }); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordAccessCard(s, &accessRequest{ID: "y"}, 77); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadAccess(s)["y"]; got.CardShown || got.Told || !got.AgentTold || got.CardID != 77 {
+		t.Fatalf("после привязки карточки: %+v", got)
+	}
+}

@@ -344,14 +344,18 @@ func RequestAccess(ctx context.Context, s *config.Settings, chatID int64, read, 
 	if existing != nil {
 		req.Alias = existing.Alias
 	}
-	if err := publishAccess(ctx, s, req, existing); err != nil {
+	sent, err := publishAccess(ctx, s, req, existing)
+	if err != nil {
 		return nil, err
 	}
 	logEvent(s, "access_requested", "request_id", req.ID, "chat_id", chatID, "title", info.Title,
 		"read", read, "send", send, "reason", reason)
-	return out.Set("request_id", req.ID).Set("status", accessPending).Set("asked", rights(read, send)).
-		Set("next_step", "Карточка ушла владельцу в бот. Когда он нажмёт кнопку, сюда придёт уведомление "+
-			"(если сессия жива); дождаться явно — tg_wait_access(request_id). Не проси повторно."), nil
+	out.Set("request_id", req.ID).Set("status", accessPending).Set("asked", rights(read, send))
+	if !sent {
+		return out.Set("next_step", cardPendingStep), nil
+	}
+	return out.Set("next_step", "Карточка ушла владельцу в бот. Когда он нажмёт кнопку, сюда придёт уведомление "+
+		"(если сессия жива); дождаться явно — tg_wait_access(request_id). Не проси повторно."), nil
 }
 
 func kindRu(kind string) string {
@@ -415,8 +419,11 @@ func accessKeyboard(s *config.Settings, r *accessRequest) map[string]any {
 // совпадение со старым запросом после этого направило бы нажатие не туда.
 // Пока карточка не ушла, запрос помечен отправляющим процессом (PubPID):
 // умрёт он между записью и карточкой — запрос не повиснет без кнопок
-// (orphaned, publishOrphanAccess).
-func publishAccess(ctx context.Context, s *config.Settings, req *accessRequest, existing *config.ChatRule) error {
+// (orphaned, publishOrphanAccess). Карточка не ушла (или ответ Bot API
+// потерялся — она могла и уйти) — запрос не удаляется: он становится
+// сиротой, карточку пришлёт уборка, а нажатие по уже ушедшей найдёт его.
+// false — карточка пока не ушла.
+func publishAccess(ctx context.Context, s *config.Settings, req *accessRequest, existing *config.ChatRule) (bool, error) {
 	req.PubPID, req.PubSince = os.Getpid(), pubNow()
 	if err := editAccess(s, func(m map[string]*accessRequest) bool {
 		for m[req.ID] != nil { // id случайный: не занять чужой
@@ -425,24 +432,41 @@ func publishAccess(ctx context.Context, s *config.Settings, req *accessRequest, 
 		m[req.ID] = req
 		return true
 	}); err != nil {
-		return err
+		return false, err
 	}
 	card, err := sendAccessCard(ctx, s, req, existing)
 	if err != nil {
-		_ = editAccess(s, func(m map[string]*accessRequest) bool { delete(m, req.ID); return true })
-		return fmt.Errorf("карточка в бот не ушла: %w", err)
+		logEvent(s, "access_card_failed", "request_id", req.ID, "error", err.Error())
+		_ = editAccess(s, func(m map[string]*accessRequest) bool {
+			if r := m[req.ID]; r != nil && r.CardID == 0 && r.PubPID == req.PubPID {
+				r.PubPID, r.PubSince = 0, 0 // сирота: карточку пришлёт уборка
+				return true
+			}
+			return false
+		})
+		return false, nil
 	}
-	return recordAccessCard(s, req, card)
+	return true, recordAccessCard(s, req, card)
 }
+
+// cardPendingStep — next_step агенту, если карточка запроса ещё не ушла.
+const cardPendingStep = "Запрос записан, но карточка владельцу в бот пока не ушла (сбой Bot API) — служба " +
+	"пришлёт её сама. Дождаться решения — tg_wait_access(request_id). Не проси повторно."
 
 func pubNow() float64 { return float64(time.Now().UnixNano()) / 1e9 }
 
 // recordAccessCard — карточка ушла: запомнить её и снять отметку отправки.
+// Владелец успел решить по ней раньше, чем её номер записался, — итог в
+// неё ещё не показан (показывать было некуда): CardShown снимается, его
+// доведут повтор нажатия и уборка.
 func recordAccessCard(s *config.Settings, req *accessRequest, card int64) error {
 	req.CardID, req.PubPID, req.PubSince = card, 0, 0
 	return editAccess(s, func(m map[string]*accessRequest) bool {
 		if r := m[req.ID]; r != nil {
 			r.CardID, r.PubPID, r.PubSince = card, 0, 0
+			if r.Status != accessPending && r.Result != "" {
+				r.CardShown, r.Told = false, false
+			}
 			return true
 		}
 		return false
@@ -519,10 +543,11 @@ func postAccessCard(ctx context.Context, s *config.Settings, r *accessRequest, e
 }
 
 // finishAccessCard — итог в карточке, кнопки снимаются; true — итог
-// показан (или карточки нет).
+// показан (или карточки нет и её никто не шлёт). Номера ещё нет, а
+// карточку шлёт живой процесс — не показан: она вот-вот появится.
 var finishAccessCard = func(ctx context.Context, s *config.Settings, r *accessRequest, status string) bool {
 	if r.CardID == 0 {
-		return true
+		return r.PubPID == 0 || !lock.PIDAlive(r.PubPID, r.PubSince)
 	}
 	err := bot.Call(ctx, s, "editMessageText", map[string]any{
 		"chat_id": s.ApprovalChatID, "message_id": r.CardID,

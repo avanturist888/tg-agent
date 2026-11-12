@@ -112,14 +112,18 @@ func submitSetRequest(ctx context.Context, s *config.Settings, req *accessReques
 				"Такой запрос уже ждёт владельца. Дождись: tg_wait_access(request_id)."), nil
 		}
 	}
-	if err := publishAccess(ctx, s, req, nil); err != nil {
+	sent, err := publishAccess(ctx, s, req, nil)
+	if err != nil {
 		return nil, err
 	}
 	logEvent(s, "access_requested", "request_id", req.ID, "scope", req.Scope, "folder", req.Folder, "title", req.Title,
 		"count", req.Count, "send", req.Send, "reason", req.Reason)
-	return out.Set("request_id", req.ID).Set("scope", req.Scope).Set("status", accessPending).
-		Set("next_step", "Карточка ушла владельцу в бот. Когда он нажмёт кнопку, сюда придёт уведомление "+
-			"(если сессия жива); дождаться явно — tg_wait_access(request_id). Не проси повторно."), nil
+	out.Set("request_id", req.ID).Set("scope", req.Scope).Set("status", accessPending)
+	if !sent {
+		return out.Set("next_step", cardPendingStep), nil
+	}
+	return out.Set("next_step", "Карточка ушла владельцу в бот. Когда он нажмёт кнопку, сюда придёт уведомление "+
+		"(если сессия жива); дождаться явно — tg_wait_access(request_id). Не проси повторно."), nil
 }
 
 func sample(r *accessRequest, rows []tgc.DialogRow) {
