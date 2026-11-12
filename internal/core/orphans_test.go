@@ -326,14 +326,14 @@ func TestMarkSentDurably(t *testing.T) {
 	if _, err := deliverClaimed(context.Background(), s, d.ID, "test"); !errors.As(err, &dn) || !strings.Contains(err.Error(), "отметка в базу") {
 		t.Fatalf("повторная отправка не отказана отметкой: %v", err)
 	}
-	finishUnsaved(s) // база всё ещё не принимает — файл остаётся
+	finishUnsaved(context.Background(), s) // база всё ещё не принимает — файл остаётся
 	if _, ok := unsavedSent(s, d.ID); !ok {
 		t.Fatal("отметка потеряна, пока база не принимает")
 	}
 	if _, err := db.Q().Exec(`DROP TRIGGER no_sent`); err != nil {
 		t.Fatal(err)
 	}
-	finishUnsaved(s)
+	finishUnsaved(context.Background(), s)
 	got, _ := box.Get(d.ID)
 	if _, ok := unsavedSent(s, d.ID); ok || got.Status != outbox.Sent || got.MessageID == nil || *got.MessageID != 77 {
 		t.Fatalf("отметка не дописана: %+v", got)
@@ -653,5 +653,36 @@ func TestCardOldFailureNotShown(t *testing.T) {
 	card(context.Background(), s, &cardID, snap, "⚠️ **Не отправлено** — "+bot.MDEscape("часть ушла"))
 	if len(shown) != 1 {
 		t.Fatalf("записанный сбой не показан: %q", shown)
+	}
+}
+
+// Ушло, а отметка не легла в базу (sent-unsaved): в базе черновик ещё
+// approved с прежним сбоем, но «Не отправлено» и «Отправляю…» — уже неправда,
+// а «Отправлено» — правда.
+func TestCardUnsavedSent(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	snap, err := box.MarkSendError(d.ID, "нет связи")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUnsaved(s, d.ID, 7, "2026-11-12T10:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	var shown []string
+	old := finishCard
+	finishCard = func(_ context.Context, _ *config.Settings, _ int64, _ *outbox.Draft, _, status, _ string) bool {
+		shown = append(shown, status)
+		return true
+	}
+	t.Cleanup(func() { finishCard = old })
+	cardID := int64(55)
+	ctx := context.Background()
+	card(ctx, s, &cardID, snap, "⚠️ **Не отправлено** — "+bot.MDEscape(*snap.SendError))
+	card(ctx, s, &cardID, snap, "⏳ **Отправляю…**")
+	card(ctx, s, &cardID, snap, "✅ **Отправлено**")
+	if len(shown) != 1 || !strings.HasPrefix(shown[0], "✅") {
+		t.Fatalf("показано: %q", shown)
 	}
 }

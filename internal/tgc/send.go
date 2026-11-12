@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"mime"
 	"os"
@@ -175,6 +176,19 @@ type OutFile struct {
 	Photo bool
 }
 
+// PreSend — сбой до отправляющего запроса (файл не загрузился, медиа не
+// приняли на загрузку): этим вызовом получателю не ушло ничего.
+type PreSend struct{ Err error }
+
+func (e *PreSend) Error() string { return e.Err.Error() }
+func (e *PreSend) Unwrap() error { return e.Err }
+
+// BeforeSend — err случился до отправляющего запроса (PreSend).
+func BeforeSend(err error) bool {
+	var p *PreSend
+	return errors.As(err, &p)
+}
+
 // SendFiles — отправить файлы альбомами до 10 штук: фото одним, документы
 // другим — смешивать их в одном альбоме Telegram не даёт. reply получает
 // первый альбом.
@@ -312,7 +326,7 @@ func packWaveform(v []int) []byte {
 func (c *Conn) sendVoice(ctx context.Context, t Target, path string, reply *int64) ([]int, error) {
 	file, err := uploader.NewUploader(c.API).FromPath(ctx, path)
 	if err != nil {
-		return nil, err
+		return nil, &PreSend{err}
 	}
 	dur, wave := oggVoice(path)
 	audio := &tg.DocumentAttributeAudio{Voice: true, Duration: dur}
@@ -351,7 +365,7 @@ func (c *Conn) sendAlbum(ctx context.Context, t Target, paths []string, photo bo
 	for _, p := range paths {
 		file, err := up.FromPath(ctx, p)
 		if err != nil {
-			return nil, err
+			return nil, &PreSend{err}
 		}
 		if photo {
 			media = append(media, &tg.InputMediaUploadedPhoto{File: file})
@@ -380,13 +394,14 @@ func (c *Conn) sendAlbum(ctx context.Context, t Target, paths []string, photo bo
 	var single []tg.InputSingleMedia
 	var randoms []int64
 	for _, m := range media {
+		// загрузка медиа сообщения в чат не публикует
 		got, err := c.API.MessagesUploadMedia(ctx, &tg.MessagesUploadMediaRequest{Peer: t.Input, Media: m})
 		if err != nil {
-			return nil, err
+			return nil, &PreSend{err}
 		}
 		in, err := uploadedMedia(got)
 		if err != nil {
-			return nil, err
+			return nil, &PreSend{err}
 		}
 		r := randomID()
 		randoms = append(randoms, r)

@@ -101,7 +101,7 @@ func maybeSweep(ctx context.Context, s *config.Settings, last *time.Time) {
 	*last = time.Now()
 	go func() {
 		defer sweeping.Store(false)
-		finishUnsaved(s) // ушедшее, чья отметка не легла в базу, — дописать
+		finishUnsaved(ctx, s) // ушедшее, чья отметка не легла в базу, — дописать
 		// досылка — со сроком на каждый черновик и до остановки службы
 		recoverApproved(ctx, s, time.Now().Add(-recoverOrphansAfter), "дослано: одобривший процесс не отправил")
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)

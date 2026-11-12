@@ -71,6 +71,18 @@ func TestSendDraftPartialIsFinal(t *testing.T) {
 	}
 }
 
+// Файл не загрузился до отправляющего запроса, а до него ничего не ушло —
+// сбой остаётся «до отправки» (PreSend): deliverTelegram отдаст его как
+// NotSent, и попытка повторится.
+func TestSendDraftPreSendKept(t *testing.T) {
+	d := outbox.Draft{Files: []outbox.FileSnap{{Path: "a.txt", Name: "a.txt"}}}
+	_, err := sendDraft(context.Background(), &fakeSender{filesErr: &tgc.PreSend{Err: errors.New("upload failed")}}, tgc.Target{}, &d)
+	var dn *Denied
+	if !tgc.BeforeSend(err) || errors.As(err, &dn) {
+		t.Fatalf("сбой загрузки: %v", err)
+	}
+}
+
 // Ответ отправки — с настоящим message_id: без него tg_wait_approval отдаёт 0,
 // а tg_edit_message не находит своё сообщение (так было 27.10–02.11).
 func TestSendDraftKeepsMessageID(t *testing.T) {

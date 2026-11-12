@@ -1197,8 +1197,11 @@ func deliverTelegram(ctx context.Context, s *config.Settings, rule config.ChatRu
 		r, err := sendDraft(ctx, c, t, d)
 		if err != nil {
 			var dn *Denied
-			if !errors.As(err, &dn) && tgc.Rejected(err) {
-				return notSent(err) // Telegram ответил отказом — сообщения нет
+			// Telegram ответил отказом или сбой случился до отправляющего
+			// запроса (файл не загрузился) — сообщения нет. Если до этого
+			// ушёл текст или часть файлов, sendDraft уже вернул Denied
+			if !errors.As(err, &dn) && (tgc.Rejected(err) || tgc.BeforeSend(err)) {
+				return notSent(err)
 			}
 			return err
 		}
@@ -1342,8 +1345,10 @@ func unsavedSent(s *config.Settings, draftID string) (int64, bool) {
 	return v.MessageID, true
 }
 
-// finishUnsaved — уборка службы: дописать отметки, которые не легли.
-func finishUnsaved(s *config.Settings) {
+// finishUnsaved — уборка службы: дописать отметки, которые не легли, и
+// показать итог в карточке: пока отметки не было, «Отправлено» могло не
+// показаться, а с отметкой его уже никто, кроме уборки, не покажет.
+func finishUnsaved(ctx context.Context, s *config.Settings) {
 	entries, err := os.ReadDir(filepath.Join(s.DataDir(), "sent-unsaved"))
 	if err != nil {
 		return
@@ -1369,10 +1374,14 @@ func finishUnsaved(s *config.Settings) {
 			continue
 		}
 		if err == nil && d.Status == outbox.Approved {
-			if _, err = box.MarkSent(id, v.MessageID, v.At); err != nil {
+			var done *outbox.Draft
+			if done, err = box.MarkSent(id, v.MessageID, v.At); err != nil {
 				continue
 			}
 			_ = audit.Log(s.AuditPath(), "mark_sent_recovered", "draft_id", id, "message_id", v.MessageID)
+			if s.BotReady() {
+				card(ctx, s, done.BotMessageID, done, sentSummary(s, done, v.MessageID))
+			}
 		}
 		if err == nil {
 			_ = os.Remove(unsavedPath(s, id))

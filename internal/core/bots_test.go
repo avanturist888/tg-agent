@@ -118,6 +118,23 @@ func TestVaultKeepsTokensOutOfFile(t *testing.T) {
 	}
 }
 
+// Токен в старом файле — времён до диспетчера: если в диспетчере у бота
+// уже есть токен (выпущен позже), перенос его не заменяет.
+func TestVaultImportKeepsNewerToken(t *testing.T) {
+	botTestEnv(t)
+	if err := credSet(botCredTarget("old_bot"), newTok); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(config.DataPath(), "bot_tokens.json")
+	os.WriteFile(legacy, []byte(`{"old_bot":{"username":"@old_bot","bot_id":"1","token":"`+liveTok+`"}}`), 0o600)
+	if tok, ok := VaultToken("@old_bot"); !ok || tok != newTok {
+		t.Fatalf("токен после переноса: ok %v, новый %v", ok, tok == newTok)
+	}
+	if raw, err := os.ReadFile(legacy + ".migrated"); err != nil || strings.Contains(string(raw), "AAH") {
+		t.Fatalf("отложенная копия: %v", err)
+	}
+}
+
 func TestRunBotOpRevoke(t *testing.T) {
 	s := botTestEnv(t)
 	env := filepath.Join(t.TempDir(), "worker.env")

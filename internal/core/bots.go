@@ -28,6 +28,7 @@ import (
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
 	"tgagent/internal/fsx"
+	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
 	"tgagent/internal/secret"
@@ -375,7 +376,9 @@ func vaultDB() (*store.DB, error) { return store.Open(config.DataPath()) }
 
 // bot_tokens.json до переезда: токены, ещё лежащие в нём, — сначала в
 // диспетчер учётных данных (в базе секретов нет); не записался хоть один —
-// перенос откладывается, файл остаётся как был.
+// перенос откладывается, файл остаётся как был. Токен в самом файле — только
+// у записей времён до диспетчера (сборки с ним клали туда и новые токены):
+// если в диспетчере у бота уже есть токен, он новее — остаётся он.
 func init() {
 	store.RegisterLegacy(store.Legacy{File: "bot_tokens.json", Import: importVault})
 }
@@ -393,15 +396,29 @@ func importVault(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 		return 0, fmt.Errorf("%w: %v", store.ErrCorrupt, err)
 	}
 	moved := false
+	err = lock.With(ctx, vaultLockPath(filepath.Dir(path)), vaultLockWait, func() error {
+		for key, e := range m {
+			if e == nil || e.Token == "" {
+				continue
+			}
+			if _, ok := vaultToken(key); !ok {
+				if err := credSet(botCredTarget(key), e.Token); err != nil {
+					return fmt.Errorf("%w: токен @%s не записался в диспетчер: %v", store.ErrRetry, key, err)
+				}
+			}
+			e.Token, moved = "", true
+		}
+		return nil
+	})
+	if lock.IsBusy(err) {
+		err = fmt.Errorf("%w: %v", store.ErrRetry, err)
+	}
+	if err != nil {
+		return 0, err
+	}
 	for key, e := range m {
 		if e == nil {
 			continue
-		}
-		if e.Token != "" {
-			if err := credSet(botCredTarget(key), e.Token); err != nil {
-				return 0, fmt.Errorf("%w: токен @%s не записался в диспетчер: %v", store.ErrRetry, key, err)
-			}
-			e.Token, moved = "", true
 		}
 		if _, err := botsTab.Insert(ctx, tx, key, e); err != nil {
 			return 0, err
@@ -420,6 +437,13 @@ func importVault(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 	}
 	return len(m), nil
 }
+
+// vaultLockPath — лок «прочитать токен в диспетчере → записать» между
+// процессами (перенос и сохранение токена). Под ним — только диспетчер, без
+// транзакций базы: перенос берёт его внутри своей транзакции.
+func vaultLockPath(dataDir string) string { return filepath.Join(dataDir, "bot-vault") }
+
+const vaultLockWait = 30 * time.Second
 
 // botCredTarget — имя записи токена в диспетчере учётных данных.
 func botCredTarget(key string) string { return "tg-agent/bot/" + key }
@@ -521,9 +545,16 @@ func saveBotToken(ctx context.Context, s *config.Settings, tok, source string) (
 	vaultMu.Lock()
 	defer vaultMu.Unlock()
 	key := strings.ToLower(me.Username)
-	cur, _ := vaultToken(key)
-	if err := credSet(botCredTarget(key), tok); err != nil {
-		return "", fmt.Errorf("токен не записан в диспетчер учётных данных Windows: %w", err)
+	var cur string
+	err = lock.With(ctx, vaultLockPath(config.DataPath()), vaultLockWait, func() error {
+		cur, _ = vaultToken(key)
+		if err := credSet(botCredTarget(key), tok); err != nil {
+			return fmt.Errorf("токен не записан в диспетчер учётных данных Windows: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
 	}
 	username := "@" + me.Username
 	err = editBot(key, func(e *BotEntry) *BotEntry {
