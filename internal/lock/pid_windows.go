@@ -38,7 +38,3 @@ func pidAlive(pid int, since float64) bool {
 	started := float64(created.Nanoseconds()) / 1e9
 	return started <= since+1
 }
-
-func isSharingViolation(err error) bool {
-	return errors.Is(err, windows.ERROR_SHARING_VIOLATION)
-}

@@ -121,9 +121,10 @@ CREATE TABLE chat_set_blocked (
 	// процесс мог умереть, уже отправив.
 	`ALTER TABLE drafts ADD COLUMN send_attempts INTEGER NOT NULL DEFAULT 0;
 UPDATE drafts SET send_attempts = 1 WHERE sender_pid IS NOT NULL;`,
-	// 3: итоги, которые не удалось показать в карточке черновика (Bot API не
-	// отвечал): уборка службы повторяет, пока не покажет (core/approvals.go)
-	`CREATE TABLE pending_cards (key TEXT PRIMARY KEY, body TEXT NOT NULL CHECK (json_valid(body))) WITHOUT ROWID;`,
+	// 3: итоги карточек черновиков — номер последнего принятого, его текст и
+	// показан ли он: не показанный (Bot API не отвечал) уборка повторяет, а
+	// итог, опоздавший к локу, по номеру отвергается (core/approvals.go)
+	`CREATE TABLE card_states (key TEXT PRIMARY KEY, body TEXT NOT NULL CHECK (json_valid(body))) WITHOUT ROWID;`,
 }
 
 // Version — версия схемы, которую знает эта сборка.

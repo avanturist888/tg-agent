@@ -1,10 +1,13 @@
 package lock
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,26 +30,110 @@ func TestLockBasics(t *testing.T) {
 	}
 }
 
-func TestOrphanAndDeadOwner(t *testing.T) {
+// Файл, оставшийся от старой сборки (или не удалённый при выходе), лока не
+// держит: держит только блокировка ОС.
+func TestLeftoverFileIsNotLock(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "x")
-	// свой pid, но лок мы не держим — осиротевший
-	raw, _ := json.Marshal(meta{PID: os.Getpid(), TS: 1})
-	os.WriteFile(p+".lock", raw, 0o600)
-	if err := New(p, time.Second).Acquire(context.Background()); err != nil {
-		t.Fatalf("свой осиротевший лок не снят: %v", err)
+	raw, _ := json.Marshal(meta{PID: os.Getpid(), TS: float64(time.Now().Unix())})
+	if err := os.WriteFile(p+".lock", raw, 0o600); err != nil {
+		t.Fatal(err)
 	}
-	New(p, 0).Release()
-	os.Remove(p + ".lock")
-	// pid живого процесса, запущенного позже взятия лока, — чужой, лок протух
-	raw, _ = json.Marshal(meta{PID: os.Getppid(), TS: 1})
-	os.WriteFile(p+".lock", raw, 0o600)
-	if err := New(p, time.Second).Acquire(context.Background()); err != nil {
-		t.Fatalf("лок с переиспользованным pid не снят: %v", err)
+	l := New(p, time.Second)
+	if err := l.Acquire(context.Background()); err != nil {
+		t.Fatalf("оставшийся файл принят за лок: %v", err)
+	}
+	l.Release()
+}
+
+// Отпустивший лок удаляет файл; тот, кто открыл прежний файл до удаления и
+// запер его после, лока не получает — путь ведёт уже к другому файлу.
+func TestReplacedFileNotTaken(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "x")
+	a := New(p, time.Second)
+	if err := a.Acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := openLock(p+".lock", true) // ждущий: файл открыт, лок не взят
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stale.Close()
+	if ok, _ := tryLock(stale); ok {
+		t.Fatal("взят лок, который держит a")
+	}
+	a.Release()
+	c := New(p, 0)
+	cOK, err := c.tryAcquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := tryLock(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok && samePath(stale, p+".lock") {
+		if cOK {
+			t.Fatal("лок держат двое")
+		}
+		t.Fatal("заперт удалённый файл, а захват его принял бы")
+	}
+	if ok {
+		unlock(stale)
+	}
+	if cOK {
+		c.Release()
 	}
 }
 
-// Peek не снимает лок и не считает вечно живым файл без владельца: упал
-// между созданием и записью — по возрасту, как breakIfStale.
+// Лок другого процесса исключает нас, а с его смертью снимается сам.
+func TestLockAcrossProcesses(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "x")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperHold$")
+	cmd.Env = append(os.Environ(), "LOCK_HELPER="+p)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	line, err := bufio.NewReader(out).ReadString('\n')
+	if err != nil || strings.TrimSpace(line) != "held" {
+		t.Fatalf("помощник не взял лок: %q %v", line, err)
+	}
+	if err := New(p, 300*time.Millisecond).Acquire(context.Background()); !IsBusy(err) {
+		t.Fatalf("лок живого процесса взят: %v", err)
+	}
+	if present, alive := Peek(p); !present || !alive {
+		t.Fatalf("Peek живого лока: %v %v", present, alive)
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+	l := New(p, 5*time.Second)
+	if err := l.Acquire(context.Background()); err != nil {
+		t.Fatalf("лок умершего процесса не снялся: %v", err)
+	}
+	l.Release()
+}
+
+func TestHelperHold(t *testing.T) {
+	p := os.Getenv("LOCK_HELPER")
+	if p == "" {
+		t.Skip("только помощник TestLockAcrossProcesses")
+	}
+	if err := New(p, time.Second).Acquire(context.Background()); err != nil {
+		os.Exit(2)
+	}
+	os.Stdout.WriteString("held\n")
+	time.Sleep(time.Minute)
+	os.Exit(0)
+}
+
+// Peek не удаляет файл и не считает вечно живым файл старой сборки без
+// владельца: упал между созданием и записью — по возрасту.
 func TestPeekMalformed(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "x")
@@ -71,8 +158,7 @@ func TestPeekMalformed(t *testing.T) {
 	}
 }
 
-// Горутины одного процесса берут один лок по очереди: файл со своим pid,
-// ещё не отмеченный в held, не принимается за осиротевший.
+// Горутины одного процесса берут один лок по очереди.
 func TestLockExclusiveInProcess(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "x")
 	var inside, worst atomic.Int32

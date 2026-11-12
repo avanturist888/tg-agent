@@ -1,8 +1,22 @@
-// Package lock — межпроцессные локи на файлах.
+// Package lock — межпроцессные локи.
 //
-// Лок — это файл <path>.lock, созданный с O_EXCL; внутри {"pid": …, "ts": …}.
+// Лок — блокировка ОС на файле <path>.lock (Windows — LockFileEx, иначе —
+// flock), а не сам факт существования файла. Её держит открытый дескриптор,
+// и снимает её ОС, когда процесс умирает. Поэтому протухших локов не бывает
+// и снимать чужое по pid или по возрасту не нужно. Это и закрывает гонку
+// прежней схемы (файл с O_EXCL), где «снять протухший» могло удалить уже
+// новый, живой лок другого процесса.
+//
 // Процессов много (служба, MCP-прослойка на каждую сессию Claude Code, CLI,
-// окно), а файлы в data/ — общие.
+// окно), а файлы в data/ — общие. Два дескриптора одного процесса тоже
+// исключают друг друга, так что лок разделяет и горутины.
+//
+// Файл лока — только место для блокировки. Отпуская лок, держатель его
+// удаляет (иначе файлы карточек копились бы), а захват проверяет, что путь
+// всё ещё ведёт к тому файлу, который он запер: иначе запер удалённый, и
+// захват начинается заново. Не удалился файл — не беда, его запрут заново.
+// Пока лок взят, в файле — {"pid": …, "ts": …}: для диагностики и для сборок
+// до OS-локов, которые узнают живой лок по pid.
 package lock
 
 import (
@@ -11,11 +25,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sync"
 	"time"
 )
 
-// StaleAfter — возраст лока без записанного владельца, после которого он протух.
+// StaleAfter — возраст файла лока старой сборки (O_EXCL) без записанного
+// владельца, после которого он считается брошенным (Peek).
 const StaleAfter = 120 * time.Second
 
 // Busy — лок держит кто-то другой дольше, чем мы согласны ждать.
@@ -28,22 +42,11 @@ func IsBusy(err error) bool {
 	return errors.As(err, &b)
 }
 
-var (
-	// heldMu — и над held, и над шагом «создать файл → записать → отметить в
-	// held»: иначе соседняя горутина увидела бы файл с нашим pid ещё без
-	// отметки, сочла бы его осиротевшим и сняла живой лок.
-	heldMu sync.Mutex
-	// локи, которые этот процесс держит прямо сейчас (путь → кто держит):
-	// отличают свой живой лок от своего же осиротевшего — pid в файле в обоих
-	// случаях наш
-	held = map[string]*File{}
-)
-
 // File — лок на файл path (сам лок — path + ".lock").
 type File struct {
 	Path    string
 	Timeout time.Duration
-	taken   bool
+	f       *os.File // открыт и заперт, пока лок наш
 }
 
 func New(path string, timeout time.Duration) *File {
@@ -55,68 +58,45 @@ type meta struct {
 	TS  float64 `json:"ts"`
 }
 
+// tryAcquire — одна попытка без ожидания.
 func (l *File) tryAcquire() (bool, error) {
-	heldMu.Lock()
-	f, err := os.OpenFile(l.Path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if l.f != nil {
+		return false, fmt.Errorf("лок %s уже взят этим же объектом", l.Path)
+	}
+	f, err := openLock(l.Path, true)
 	if err != nil {
-		heldMu.Unlock()
-		if errors.Is(err, os.ErrExist) || isSharingViolation(err) || errors.Is(err, os.ErrPermission) {
-			l.breakIfStale()
-			return false, nil
+		if errors.Is(err, os.ErrExist) || busyOpen(err) {
+			return false, nil // файл как раз удаляют, отпуская лок
 		}
 		return false, err
 	}
-	defer heldMu.Unlock()
-	now := float64(time.Now().UnixNano()) / 1e9
-	body, _ := json.Marshal(meta{PID: os.Getpid(), TS: now})
-	_, werr := f.Write(body)
-	// файл сразу закрываем: сам факт его существования и есть лок, а открытый
-	// дескриптор на Windows только мешает соседям читать и удалять
-	cerr := f.Close()
-	if werr != nil || cerr != nil {
-		_ = os.Remove(l.Path)
-		return false, errors.Join(werr, cerr)
+	ok, err := tryLock(f)
+	if err != nil || !ok {
+		_ = f.Close()
+		return false, err
 	}
-	held[l.Path] = l
-	l.taken = true
+	// прежний держатель мог удалить файл, пока мы его открывали: тогда
+	// заперт удалённый, а по пути уже лежит (или вот-вот ляжет) новый
+	if !samePath(f, l.Path) {
+		unlock(f)
+		_ = f.Close()
+		return false, nil
+	}
+	body, _ := json.Marshal(meta{PID: os.Getpid(), TS: float64(time.Now().UnixNano()) / 1e9})
+	if f.Truncate(0) == nil {
+		_, _ = f.WriteAt(body, 0) // только сведения: лок держит блокировка
+	}
+	l.f = f
 	return true, nil
 }
 
-func (l *File) breakIfStale() {
-	st, err := os.Stat(l.Path)
+func samePath(f *os.File, path string) bool {
+	a, err := f.Stat()
 	if err != nil {
-		return
+		return false
 	}
-	age := time.Since(st.ModTime())
-	data, err := os.ReadFile(l.Path)
-	if err != nil {
-		return
-	}
-	var m meta
-	_ = json.Unmarshal(data, &m)
-	var stale bool
-	switch {
-	case m.PID == os.Getpid():
-		// наш pid, но мы его не держим — снять файл при выходе не удалось.
-		// Проверка и снятие — под heldMu: между ними своя же горутина не
-		// возьмёт лок заново
-		heldMu.Lock()
-		defer heldMu.Unlock()
-		if held[l.Path] == nil {
-			_ = os.Remove(l.Path)
-		}
-		return
-	case m.PID != 0:
-		// Протухшим считаем только лок мёртвого владельца: живой процесс может
-		// законно держать сессию долго, сносить его лок по возрасту нельзя.
-		stale = !pidAlive(m.PID, m.TS)
-	default:
-		// владельца не записали (упал между созданием файла и записью pid)
-		stale = age > StaleAfter
-	}
-	if stale {
-		_ = os.Remove(l.Path) // не вышло — файл ещё открыт, значит, не протух
-	}
+	b, err := os.Stat(path)
+	return err == nil && os.SameFile(a, b)
 }
 
 // Acquire ждёт лок до Timeout или отмены ctx.
@@ -132,7 +112,7 @@ func (l *File) Acquire(ctx context.Context) error {
 		}
 		if time.Now().After(deadline) {
 			return &Busy{fmt.Sprintf("Сессия Telegram занята другим процессом tg-agent "+
-				"(лок %s). Подожди или удали лок-файл вручную.", l.Path)}
+				"(лок %s). Подожди и повтори.", l.Path)}
 		}
 		select {
 		case <-ctx.Done():
@@ -142,43 +122,21 @@ func (l *File) Acquire(ctx context.Context) error {
 	}
 }
 
-// Touch продлевает лок: демон держит его часами.
-func (l *File) Touch() {
-	if l.taken {
-		now := time.Now()
-		_ = os.Chtimes(l.Path, now, now)
-	}
-}
-
 // Release снимает лок. Падать нельзя: работа под локом уже сделана
 // (например, сообщение уже отправлено).
 func (l *File) Release() {
-	if !l.taken {
+	f := l.f
+	if f == nil {
 		return
 	}
-	l.taken = false
-	// сначала файл, потом отметка: пока файл наш, своя же горутина не сочтёт
-	// его осиротевшим; отметку снимаем, только если она всё ещё наша (после
-	// удаления файла лок могла взять соседняя горутина)
-	forget := func() {
-		heldMu.Lock()
-		if held[l.Path] == l {
-			delete(held, l.Path)
-		}
-		heldMu.Unlock()
-	}
-	defer forget()
-	// Windows не даёт удалить файл, пока его читает другой процесс, — это
-	// доли секунды, переждём
-	for i := 0; i < 40; i++ {
-		err := os.Remove(l.Path)
-		if err == nil || errors.Is(err, os.ErrNotExist) {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	// не вышло — файл останется с нашим pid; held его забудет, так что и
-	// мы, и другие (после нашей смерти) снимут его как протухший
+	l.f = nil
+	// файл удаляем, пока он заперт нами: тот, кто запрёт его после нас,
+	// увидит, что путь ведёт уже не к нему, и начнёт заново. Не удалился
+	// (его читают) — останется пустым, без нашего pid, и пригодится следующему
+	_ = f.Truncate(0)
+	_ = os.Remove(l.Path)
+	unlock(f)
+	_ = f.Close()
 }
 
 // With — выполнить fn под локом.
@@ -205,22 +163,49 @@ func Held(path string) bool {
 	return true
 }
 
-// Peek — лок path, не трогая его: есть ли файл и жив ли его владелец.
-// В отличие от Held не снимает мёртвый лок — он остаётся следом (например,
-// прерванной отправки). Нечитаемый файл (его как раз пишут) — живой.
+// Peek — лок path, не трогая файл: есть ли он и жив ли его владелец.
+// В отличие от Held не удаляет файл — он остаётся следом (например,
+// прерванной отправки старой сборки). Заперт — владелец жив. Не заперт —
+// судим по записи сборки до OS-локов: pid жив — жив; владельца не записали —
+// по возрасту (его как раз пишут или процесс упал между созданием и записью).
 func Peek(path string) (present, alive bool) {
-	raw, err := os.ReadFile(path + ".lock")
+	p := path + ".lock"
+	f, err := openLock(p, false)
 	if err != nil {
-		return !errors.Is(err, os.ErrNotExist), !errors.Is(err, os.ErrNotExist)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, false
+		}
+		return true, true // не открыть — его как раз удаляют или пишут
+	}
+	defer f.Close()
+	ok, err := tryLock(f)
+	if err != nil || !ok {
+		return true, true
+	}
+	defer unlock(f)
+	raw, err := readAll(f)
+	if err != nil {
+		return true, true
 	}
 	var m meta
 	if json.Unmarshal(raw, &m) != nil || m.PID == 0 {
-		// владельца не записали: его как раз пишут — или процесс упал между
-		// созданием файла и записью (тогда, как у breakIfStale, по возрасту)
-		st, err := os.Stat(path + ".lock")
+		st, err := f.Stat()
 		return true, err != nil || time.Since(st.ModTime()) <= StaleAfter
 	}
 	return true, pidAlive(m.PID, m.TS)
+}
+
+func readAll(f *os.File) ([]byte, error) {
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, st.Size())
+	n, err := f.ReadAt(buf, 0)
+	if n == len(buf) {
+		return buf, nil
+	}
+	return buf[:n], err
 }
 
 // PIDAlive — жив ли процесс pid, взявший что-то в момент since (unix, с

@@ -21,13 +21,13 @@ const (
 	TAgentFolders    = "agent_folders"
 	TAccountNotes    = "account_notes"
 	TChatSets        = "chat_sets"
-	TPendingCards    = "pending_cards"
+	TCardStates      = "card_states"
 )
 
 var docTables = map[string]bool{
 	TSubscriptions: true, TAccessRequests: true, TBotOps: true, TBots: true, TPinnedDrafts: true,
 	TT3Threads: true, TUpstreamSources: true, TUpstreamCards: true, TAgentFolders: true,
-	TAccountNotes: true, TChatSets: true, TPendingCards: true,
+	TAccountNotes: true, TChatSets: true, TCardStates: true,
 }
 
 // Table — набор записей V по строковому ключу; V хранится JSON.

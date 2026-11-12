@@ -196,12 +196,6 @@ func Serve(ctx context.Context, s *config.Settings, ev Events, onReady func(ctx 
 		return err
 	}
 	defer flock.Release()
-	go func() {
-		for ctx.Err() == nil {
-			flock.Touch()
-			sleep(ctx, time.Minute)
-		}
-	}()
 
 	// отметка обновлений и даты правок на диске: после перезапуска служба
 	// догоняет пропущенное за время простоя (updstate.go, edits.go)

@@ -367,8 +367,8 @@ func TestCardRetried(t *testing.T) {
 }
 
 // Уборка показывает прежний итог, а тем временем (другой процесс) пришёл
-// новый и тоже не показался: уборка снимает только тот, что показала, —
-// новый остаётся в очереди. Промежуточное «Отправляю…» в очередь не идёт.
+// новый и тоже не показался: уборка не отмечает показанным новый — он
+// остаётся в очереди. Промежуточное «Отправляю…» в очередь не идёт.
 func TestCardRetryKeepsNewer(t *testing.T) {
 	s := watchEnv(t)
 	box := outbox.New(s.DataDir())
@@ -383,33 +383,35 @@ func TestCardRetryKeepsNewer(t *testing.T) {
 	old := finishCard
 	finishCard = func(_ context.Context, _ *config.Settings, _ int64, _ *outbox.Draft, _, status, _ string) bool {
 		if up && strings.Contains(status, "первый") {
-			// пока уборка показывает первый, другой процесс записал новый итог
-			if err := pendingCardsTab.Put(ctx, db.Q(), d.ID, pendingCard{Card: cardID, Status: "⚠️ второй", At: time.Now()}); err != nil {
+			// пока уборка показывает первый, другой процесс принял новый итог
+			v, err := nextCardVersion(ctx, db, d.ID)
+			if err != nil {
 				t.Fatal(err)
 			}
+			rememberCard(ctx, s, db, d.ID, cardID, "⚠️ второй", v, false)
 		}
 		return up
 	}
 	t.Cleanup(func() { finishCard = old })
 	card(ctx, s, &cardID, d, "⚠️ первый")
 	card(ctx, s, &cardID, d, "⏳ **Отправляю…**") // не показалось, но и не заменило первый
-	if p, ok, _ := pendingCardsTab.Get(ctx, db.Q(), d.ID); !ok || p.Status != "⚠️ первый" {
-		t.Fatalf("в очереди: %+v %v", p, ok)
+	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); !st.pending() || st.Status != "⚠️ первый" {
+		t.Fatalf("в очереди: %+v", st)
 	}
 	up = true
 	retryCards(ctx, s)
-	if p, ok, _ := pendingCardsTab.Get(ctx, db.Q(), d.ID); !ok || p.Status != "⚠️ второй" {
-		t.Fatalf("новый итог потерян: %+v %v", p, ok)
+	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); !st.pending() || st.Status != "⚠️ второй" {
+		t.Fatalf("новый итог потерян: %+v", st)
 	}
 	retryCards(ctx, s)
-	if _, ok, _ := pendingCardsTab.Get(ctx, db.Q(), d.ID); ok {
-		t.Fatal("показанный итог остался в очереди")
+	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); st.pending() {
+		t.Fatalf("показанный итог остался в очереди: %+v", st)
 	}
 }
 
-// Другой процесс держит лок карточки: показывает новый итог и снимает
-// очередь. Уборка этого процесса ждёт лок, перечитывает очередь и прежний
-// итог поверх нового не показывает.
+// Другой процесс держит лок карточки: показывает новый итог. Уборка этого
+// процесса ждёт лок, перечитывает состояние и прежний итог поверх нового не
+// показывает.
 func TestCardRetryWaitsOtherProcess(t *testing.T) {
 	s := watchEnv(t)
 	box := outbox.New(s.DataDir())
@@ -419,9 +421,11 @@ func TestCardRetryWaitsOtherProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err := pendingCardsTab.Put(ctx, db.Q(), d.ID, pendingCard{Card: 55, Status: "⚠️ старый", At: time.Now()}); err != nil {
+	v, err := nextCardVersion(ctx, db, d.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
+	rememberCard(ctx, s, db, d.ID, 55, "⚠️ старый", v, false)
 	var shown []string
 	old := finishCard
 	finishCard = func(_ context.Context, _ *config.Settings, _ int64, _ *outbox.Draft, _, status, _ string) bool {
@@ -437,10 +441,12 @@ func TestCardRetryWaitsOtherProcess(t *testing.T) {
 	done := make(chan struct{})
 	go func() { retryCards(ctx, s); close(done) }()
 	time.Sleep(200 * time.Millisecond)
-	// «другой процесс» показал новый итог и снял очередь
-	if err := pendingCardsTab.Delete(ctx, db.Q(), d.ID); err != nil {
+	// «другой процесс» показал новый итог
+	v2, err := nextCardVersion(ctx, db, d.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
+	rememberCard(ctx, s, db, d.ID, 55, "✅ новый", v2, true)
 	other.Release()
 	<-done
 	if len(shown) != 0 {
@@ -448,9 +454,10 @@ func TestCardRetryWaitsOtherProcess(t *testing.T) {
 	}
 }
 
-// Показ прежнего итога не стирает из очереди итог новее себя (его записал
-// путь, не дождавшийся лока карточки, пока показывали прежний).
-func TestCardShownKeepsNewerQueued(t *testing.T) {
+// Итог, появившийся раньше, но опоздавший (не дождался лока или взял его
+// после более нового), не показывается и в очередь не встаёт: новый уже
+// показан и из очереди ушёл, но его номер остался.
+func TestCardDelayedOlderRejected(t *testing.T) {
 	s := watchEnv(t)
 	box := outbox.New(s.DataDir())
 	d := approved(t, box, "test")
@@ -459,16 +466,80 @@ func TestCardShownKeepsNewerQueued(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
+	var shown []string
 	old := finishCard
-	finishCard = func(context.Context, *config.Settings, int64, *outbox.Draft, string, string, string) bool { return true }
+	finishCard = func(_ context.Context, _ *config.Settings, _ int64, _ *outbox.Draft, _, status, _ string) bool {
+		shown = append(shown, status)
+		return true
+	}
 	t.Cleanup(func() { finishCard = old })
-	newer := pendingCard{Card: 55, Status: "✅ отправлено", At: time.Now().Add(time.Minute)}
-	if err := pendingCardsTab.Put(ctx, db.Q(), d.ID, newer); err != nil {
+	cardID := int64(55)
+
+	// A получил номер, не дождался лока; тем временем B показал свой итог
+	vA, err := nextCardVersion(ctx, db, d.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	cardID := int64(55)
-	card(ctx, s, &cardID, d, "⚠️ не отправлено")
-	if p, ok, _ := pendingCardsTab.Get(ctx, db.Q(), d.ID); !ok || p.Status != newer.Status {
-		t.Fatalf("новый итог стёрт старым: %+v %v", p, ok)
+	card(ctx, s, &cardID, d, "✅ B")
+	rememberCard(ctx, s, db, d.ID, cardID, "⚠️ A", vA, false)
+	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); st.pending() || st.Status != "✅ B" {
+		t.Fatalf("старый итог принят поверх нового: %+v", st)
+	}
+	retryCards(ctx, s)
+	if len(shown) != 1 || shown[0] != "✅ B" {
+		t.Fatalf("показано: %q", shown)
+	}
+
+	// A получил номер и ждёт лок; B (другой процесс) показал итог, пока A
+	// ждал; A взял лок после B — показывать нечего
+	shown = nil
+	other := lock.New(filepath.Join(s.DataDir(), "cards", d.ID), time.Second)
+	if err := other.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { card(ctx, s, &cardID, d, "⚠️ A2"); close(done) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, _, _ := cardStates.Get(ctx, db.Q(), d.ID)
+		if st.Next > vA+1 { // A2 уже получил номер
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("A2 не получил номер")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	vB, err := nextCardVersion(ctx, db, d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rememberCard(ctx, s, db, d.ID, cardID, "✅ B2", vB, true)
+	other.Release()
+	<-done
+	if len(shown) != 0 {
+		t.Fatalf("опоздавший итог показан поверх нового: %q", shown)
+	}
+	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); st.pending() || st.Status != "✅ B2" {
+		t.Fatalf("состояние: %+v", st)
+	}
+}
+
+// Удалённый черновик — и состояние его карточки уборка забывает.
+func TestCardStateForgottenWithDraft(t *testing.T) {
+	s := watchEnv(t)
+	db, err := stateDB(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	v, err := nextCardVersion(ctx, db, "nonexistent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rememberCard(ctx, s, db, "nonexistent", 55, "⚠️ итог", v, false)
+	retryCards(ctx, s)
+	if _, ok, _ := cardStates.Get(ctx, db.Q(), "nonexistent"); ok {
+		t.Fatal("состояние карточки удалённого черновика осталось")
 	}
 }

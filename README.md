@@ -754,7 +754,7 @@ internal/
   bot/             Bot API: карточки и кнопки, запасной маршрут через прокси
   gui/             окно управления: локальный HTTP + WebView2
   cli/             команды владельца
-  lock/            межпроцессные локи на файлах
+  lock/            межпроцессные локи (блокировки ОС на файлах)
   chatsfile/       правка config/chats.toml без потери комментариев
   audit/           журнал data/audit.jsonl
 scripts/

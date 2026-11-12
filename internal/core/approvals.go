@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -135,28 +136,48 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 	}
 }
 
-// showCard — показать итог и поправить очередь, не отпуская лок карточки:
-// отпусти его между показом и очередью — уборка успела бы взять прежний итог
-// и показать его поверх этого. Версия итога — когда его начали показывать:
-// не показанный уходит в очередь с ней, показанный снимает из очереди
-// только записи не новее себя (новую, пришедшую, пока ждали лок, — нет).
+// showCard — показать итог в карточке. Порядок итогов держит номер версии
+// из базы (nextCardVersion): его выдают, когда итог появился, — раньше, чем
+// путь начнёт ждать лок карточки. Под локом итог, у которого уже есть более
+// новый принятый (показанный или ждущий показа), не показывается: путь мог
+// застрять перед локом или в очереди к нему, а лок не держит порядок
+// пришедших. Не показанный уходит в очередь (rememberCard). Лок не
+// отпускается между показом и записью: иначе уборка успела бы показать
+// прежний итог поверх этого.
 func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID int64, status string) {
-	version := time.Now()
+	db, err := stateDB(s)
+	var ver int64
+	if err == nil {
+		ver, err = nextCardVersion(ctx, db, d.ID)
+	}
+	if err != nil {
+		// без базы порядок не проверить и в очередь не поставить — показать
+		// хотя бы этот итог: иначе карточка так и висела бы на «Отправляю…»
+		_ = audit.Log(s.AuditPath(), "card_version_failed", "draft_id", d.ID, "error", err.Error())
+		if unlock, ok := lockCard(ctx, s, d.ID); ok {
+			defer unlock()
+			finishCard(ctx, s, cardID, d, title(s, d), status, d.Note)
+		}
+		return
+	}
 	unlock, ok := lockCard(ctx, s, d.ID)
 	if !ok {
-		rememberCard(s, d.ID, cardID, status, version, false)
+		rememberCard(ctx, s, db, d.ID, cardID, status, ver, false)
 		return
 	}
 	defer unlock()
+	if cur, ok, err := cardStates.Get(ctx, db.Q(), d.ID); err == nil && ok && cur.Ver > ver {
+		return // уже принят итог новее — этот устарел, пока ждал
+	}
 	shown := finishCard(ctx, s, cardID, d, title(s, d), status, d.Note)
-	rememberCard(s, d.ID, cardID, status, version, shown)
+	rememberCard(ctx, s, db, d.ID, cardID, status, ver, shown)
 }
 
 // lockCard — итог в карточку одного черновика показывают по одному, во всех
 // процессах профиля (card и уборка retryCards): иначе уборка показала бы
-// прежний итог поверх нового или стёрла из очереди новый, ещё не
-// показанный. Лок — файловый (data/cards/<id>), сетевой вызов — под ним, но
-// вне транзакции базы. Не дождались — итог не показан (уйдёт в очередь).
+// прежний итог поверх нового. Лок — блокировка ОС на файле data/cards/<id>,
+// сетевой вызов — под ним, но вне транзакции базы. Не дождались — итог не
+// показан (уйдёт в очередь).
 func lockCard(ctx context.Context, s *config.Settings, draftID string) (func(), bool) {
 	dir := filepath.Join(s.DataDir(), "cards")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -179,101 +200,131 @@ func intermediate(status string) bool { return strings.HasPrefix(status, "⏳") 
 
 var finishCard = bot.FinishCard // тесты подменяют
 
-// pendingCard — итог, который не удалось показать в карточке.
-type pendingCard struct {
-	Card   int64     `json:"card"`
-	Status string    `json:"status"`
-	At     time.Time `json:"at"`
+// cardState — итоги карточки черновика (таблица card_states, ключ — id
+// черновика). Номера версий выдаёт база по порядку появления итогов: часы
+// процессов для этого не годятся — их поправляют и назад. Запись живёт, пока
+// жив черновик, и после показа: по ней отвергается итог, опоздавший к локу.
+type cardState struct {
+	Card   int64  `json:"card,omitempty"`
+	Status string `json:"status,omitempty"` // итог версии Ver
+	Ver    int64  `json:"ver"`              // последний принятый итог
+	Next   int64  `json:"next"`             // последний выданный номер
+	Shown  bool   `json:"shown"`            // итог Ver уже в карточке
 }
 
-var pendingCardsTab = store.NewTable[pendingCard](store.TPendingCards)
+// pending — принятый итог ещё не показан: уборка повторит.
+func (c cardState) pending() bool { return !c.Shown && c.Status != "" }
 
-// rememberCard — показан итог — забыть прежний несостоявшийся; не показан —
-// запомнить (последний итог черновика главнее): retryCards покажет, когда
-// Bot API ответит, — иначе карточка так и висела бы на «Отправляю…».
-func rememberCard(s *config.Settings, draftID string, cardID int64, status string, version time.Time, shown bool) {
-	if !shown && intermediate(status) {
-		return // прежний несостоявшийся окончательный главнее — его не трогаем
-	}
-	db, err := stateDB(s)
-	if err != nil {
-		return
-	}
-	err = pendingCardsTab.Edit(context.Background(), db, func(m map[string]pendingCard) bool {
-		cur, queued := m[draftID]
-		if queued && cur.At.After(version) {
-			return false // в очереди итог новее этого — он главнее
+var cardStates = store.NewTable[cardState](store.TCardStates)
+
+// editCardState — прочитать, решить и записать состояние карточки одной
+// транзакцией (между процессами — тоже).
+func editCardState(ctx context.Context, db *store.DB, id string, fn func(cur cardState, ok bool) (cardState, bool)) error {
+	return db.Write(ctx, func(tx *sql.Tx) error {
+		cur, ok, err := cardStates.Get(ctx, tx, id)
+		if err != nil {
+			return err
 		}
-		if shown {
-			if !queued {
-				return false
-			}
-			delete(m, draftID)
-		} else {
-			m[draftID] = pendingCard{Card: cardID, Status: status, At: version}
+		next, write := fn(cur, ok)
+		if !write {
+			return nil
 		}
-		return true
+		return cardStates.Put(ctx, tx, id, next)
+	})
+}
+
+// nextCardVersion — номер для нового итога карточки черновика id.
+func nextCardVersion(ctx context.Context, db *store.DB, id string) (int64, error) {
+	var v int64
+	err := editCardState(ctx, db, id, func(cur cardState, ok bool) (cardState, bool) {
+		if !ok {
+			cur.Shown = true // ждущего показа итога нет
+		}
+		cur.Next = max(cur.Next, cur.Ver) + 1
+		v = cur.Next
+		return cur, true
+	})
+	return v, err
+}
+
+// rememberCard — принять итог версии ver: показан — он теперь в карточке (и
+// снимает прежний ждущий); не показан — ждёт, retryCards покажет, когда Bot
+// API ответит, — иначе карточка так и висела бы на «Отправляю…». Итог старше
+// уже принятого не принимается: новый главнее, даже если тот ещё не показан.
+func rememberCard(ctx context.Context, s *config.Settings, db *store.DB, draftID string, cardID int64, status string, ver int64, shown bool) {
+	err := editCardState(ctx, db, draftID, func(cur cardState, _ bool) (cardState, bool) {
+		if cur.Ver > ver {
+			return cur, false
+		}
+		if !shown && intermediate(status) {
+			return cur, false // промежуточный не повторяем, прежний ждущий — главнее
+		}
+		cur.Card, cur.Status, cur.Ver, cur.Shown = cardID, status, ver, shown
+		cur.Next = max(cur.Next, ver)
+		return cur, true
 	})
 	if err != nil {
 		_ = audit.Log(s.AuditPath(), "card_pending_failed", "draft_id", draftID, "error", err.Error())
 	}
 }
 
-// retryCards — уборка службы: показать итоги, которые не показались.
+// retryCards — уборка службы: показать итоги, которые не показались, и
+// забыть карточки удалённых черновиков.
 func retryCards(ctx context.Context, s *config.Settings) {
 	db, err := stateDB(s)
 	if err != nil {
 		return
 	}
-	pending, err := pendingCardsTab.All(ctx, db.Q())
+	_ = db.Write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, "DELETE FROM "+store.TCardStates+" WHERE key NOT IN (SELECT id FROM drafts)")
+		return err
+	})
+	states, err := cardStates.All(ctx, db.Q())
 	if err != nil {
 		return
 	}
 	box := outbox.New(s.DataDir())
-	for id := range pending {
+	for id, st := range states {
 		if ctx.Err() != nil {
 			return
 		}
-		retryCard(ctx, s, db, box, id)
+		if st.pending() {
+			retryCard(ctx, s, db, box, id)
+		}
 	}
 }
 
-// retryCard — показать запомненный итог черновика id. Запись перечитывается
-// под локом карточки (её мог заменить или снять card), а снимается только
-// та, что показана: новую, пришедшую позже, уборка не стирает.
+// retryCard — показать ждущий итог черновика id. Состояние перечитывается
+// под локом карточки (его мог поменять card в другом процессе), а показанным
+// отмечается, только если принятый итог всё тот же: новый, пришедший позже,
+// уборка не трогает.
 func retryCard(ctx context.Context, s *config.Settings, db *store.DB, box *outbox.Outbox, id string) {
 	unlock, ok := lockCard(ctx, s, id)
 	if !ok {
 		return
 	}
 	defer unlock()
-	p, ok, err := pendingCardsTab.Get(ctx, db.Q(), id)
-	if err != nil || !ok {
+	st, ok, err := cardStates.Get(ctx, db.Q(), id)
+	if err != nil || !ok || !st.pending() {
 		return
 	}
 	d, err := box.Get(id)
 	var nf *outbox.NotFound
 	if errors.As(err, &nf) {
-		dropCard(ctx, db, id, p) // черновика нет — и карточку держать незачем
+		_ = cardStates.Delete(ctx, db.Q(), id) // черновика нет — и карточку держать незачем
 		return
 	}
-	if err != nil || !finishCard(ctx, s, p.Card, d, title(s, d), p.Status, d.Note) {
+	if err != nil || !finishCard(ctx, s, st.Card, d, title(s, d), st.Status, d.Note) {
 		return
 	}
-	dropCard(ctx, db, id, p)
-	_ = audit.Log(s.AuditPath(), "card_recovered", "draft_id", id, "message_id", p.Card)
-}
-
-// dropCard — снять запись, если это всё ещё она (другой процесс мог
-// записать новый итог).
-func dropCard(ctx context.Context, db *store.DB, id string, shown pendingCard) {
-	_ = pendingCardsTab.Edit(ctx, db, func(m map[string]pendingCard) bool {
-		if cur, ok := m[id]; ok && cur.At.Equal(shown.At) && cur.Status == shown.Status {
-			delete(m, id)
-			return true
+	_ = editCardState(ctx, db, id, func(cur cardState, ok bool) (cardState, bool) {
+		if !ok || cur.Ver != st.Ver {
+			return cur, false
 		}
-		return false
+		cur.Shown = true
+		return cur, true
 	})
+	_ = audit.Log(s.AuditPath(), "card_recovered", "draft_id", id, "message_id", st.Card)
 }
 
 var sendClaimed = deliverClaimed // тесты подменяют
@@ -947,7 +998,6 @@ func RunButtons(ctx context.Context, s *config.Settings, loader func() (*config.
 	setCommands(ctx, s)
 	RecoverInterrupted(ctx, s)
 	for ctx.Err() == nil {
-		updates.Touch() // иначе лок сочтут протухшим и перехватят
 		if fresh, err := loader(); err == nil {
 			s = fresh // белый список и права могли поменяться
 		}

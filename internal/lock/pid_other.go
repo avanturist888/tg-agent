@@ -15,5 +15,3 @@ func pidAlive(pid int, since float64) bool {
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
-
-func isSharingViolation(error) bool { return false }
