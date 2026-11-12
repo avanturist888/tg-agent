@@ -117,11 +117,14 @@ type Draft struct {
 	Vote *VoteSpec
 	// Bot — не сообщение, а действие в BotFather
 	Bot *BotSpec
-	// CardDue — ушло, а итог «Отправлено» в карточке ещё не показан: ставит
-	// MarkSent в той же записи, снимает показ (CardShown). Процесс умер
-	// между ними — итог покажет уборка (core.showDueCards), а не оставит
-	// карточку на «Отправляю…».
-	CardDue bool
+	// CardDue — окончательный итог (отправлено, отменено, протухло) в
+	// карточке ещё не показан: ставит та же запись, что меняет статус
+	// (MarkSent, Cancel, протухание), CardDueAt — когда; снимает показ
+	// (CardShown). Процесс умер или база и Bot API не ответили между ними —
+	// итог покажет уборка (core.showDueCards), а не оставит карточку
+	// прежней.
+	CardDue   bool
+	CardDueAt string
 
 	extra *omap.Map // поля от других версий — возвращаем при записи как есть
 }
@@ -131,7 +134,7 @@ var known = map[string]bool{
 	"status": true, "origin": true, "approved_at": true, "sent_at": true, "message_id": true,
 	"bot_message_id": true, "fmt": true, "files": true, "send_error": true, "note": true,
 	"history": true, "send_at": true, "topic": true, "topic_title": true, "edit_of": true, "edit_old": true,
-	"poll": true, "vote": true, "bot": true, "card_due": true,
+	"poll": true, "vote": true, "bot": true, "card_due": true, "card_due_at": true,
 }
 
 func (d *Draft) MarshalJSON() ([]byte, error) {
@@ -172,6 +175,7 @@ func (d *Draft) MarshalJSON() ([]byte, error) {
 	}
 	if d.CardDue {
 		m.Set("card_due", true)
+		m.Set("card_due_at", d.CardDueAt)
 	}
 	return m.MarshalJSON()
 }
@@ -208,6 +212,7 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		Vote         *VoteSpec         `json:"vote"`
 		Bot          *BotSpec          `json:"bot"`
 		CardDue      bool              `json:"card_due"`
+		CardDueAt    string            `json:"card_due_at"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
@@ -218,7 +223,7 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		SentAt: aux.SentAt, MessageID: aux.MessageID, BotMessageID: aux.BotMessageID, Fmt: aux.Fmt,
 		Files: aux.Files, SendError: aux.SendError, Note: aux.Note, History: aux.History, SendAt: aux.SendAt,
 		Topic: aux.Topic, TopicTitle: aux.TopicTitle, EditOf: aux.EditOf, EditOld: aux.EditOld, Poll: aux.Poll, Vote: aux.Vote,
-		Bot: aux.Bot, CardDue: aux.CardDue,
+		Bot: aux.Bot, CardDue: aux.CardDue, CardDueAt: aux.CardDueAt,
 	}
 	if d.Status == "" {
 		d.Status = Pending
@@ -399,6 +404,7 @@ func (o *Outbox) Cancel(id, by string) (*Draft, error) {
 			return &BadState{fmt.Sprintf("Поздно: окно отмены закрылось, черновик %s уже отправляется.", id)}
 		}
 		d.Status = Cancelled
+		d.dueCard(time.Now())
 		d.AddHistory("event", "cancelled", "by", by, "at", audit.Now())
 		return nil
 	})
@@ -420,13 +426,21 @@ func (o *Outbox) MarkSendError(id, msg string) (*Draft, error) {
 	})
 }
 
-// CardShown — итог «Отправлено» в карточке показан (снять CardDue).
+// CardShown — окончательный итог в карточке показан (снять CardDue).
 func (o *Outbox) CardShown(id string) error {
 	_, err := o.Update(id, func(d *Draft) error {
-		d.CardDue = false
+		d.CardDue, d.CardDueAt = false, ""
 		return nil
 	})
 	return err
+}
+
+// dueCard — статус стал окончательным: итог ждёт показа в карточке (если
+// карточка есть).
+func (d *Draft) dueCard(now time.Time) {
+	if d.BotMessageID != nil && *d.BotMessageID != 0 {
+		d.CardDue, d.CardDueAt = true, now.Format(time.RFC3339)
+	}
 }
 
 func (o *Outbox) MarkSent(id string, messageID int64, at string) (*Draft, error) {
@@ -435,7 +449,8 @@ func (o *Outbox) MarkSent(id string, messageID int64, at string) (*Draft, error)
 		d.SendError = nil
 		d.SentAt = &at
 		d.MessageID = &messageID
-		d.CardDue = d.BotMessageID != nil && *d.BotMessageID != 0
+		d.CardDue, d.CardDueAt = false, ""
+		d.dueCard(time.Now())
 		d.AddHistory("event", "sent", "at", at, "message_id", messageID)
 		return nil
 	})

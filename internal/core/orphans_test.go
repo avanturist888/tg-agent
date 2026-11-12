@@ -828,3 +828,33 @@ func TestCardNoVersionStaleNotShown(t *testing.T) {
 		t.Fatalf("правдивый итог без номера: %q", shown)
 	}
 }
+
+// Отмена записалась, а итог в карточку не показался (Bot API не ответил) —
+// уборка покажет «Отменено», а не оставит карточку прежней.
+func TestCardDueCancelled(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	if _, err := box.AttachCard(d.ID, 55); err != nil {
+		t.Fatal(err)
+	}
+	c, err := box.Cancel(d.ID, "test")
+	if err != nil || !c.CardDue {
+		t.Fatalf("CardDue после отмены: %v %v", err, c != nil && c.CardDue)
+	}
+	var shown []string
+	old, oldAfter := finishCard, recoverOrphansAfter
+	finishCard = func(_ context.Context, _ *config.Settings, _ int64, _ *outbox.Draft, _, status, _ string) bool {
+		shown = append(shown, status)
+		return true
+	}
+	recoverOrphansAfter = 0
+	t.Cleanup(func() { finishCard, recoverOrphansAfter = old, oldAfter })
+	showDueCards(context.Background(), s)
+	if len(shown) != 1 || !strings.HasPrefix(shown[0], "✋") {
+		t.Fatalf("показано: %q", shown)
+	}
+	if got, _ := box.Get(d.ID); got.CardDue {
+		t.Fatal("CardDue не снят после показа")
+	}
+}

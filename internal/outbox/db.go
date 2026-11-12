@@ -43,6 +43,9 @@ func decode(body string) (*Draft, error) {
 // это попадает с ближайшей записью (expire), чтения ничего не пишут.
 func touch(d *Draft, now time.Time) *Draft {
 	if d.IsExpired(now) {
+		if d.Status != Expired {
+			d.dueCard(now)
+		}
 		d.Status = Expired
 	}
 	return d
@@ -108,6 +111,7 @@ func expire(ctx context.Context, tx *sql.Tx, now time.Time) error {
 	}
 	for _, d := range stale {
 		d.Status = Expired
+		d.dueCard(now)
 		if err := save(ctx, tx, d); err != nil {
 			return err
 		}

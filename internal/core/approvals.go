@@ -279,13 +279,19 @@ func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID i
 	shown := finishCard(ctx, s, cardID, d, title(s, d), status, d.Note)
 	if shown {
 		rememberCard(ctx, s, db, d.ID, cardID, status, ver, true)
-		if strings.HasPrefix(status, "✅") {
+		if finalOutcome(status) {
 			markCardShown(s, d.ID)
 		}
 	}
 }
 
-// markCardShown — «Отправлено» в карточке: снять у черновика CardDue.
+// finalOutcome — окончательный итог (отправлено, отменено, протухло): его
+// показ снимает CardDue. Сверку с черновиком он уже прошёл (freshFits).
+func finalOutcome(status string) bool {
+	return strings.HasPrefix(status, "✅") || strings.HasPrefix(status, "✋") || strings.HasPrefix(status, "⌛")
+}
+
+// markCardShown — окончательный итог в карточке: снять у черновика CardDue.
 func markCardShown(s *config.Settings, id string) {
 	box := outbox.New(s.DataDir())
 	if d, err := box.Get(id); err == nil && d.CardDue {
@@ -295,12 +301,13 @@ func markCardShown(s *config.Settings, id string) {
 	}
 }
 
-// showDueCards — «Отправлено» в карточки ушедших черновиков, чей итог так и
-// не показали (CardDue): процесс, отправивший их, умер между отметкой и
-// карточкой. Свежие (до recoverOrphansAfter) не трогаем — их карточку
-// сейчас показывает сам отправивший.
+// showDueCards — окончательный итог (отправлено, отменено, протухло) в
+// карточки, где его так и не показали (CardDue): процесс умер между
+// отметкой и карточкой или ни база, ни Bot API тогда не ответили. Свежие
+// (до recoverOrphansAfter) не трогаем — их карточку сейчас показывает тот,
+// кто менял статус.
 func showDueCards(ctx context.Context, s *config.Settings) {
-	drafts, err := outbox.New(s.DataDir()).List(outbox.Sent)
+	drafts, err := outbox.New(s.DataDir()).List("")
 	if err != nil {
 		return
 	}
@@ -308,14 +315,18 @@ func showDueCards(ctx context.Context, s *config.Settings) {
 		if ctx.Err() != nil {
 			return
 		}
-		if !d.CardDue || d.BotMessageID == nil || d.MessageID == nil || d.SentAt == nil {
+		if !d.CardDue || d.BotMessageID == nil || !isFinal(d.Status) || (d.Status == outbox.Sent && d.MessageID == nil) {
 			continue
 		}
-		if at, err := time.Parse(time.RFC3339, *d.SentAt); err == nil && time.Since(at) < recoverOrphansAfter {
+		since := d.CardDueAt // когда статус стал окончательным
+		if d.Status == outbox.Sent && d.SentAt != nil {
+			since = *d.SentAt
+		}
+		if at, err := time.Parse(time.RFC3339, since); err == nil && time.Since(at) < recoverOrphansAfter {
 			continue
 		}
-		_ = audit.Log(s.AuditPath(), "card_due_shown", "draft_id", d.ID)
-		card(ctx, s, d.BotMessageID, d, sentSummary(s, d, *d.MessageID))
+		_ = audit.Log(s.AuditPath(), "card_due_shown", "draft_id", d.ID, "status", d.Status)
+		card(ctx, s, d.BotMessageID, d, finalSummary(s, d))
 	}
 }
 
@@ -1221,7 +1232,7 @@ func refreshFailedCards(ctx context.Context, s *config.Settings) {
 // одобрил, умер, не взяв черновик в отправку (tg tool-call без службы,
 // перенос очереди старой сборки уже после запуска службы). Пока отправляет
 // живой процесс, черновик держит его захват (ClaimSend) — второй отправки нет.
-const recoverOrphansAfter = time.Minute
+var recoverOrphansAfter = time.Minute // тесты сокращают
 
 // recoverApproved — дослать одобренное кнопкой или автоотправкой раньше
 // cutoff, которое никто не отправил.
