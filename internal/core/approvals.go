@@ -44,10 +44,61 @@ func botID(s *config.Settings) string {
 	return id
 }
 
-// botOffset — смещение getUpdates и чей бот (kv bot_offset).
+// botOffset — смещение getUpdates и чей бот (kv bot_offset). Inflight и
+// Tries — решение владельца, которое сейчас разбирается (смещение за него
+// ещё не сдвинуто, см. Pump), и сколько раз его начинали.
 type botOffset struct {
-	Offset int64  `json:"offset"`
-	Bot    string `json:"bot"`
+	Offset   int64  `json:"offset"`
+	Bot      string `json:"bot"`
+	Inflight int64  `json:"inflight,omitempty"`
+	Tries    int    `json:"tries,omitempty"`
+}
+
+// maxUpdateTries — столько раз разбор одного решения может начаться заново
+// (процесс умер посреди него); дальше оно пропускается: апдейт, роняющий
+// службу, иначе ронял бы её по кругу.
+const maxUpdateTries = 3
+
+// startInflight — отметить, что решение id начали разбирать; вернёт, в
+// который раз. Ошибка базы — 1: смещение тогда тоже не записалось бы, и
+// разбор лучше повторить, чем потерять.
+func startInflight(s *config.Settings, offset, id int64) int {
+	db, err := stateDB(s)
+	if err != nil {
+		return 1
+	}
+	tries := 1
+	ctx := context.Background()
+	err = db.Write(ctx, func(tx *sql.Tx) error {
+		var v botOffset
+		if ok, err := store.GetKV(ctx, tx, store.KeyBotOffset, &v); err != nil {
+			return err
+		} else if ok && v.Inflight == id && v.Bot == botID(s) {
+			tries = v.Tries + 1
+		}
+		return store.PutKV(ctx, tx, store.KeyBotOffset, botOffset{Offset: offset, Bot: botID(s), Inflight: id, Tries: tries})
+	})
+	if err != nil {
+		_ = audit.Log(s.AuditPath(), "bot_offset_failed", "error", err.Error())
+		return 1
+	}
+	return tries
+}
+
+// isDecision — апдейт несёт решение владельца, разбор которого можно
+// повторить без вреда (повтор видит уже принятое и ничего не меняет
+// дважды): кнопки черновика, запроса доступа, «Разобрано». Такие сдвигают
+// смещение только после разбора — умри процесс посреди, Telegram отдаст
+// нажатие снова, а не потеряет его. Остальное (переключатель автоотправки,
+// заметки, команды) повтор исполнил бы дважды — им смещение сдвигается до
+// разбора: потерянное нажатие владелец видит (меню не ответило) и
+// повторит, а двойное переключение молча сделало бы обратное.
+func isDecision(u bot.Update) bool {
+	if u.CallbackQuery == nil {
+		return false
+	}
+	_, data := config.SplitCallback(u.CallbackQuery.Data)
+	return strings.HasPrefix(data, "d:") || strings.HasPrefix(data, "a:") || data == upstreamAck
 }
 
 func loadOffset(s *config.Settings) (botOffset, bool) {
@@ -876,31 +927,62 @@ func Pump(ctx context.Context, s *config.Settings, until time.Time, stop func() 
 			sleepCtx(ctx, 5*time.Second)
 			continue
 		}
-		for _, u := range updates {
-			offset = max(offset, u.UpdateID+1)
-			writeOffset(s, offset)
-			if u.CallbackQuery != nil {
-				func() {
-					// одно нажатие не должно ронять службу
-					defer func() {
-						if r := recover(); r != nil {
-							_ = audit.Log(s.AuditPath(), "callback_failed", "error", fmt.Sprint(r))
-						}
-					}()
-					HandleCallback(ctx, s, u.CallbackQuery)
-				}()
-			}
-			if u.Message != nil {
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							_ = audit.Log(s.AuditPath(), "command_failed", "error", fmt.Sprint(r))
-						}
-					}()
-					HandleMessage(ctx, s, u.Message)
-				}()
-			}
+		offset = pumpUpdates(ctx, s, offset, updates)
+	}
+}
+
+var updateHandler = handleUpdate // тесты подменяют
+
+// pumpUpdates — разобрать пачку апдейтов, вернуть новое смещение. Решения
+// владельца (isDecision) сдвигают записанное смещение после разбора,
+// остальное — до.
+func pumpUpdates(ctx context.Context, s *config.Settings, offset int64, updates []bot.Update) int64 {
+	for _, u := range updates {
+		if u.UpdateID < offset {
+			continue // уже разобран
 		}
+		decision := isDecision(u)
+		if decision {
+			if tries := startInflight(s, offset, u.UpdateID); tries > maxUpdateTries {
+				_ = audit.Log(s.AuditPath(), "bot_update_skipped", "update_id", u.UpdateID, "tries", tries-1)
+				offset = u.UpdateID + 1
+				writeOffset(s, offset)
+				continue
+			}
+		} else {
+			writeOffset(s, u.UpdateID+1)
+		}
+		updateHandler(ctx, s, u)
+		offset = u.UpdateID + 1
+		if decision {
+			writeOffset(s, offset)
+		}
+	}
+	return offset
+}
+
+// handleUpdate — разобрать один апдейт бота; паника не роняет службу.
+func handleUpdate(ctx context.Context, s *config.Settings, u bot.Update) {
+	if u.CallbackQuery != nil {
+		func() {
+			// одно нажатие не должно ронять службу
+			defer func() {
+				if r := recover(); r != nil {
+					_ = audit.Log(s.AuditPath(), "callback_failed", "error", fmt.Sprint(r))
+				}
+			}()
+			HandleCallback(ctx, s, u.CallbackQuery)
+		}()
+	}
+	if u.Message != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					_ = audit.Log(s.AuditPath(), "command_failed", "error", fmt.Sprint(r))
+				}
+			}()
+			HandleMessage(ctx, s, u.Message)
+		}()
 	}
 }
 

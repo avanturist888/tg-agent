@@ -56,24 +56,26 @@ func RolledBack(dir string) bool {
 
 // ClearRollback — снять отметку отката (tg cutover: процессов старой
 // сборки больше нет, её файлы снова переносятся в базу).
-// rollbackEpisode — номер этого отката (из отметки): повтор выгрузки до
-// tg cutover — тот же откат, следующий после cutover — новый.
-func rollbackEpisode(dir string) string {
+// rollbackMark — отметка отката (data/legacy-rollback): номер этого отката
+// (повтор выгрузки до tg cutover — тот же откат, следующий после cutover —
+// новый) и закончилась ли его выгрузка (Complete: после неё владелец
+// запускает старую сборку).
+type rollbackMark struct {
+	At       string `json:"at"`
+	Episode  string `json:"episode"`
+	Complete bool   `json:"complete,omitempty"`
+}
+
+func readRollback(dir string) (rollbackMark, bool) {
+	var v rollbackMark
 	raw, err := os.ReadFile(filepath.Join(dir, RollbackFile))
-	if err != nil {
-		return ""
+	if err != nil || json.Unmarshal(raw, &v) != nil {
+		return v, false
 	}
-	var v struct {
-		Episode string `json:"episode"`
-		At      string `json:"at"`
+	if v.Episode == "" {
+		v.Episode = v.At
 	}
-	if json.Unmarshal(raw, &v) != nil {
-		return ""
-	}
-	if v.Episode != "" {
-		return v.Episode
-	}
-	return v.At
+	return v, v.Episode != ""
 }
 
 func ClearRollback(dir string) error {
@@ -151,9 +153,9 @@ func ExportLegacy(dir string) ([]string, error) {
 	err = db.write(ctx, true, func(tx *sql.Tx) error {
 		// повтор выгрузки (прошлая сорвалась) — тот же откат: отметку с его
 		// номером не переписываем
-		if rollbackEpisode(dir) == "" {
+		if _, ok := readRollback(dir); !ok {
 			now := time.Now()
-			raw, _ := json.Marshal(map[string]any{"at": now.Format(time.RFC3339), "episode": now.Format(time.RFC3339Nano)})
+			raw, _ := json.Marshal(rollbackMark{At: now.Format(time.RFC3339), Episode: now.Format(time.RFC3339Nano)})
 			if err := fsx.WriteFile(filepath.Join(dir, RollbackFile), raw, 0o600); err != nil {
 				return err
 			}
@@ -229,6 +231,17 @@ func ExportLegacy(dir string) ([]string, error) {
 			continue
 		}
 		done = append(done, m.file)
+	}
+	if len(errs) == 0 {
+		// выгрузка закончена — дальше старую сборку можно запускать, и
+		// черновики, отданные ей на досылку, она уже могла отправить
+		if mark, ok := readRollback(dir); ok && !mark.Complete {
+			mark.Complete = true
+			raw, _ := json.Marshal(mark)
+			if err := fsx.WriteFile(filepath.Join(dir, RollbackFile), raw, 0o600); err != nil {
+				errs = append(errs, fmt.Errorf("отметка отката: %w", err))
+			}
+		}
 	}
 	return done, errors.Join(errs...)
 }
@@ -336,10 +349,11 @@ func jsonOut(v any) ([]byte, error) { return json.MarshalIndent(v, "", "  ") }
 func exportOutbox(ctx context.Context, tx *sql.Tx, dir string) ([]byte, error) {
 	drafts := []map[string]json.RawMessage{}
 	var handed []string // одобренные без попытки: их досылает старая сборка
-	episode := rollbackEpisode(dir)
-	if episode == "" {
+	mark, ok := readRollback(dir)
+	if !ok {
 		return nil, errors.New("нет отметки отката")
 	}
+	episode := mark.Episode
 	err := eachRow(ctx, tx, "SELECT id, status, body, send_attempts, sender_pid, sender_since FROM drafts ORDER BY seq", func(r *sql.Rows) error {
 		var (
 			id, status, body string
@@ -358,12 +372,15 @@ func exportOutbox(ctx context.Context, tx *sql.Tx, dir string) ([]byte, error) {
 			return fmt.Errorf("черновик %s: %w", id, err)
 		}
 		m["status"] = jsonString(status)
-		// отдан на досылку этим же откатом (повтор выгрузки) — попытки не
-		// было, её отметила сама выгрузка; отдан прошлым — настоящая
-		var mark string
-		_ = json.Unmarshal(m[handoffKey], &mark)
+		// отдан на досылку этим же откатом, и его выгрузка ещё не
+		// закончилась (повтор после сбоя: старую сборку до конца выгрузки не
+		// запускают) — попытки не было, её отметила сама выгрузка. Отдан
+		// прошлым откатом или этим, но уже законченным, — старая сборка
+		// могла его отправить: попытка настоящая
+		var handedBy string
+		_ = json.Unmarshal(m[handoffKey], &handedBy)
 		delete(m, handoffKey) // старой сборке пометка не нужна, а повтор даст тот же файл
-		if mark == episode {
+		if handedBy == episode && !mark.Complete {
 			attempts = 0
 		}
 		noError := len(m["send_error"]) == 0 || string(m["send_error"]) == "null"

@@ -868,8 +868,15 @@ func TestExportHandsApprovedOnce(t *testing.T) {
 	if err != nil || !strings.Contains(string(raw), `"approved"`) || strings.Contains(string(raw), "send_error") {
 		t.Fatalf("старой сборке — не на досылку: %v %s", err, raw)
 	}
-	// повтор выгрузки того же отката (прошлая сорвалась на другом файле) —
-	// тот же файл: пометка выгрузки — не попытка
+	mark, ok := readRollback(dir)
+	if !ok || !mark.Complete {
+		t.Fatalf("законченная выгрузка не отмечена: %+v", mark)
+	}
+	// повтор выгрузки того же отката, прошлая сорвалась (до конца — старую
+	// сборку не запускали) — тот же файл: пометка выгрузки — не попытка
+	mark.Complete = false
+	rb, _ := json.Marshal(mark)
+	write(t, filepath.Join(dir, RollbackFile), string(rb))
 	if _, err := db.Q().Exec("UPDATE legacy_imports SET size = 0, mtime = 0 WHERE exported != 0"); err != nil {
 		t.Fatal(err)
 	}
@@ -879,7 +886,15 @@ func TestExportHandsApprovedOnce(t *testing.T) {
 	if again, err := os.ReadFile(filepath.Join(dir, "outbox.json")); err != nil || string(again) != string(raw) {
 		t.Fatalf("повтор выгрузки дал другой файл: %v\n%s\n%s", err, raw, again)
 	}
-	if err := ClearRollback(dir); err != nil { // файл не тронут
+	// повтор после законченной выгрузки: старая сборка уже могла работать и
+	// отправить, не тронув файл, — «могло уйти»
+	if _, err := ExportLegacy(dir); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := os.ReadFile(filepath.Join(dir, "outbox.json")); err != nil || !strings.Contains(string(again), "send_error") {
+		t.Fatalf("после законченной выгрузки черновик снова отдан на досылку: %v %s", err, again)
+	}
+	if err := ClearRollback(dir); err != nil { // файл не тронут старой сборкой
 		t.Fatal(err)
 	}
 	if err := db.ImportLegacy(); err != nil {

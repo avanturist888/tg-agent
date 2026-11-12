@@ -13,8 +13,8 @@ import (
 
 	"tgagent/internal/config"
 	"tgagent/internal/outbox"
-	"tgagent/internal/tgc"
 	"tgagent/internal/store"
+	"tgagent/internal/tgc"
 	"tgagent/internal/wincred"
 )
 
