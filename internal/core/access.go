@@ -214,11 +214,15 @@ type accessRequest struct {
 	PubSince float64   `json:"pub_since,omitempty"`
 	Created  time.Time `json:"created"`
 	Decided  time.Time `json:"decided,omitzero"`
-	// Result — итог для карточки, записан вместе с решением; Told — итог
-	// показан и агенту сказано (afterAccess). Решено, а не сказано (процесс
-	// умер между ними) — доводят повтор нажатия и уборка (retellAccess)
-	Result string `json:"result,omitempty"`
-	Told   bool   `json:"told,omitempty"`
+	// Result — итог для карточки, записан вместе с решением. CardShown —
+	// итог в карточке показан, AgentTold — агенту сказано (или некому),
+	// Told — оба. Решено, а не доведено (процесс умер, Bot API или агент не
+	// ответили) — доводят повтор нажатия и уборка (retellAccess), каждое —
+	// только недоведённое
+	Result    string `json:"result,omitempty"`
+	CardShown bool   `json:"card_shown,omitempty"`
+	AgentTold bool   `json:"agent_told,omitempty"`
+	Told      bool   `json:"told,omitempty"`
 }
 
 // accessTab — запросы доступа по id.
@@ -514,10 +518,11 @@ func postAccessCard(ctx context.Context, s *config.Settings, r *accessRequest, e
 	return msg.MessageID, err
 }
 
-// finishAccessCard — итог в карточке, кнопки снимаются.
-func finishAccessCard(ctx context.Context, s *config.Settings, r *accessRequest, status string) {
+// finishAccessCard — итог в карточке, кнопки снимаются; true — итог
+// показан (или карточки нет).
+var finishAccessCard = func(ctx context.Context, s *config.Settings, r *accessRequest, status string) bool {
 	if r.CardID == 0 {
-		return
+		return true
 	}
 	err := bot.Call(ctx, s, "editMessageText", map[string]any{
 		"chat_id": s.ApprovalChatID, "message_id": r.CardID,
@@ -526,7 +531,9 @@ func finishAccessCard(ctx context.Context, s *config.Settings, r *accessRequest,
 	if err != nil {
 		logEvent(s, "card_edit_failed", "request_id", r.ID, "error", err.Error())
 		_ = bot.Call(ctx, s, "editMessageReplyMarkup", map[string]any{"chat_id": s.ApprovalChatID, "message_id": r.CardID}, nil)
+		return false
 	}
+	return true
 }
 
 // handleAccessCallback — нажатие под карточкой запроса доступа («a:<id>:<rwa|rw|r|no>»).
@@ -620,37 +627,64 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 	bot.AnswerCallback(ctx, s, q.ID, reply)
 	logEvent(s, "access_"+r.Status, "request_id", id, "scope", r.Scope, "chat_id", r.Peer, "title", r.Title, "alias", r.Alias,
 		"read", r.CanRead, "send", r.CanSend, "auto_send", r.CanAuto, "by", "telegram_button")
-	go tellAccess(context.WithoutCancel(ctx), s, r)
+	go func() {
+		ctx := context.WithoutCancel(ctx)
+		afterAccess(ctx, r) // ленты и группы — до сообщения агенту: он сразу пойдёт читать
+		tellAccess(ctx, s, r)
+	}()
 	return nil
 }
 
-// tellAccess — довести записанное решение: итог в карточку, агенту —
-// сообщение, потом отметка Told. Умер процесс до отметки — повтор нажатия
-// или уборка (retellAccess) доведут снова (сообщение агенту может прийти
-// дважды — лучше, чем ни разу).
+// tellAccess — довести записанное решение: то, что ещё не доведено, —
+// итог в карточку (CardShown), сообщение агенту (AgentTold); отметки —
+// только за вышедшее. Умер процесс до отметки — повтор нажатия или уборка
+// (retellAccess) доведут снова (сообщение агенту может прийти дважды —
+// лучше, чем ни разу).
 func tellAccess(ctx context.Context, s *config.Settings, r *accessRequest) {
-	finishAccessCard(ctx, s, r, r.Result)
-	afterAccess(ctx, r)
+	card, agent := r.CardShown, r.AgentTold
+	if !card {
+		card = finishAccessCard(ctx, s, r, r.Result)
+	}
+	if !agent {
+		agent = tellAgentAccess(ctx, r)
+	}
 	if err := editAccess(s, func(m map[string]*accessRequest) bool {
-		if cur := m[r.ID]; cur != nil && cur.Status == r.Status && !cur.Told {
-			cur.Told = true
-			return true
+		cur := m[r.ID]
+		if cur == nil || cur.Status != r.Status {
+			return false
 		}
-		return false
+		cur.CardShown = cur.CardShown || card
+		cur.AgentTold = cur.AgentTold || agent
+		cur.Told = cur.CardShown && cur.AgentTold
+		return true
 	}); err != nil {
 		logEvent(s, "access_tell_failed", "request_id", r.ID, "error", err.Error())
 	}
 }
 
-// retellAccess — уборка: решения, записанные, но не доведённые (процесс
-// умер посреди tellAccess, а нажатие уже подтверждено). Свежие не трогаем
-// — их сейчас доводит сам решивший (afterAccess ждёт до 2 минут).
+// retellGiveUp — дольше не доводим: карточку могли удалить, сессию агента —
+// закрыть насовсем.
+const retellGiveUp = 24 * time.Hour
+
+// retellAccess — уборка: решения, записанные, но не доведённые. Свежие не
+// трогаем — их сейчас доводит сам решивший (afterAccess ждёт до 2 минут).
 func retellAccess(ctx context.Context, s *config.Settings) {
 	for _, r := range loadAccess(s) {
 		if ctx.Err() != nil {
 			return
 		}
 		if r.Status == accessPending || r.Result == "" || r.Told || time.Since(r.Decided) < 3*time.Minute {
+			continue
+		}
+		if time.Since(r.Decided) > retellGiveUp {
+			logEvent(s, "access_tell_gave_up", "request_id", r.ID, "card_shown", r.CardShown, "agent_told", r.AgentTold)
+			_ = editAccess(s, func(m map[string]*accessRequest) bool {
+				if cur := m[r.ID]; cur != nil && !cur.Told {
+					cur.Told = true
+					return true
+				}
+				return false
+			})
 			continue
 		}
 		logEvent(s, "access_retold", "request_id", r.ID)
@@ -700,7 +734,8 @@ func rulePeerID(rule config.ChatRule) int64 {
 	return 0
 }
 
-// afterAccess — сообщить агенту о решении и сразу завести ленту нового чата.
+// afterAccess — сразу завести ленту нового чата (и состав открытой группы),
+// не дожидаясь сверки.
 func afterAccess(ctx context.Context, r *accessRequest) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -723,8 +758,18 @@ func afterAccess(ctx context.Context, r *accessRequest) {
 			_, _ = PollOnce(ctx, s) // лента появится сразу, а не через минуту
 		}
 	}
+}
+
+// tellAgentAccess — сообщить агенту о решении; true — дошло (или некому).
+var tellAgentAccess = func(ctx context.Context, r *accessRequest) bool {
 	if r.Agent == nil {
-		return
+		return true
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	s, err := config.Load()
+	if err != nil {
+		return false
 	}
 	text := fmt.Sprintf("tg-agent: владелец отказал в доступе к чату «%s» (запрос %s). Не проси снова без новой просьбы владельца.", r.Title, r.ID)
 	if r.Scope != "" {
@@ -733,9 +778,11 @@ func afterAccess(ctx context.Context, r *accessRequest) {
 		text = fmt.Sprintf("tg-agent: владелец открыл чат «%s» (запрос %s): alias %q, %s. "+
 			"Обращайся к нему по alias, правила — в tg_list_chats.", r.Title, r.ID, s.Ref(r.Alias), grantedRights(r))
 	}
-	if err := inbox.Send(ctx, *r.Agent, "tg-agent", text); err != nil && r.Agent.Session != "" {
-		_ = wakeT3(ctx, s, r.Agent.Session, text) // сессию остановил T3 Code
+	err = inbox.Send(ctx, *r.Agent, "tg-agent", text)
+	if err != nil && r.Agent.Session != "" {
+		err = wakeT3(ctx, s, r.Agent.Session, text) // сессию остановил T3 Code
 	}
+	return err == nil
 }
 
 // WaitAccess — tg_wait_access.

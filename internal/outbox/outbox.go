@@ -387,8 +387,10 @@ func (o *Outbox) Approve(id, by string) (*Draft, error) {
 	})
 }
 
+// Cancel — отменить. Черновик, который сейчас отправляют (живой захват),
+// не отменяется: ErrSending.
 func (o *Outbox) Cancel(id, by string) (*Draft, error) {
-	return o.Update(id, func(d *Draft) error {
+	return o.updateIdle(id, func(d *Draft) error {
 		if d.Status == Sent || d.Status == Cancelled {
 			return &BadState{fmt.Sprintf("Черновик %s уже в статусе '%s'", id, d.Status)}
 		}

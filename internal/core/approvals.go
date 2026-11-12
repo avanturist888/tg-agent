@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tgagent/internal/accounts"
@@ -98,6 +99,10 @@ func isDecision(u bot.Update) bool {
 		return false
 	}
 	_, data := config.SplitCallback(u.CallbackQuery.Data)
+	return isDecisionData(data)
+}
+
+func isDecisionData(data string) bool {
 	return strings.HasPrefix(data, "d:") || strings.HasPrefix(data, "a:") || data == upstreamAck
 }
 
@@ -660,10 +665,11 @@ func isRetry(err error) bool {
 }
 
 // refusal — ошибка изменения черновика: отказ по существу (BadState —
-// статус уже другой) решён, прочее — сбой, повторить.
+// статус уже другой, ErrSending — его сейчас отправляют) решён, прочее —
+// сбой, повторить.
 func refusal(err error) error {
 	var bs *outbox.BadState
-	if errors.As(err, &bs) {
+	if errors.As(err, &bs) || errors.Is(err, outbox.ErrSending) {
 		return nil
 	}
 	return retryable{err}
@@ -679,6 +685,12 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		}
 	}()
 	data := q.Data
+	if _, rest := config.SplitCallback(data); isDecisionData(rest) {
+		if why := stateWaiting(s); why != "" {
+			// перенос ждёт — решать не по чему (сюда — и через op callback)
+			return retryable{fmt.Errorf("состояние ещё не перенесено в базу: %s", why)}
+		}
+	}
 	if q.From.ID != s.ApprovalChatID {
 		bot.AnswerCallback(ctx, s, q.ID, "Эта кнопка не для вас.")
 		_ = audit.Log(s.AuditPath(), "callback_rejected", "sender", q.From.ID, "data", data)
@@ -961,6 +973,16 @@ func Pump(ctx context.Context, s *config.Settings, until time.Time, stop func() 
 			return
 		}
 		SendDue(ctx, s)
+		if why := stateWaiting(s); why != "" {
+			// перенос старых файлов ждёт: нажатия не забираем — Telegram
+			// хранит их, разберём, когда всё ляжет в базу
+			if !waitLogged.Swap(true) {
+				_ = audit.Log(s.AuditPath(), "bot_updates_waiting", "reason", why)
+			}
+			sleepCtx(ctx, retryPauseUpdate)
+			continue
+		}
+		waitLogged.Store(false)
 		window := int(time.Until(until).Seconds())
 		window = max(1, min(pollTimeout, window))
 		// ближайшая автоотправка — не ждём дольше неё
@@ -982,6 +1004,8 @@ func Pump(ctx context.Context, s *config.Settings, until time.Time, stop func() 
 		}
 	}
 }
+
+var waitLogged atomic.Bool // «апдейты ждут переноса» — в аудит раз
 
 // retryPauseUpdate — пауза перед повторным разбором решения, которое не
 // принялось из-за сбоя (тесты сокращают).

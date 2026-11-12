@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"tgagent/internal/config"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
+	"tgagent/internal/store"
 )
 
 // Решение владельца (кнопка черновика) сдвигает записанное смещение только
@@ -165,5 +168,49 @@ func TestAccessRetold(t *testing.T) {
 	all := loadAccess(s)
 	if !all["old"].Told || all["fresh"].Told || all["legacy"].Told {
 		t.Fatalf("доведено: old %v, fresh %v, legacy %v", all["old"].Told, all["fresh"].Told, all["legacy"].Told)
+	}
+}
+
+// Пока перенос старых файлов ждёт (нет отметки tg cutover), решение
+// владельца не разбирается — сбой, а не «черновик не найден».
+func TestDecisionWaitsLegacy(t *testing.T) {
+	s := watchEnv(t)
+	s.ApprovalChatID = 1
+	store.RequireCutover = true
+	t.Cleanup(func() { store.RequireCutover = false })
+	if err := os.MkdirAll(s.DataDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.DataDir(), "outbox.json"), []byte(`[{"id": "old", "status": "pending"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	q := &bot.CallbackQuery{ID: "q", Data: "d:old:ok"}
+	q.From.ID = 1
+	if err := HandleCallback(context.Background(), s, q); !isRetry(err) {
+		t.Fatalf("решение при ждущем переносе: %v", err)
+	}
+}
+
+// Итог не показался в карточке (Bot API не ответил) — Told не ставится, и
+// повтор доводит только карточку: агенту второй раз не пишет.
+func TestAccessTellPartial(t *testing.T) {
+	s := watchEnv(t)
+	r := &accessRequest{ID: "p", Peer: 5, Status: accessDenied, Result: "✋", CardID: 9, Decided: time.Now().Add(-time.Hour)}
+	if err := editAccess(s, func(m map[string]*accessRequest) bool { m[r.ID] = r; return true }); err != nil {
+		t.Fatal(err)
+	}
+	cardOK, told := false, 0
+	oldCard, oldAgent := finishAccessCard, tellAgentAccess
+	finishAccessCard = func(context.Context, *config.Settings, *accessRequest, string) bool { return cardOK }
+	tellAgentAccess = func(context.Context, *accessRequest) bool { told++; return true }
+	t.Cleanup(func() { finishAccessCard, tellAgentAccess = oldCard, oldAgent })
+	retellAccess(context.Background(), s)
+	if got := loadAccess(s)["p"]; got.Told || got.CardShown || !got.AgentTold || told != 1 {
+		t.Fatalf("после сбоя карточки: %+v, агенту %d", got, told)
+	}
+	cardOK = true
+	retellAccess(context.Background(), s)
+	if got := loadAccess(s)["p"]; !got.Told || told != 1 {
+		t.Fatalf("после повтора: %+v, агенту %d", got, told)
 	}
 }

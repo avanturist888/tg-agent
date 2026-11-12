@@ -11,6 +11,18 @@ import (
 // stateDB — база состояния профиля (data/state.db).
 func stateDB(s *config.Settings) (*store.DB, error) { return store.Open(s.DataDir()) }
 
+// stateWaiting — почему состояние профиля ещё не всё в базе (перенос
+// старых файлов ждёт tg cutover или отката); "" — всё на месте. Решения
+// владельца, пока перенос ждёт, разбирать нельзя: черновика или запроса из
+// старого файла в базе ещё нет, и нажатие ушло бы в «не найден».
+func stateWaiting(s *config.Settings) string {
+	db, err := stateDB(s)
+	if err != nil {
+		return err.Error()
+	}
+	return db.LegacyBlocked()
+}
+
 // Подписки и запросы доступа старой установки переносятся через свои типы:
 // адрес сессии в них (inbox.Addr) ложится в базу с зашифрованным токеном,
 // а не открытым, как в старых файлах.

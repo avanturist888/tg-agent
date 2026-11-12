@@ -271,3 +271,21 @@ func TestPruneKeepsUnsavedReceipt(t *testing.T) {
 		t.Fatalf("черновик с квитанцией выброшен: %v", err)
 	}
 }
+
+// Черновик, который сейчас отправляет живой путь, не отменяется: сообщение
+// всё равно уйдёт, а «отменено» было бы неправдой.
+func TestCancelRefusedWhileSending(t *testing.T) {
+	o := New(t.TempDir())
+	d := approvedDraft(t, o)
+	c, _, err := o.ClaimSend(d.ID)
+	if err != nil || c == nil {
+		t.Fatalf("захват: %v", err)
+	}
+	if _, err := o.Cancel(d.ID, "t"); !errors.Is(err, ErrSending) {
+		t.Fatalf("отмена посреди отправки: %v", err)
+	}
+	c.Release()
+	if _, err := o.Cancel(d.ID, "t"); err != nil {
+		t.Fatalf("отмена после отпуска: %v", err)
+	}
+}

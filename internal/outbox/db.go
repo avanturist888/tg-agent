@@ -306,6 +306,55 @@ func (o *Outbox) Update(id string, mutate func(*Draft) error) (*Draft, error) {
 	return found, nil
 }
 
+// updateIdle — Update, но не черновика, который сейчас отправляет живой
+// путь (захват ClaimSend): ErrSending. Отмена посреди отправки — неправда:
+// сообщение уйдёт, а MarkSent потом перепишет «отменено».
+func (o *Outbox) updateIdle(id string, mutate func(*Draft) error) (*Draft, error) {
+	db, err := o.db()
+	if err != nil {
+		return nil, err
+	}
+	claimsMu.Lock()
+	defer claimsMu.Unlock()
+	ctx := context.Background()
+	var found *Draft
+	err = db.Write(ctx, func(tx *sql.Tx) error {
+		found = nil
+		var (
+			pid   sql.NullInt64
+			since sql.NullFloat64
+		)
+		err := tx.QueryRowContext(ctx, "SELECT sender_pid, sender_since FROM drafts WHERE id = ?", id).Scan(&pid, &since)
+		if errors.Is(err, sql.ErrNoRows) {
+			return &NotFound{ID: id}
+		}
+		if err != nil {
+			return err
+		}
+		if pid.Valid && holderAlive(id, int(pid.Int64), since.Float64) {
+			return ErrSending
+		}
+		now := time.Now()
+		if err := expire(ctx, tx, now); err != nil {
+			return err
+		}
+		d, err := get(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		touch(d, now)
+		if err := mutate(d); err != nil {
+			return err
+		}
+		found = d
+		return save(ctx, tx, d)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return found, nil
+}
+
 // ClaimDue — забрать запланированные черновики, чьё время пришло: перевести
 // их в approved (by auto_send) одной транзакцией, чтобы забрал ровно один
 // процесс.
