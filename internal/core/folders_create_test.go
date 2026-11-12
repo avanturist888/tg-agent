@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 
 	"tgagent/internal/config"
@@ -123,5 +124,45 @@ func TestMadeByAgent(t *testing.T) {
 	}
 	if len(loadAgentFolders()) != 0 {
 		t.Fatalf("учёт: %+v", loadAgentFolders())
+	}
+}
+
+// Снятие записи не записалось на диск — процесс помнит его, и вернувшееся
+// название не возвращает папку агенту.
+func TestAgentBookUnsaved(t *testing.T) {
+	old := config.Root
+	config.Root = t.TempDir()
+	t.Cleanup(func() {
+		config.Root = old
+		unsavedBook.list, unsavedBook.has = nil, false
+	})
+	ctx := context.Background()
+	s := &config.Settings{}
+	mine := func(folders []tgc.Folder) map[int]bool {
+		_, out, err := listedFolders(ctx, s, func() ([]tgc.Folder, error) { return folders, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if err := withFolders(ctx, s, func(b *agentBook) error { b.put(5, "A"); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	// запись учёта ломается, чтение — нет: файл только для чтения (на
+	// Windows rename поверх него не проходит)
+	path := agentFoldersPath()
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+	if saveAgentFolders(nil) == nil {
+		t.Skip("запись поверх файла только для чтения здесь проходит")
+	}
+	mine([]tgc.Folder{{ID: 5, Title: "B"}}) // владелец переименовал
+	if !unsavedBook.has {
+		t.Fatal("сбой записи не замечен")
+	}
+	if got := mine([]tgc.Folder{{ID: 5, Title: "A"}}); got[5] {
+		t.Fatal("вернувшееся название вернуло папку агенту")
 	}
 }

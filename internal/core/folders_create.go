@@ -29,6 +29,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -74,6 +75,15 @@ type agentBook struct {
 	dirty bool
 }
 
+// unsavedBook — учёт, который не удалось записать: пока запись не пройдёт,
+// процесс верит ему, а не диску — иначе снятая запись (владелец
+// переименовал папку) вернулась бы с диска и с ней право удалить папку.
+var unsavedBook struct {
+	sync.Mutex
+	list []agentFolder
+	has  bool
+}
+
 // withFolders — операция с папками под локом; учёт пишется в конце, даже
 // если операция не удалась (сверка со списком уже могла снять записи).
 func withFolders(ctx context.Context, s *config.Settings, fn func(*agentBook) error) error {
@@ -82,15 +92,36 @@ func withFolders(ctx context.Context, s *config.Settings, fn func(*agentBook) er
 		return err
 	}
 	return lock.With(ctx, path, 2*time.Minute, func() error {
-		b := &agentBook{list: loadAgentFolders()}
+		unsavedBook.Lock()
+		defer unsavedBook.Unlock()
+		b := &agentBook{}
+		if unsavedBook.has {
+			b.list, b.dirty = slices.Clone(unsavedBook.list), true
+		} else {
+			b.list = loadAgentFolders()
+		}
 		err := fn(b)
 		if b.dirty {
 			if serr := saveAgentFolders(b.list); serr != nil {
 				logEvent(s, "agent_folders_save_failed", "error", serr.Error())
+				unsavedBook.list, unsavedBook.has = slices.Clone(b.list), true
+			} else {
+				unsavedBook.list, unsavedBook.has = nil, false
 			}
 		}
 		return err
 	})
+}
+
+// haveAgentFolders — есть ли что сверять (незаписанный учёт главнее диска).
+func haveAgentFolders() bool {
+	unsavedBook.Lock()
+	has, n := unsavedBook.has, len(unsavedBook.list)
+	unsavedBook.Unlock()
+	if has {
+		return n > 0
+	}
+	return len(loadAgentFolders()) > 0
 }
 
 func saveAgentFolders(list []agentFolder) error {
@@ -164,7 +195,7 @@ func listedFolders(ctx context.Context, s *config.Settings, fetch func() ([]tgc.
 // пересчёт групп (RunSets) сверку не делает: он держит setsMu, а правка
 // папок берёт setsMu (blockForAgent) уже под этим локом.
 func watchFolders(ctx context.Context, s *config.Settings, fn func(see func([]tgc.Folder) *agentBook) error) error {
-	if len(loadAgentFolders()) == 0 {
+	if !haveAgentFolders() {
 		return fn(func([]tgc.Folder) *agentBook { return nil })
 	}
 	return withFolders(ctx, s, func(b *agentBook) error {
