@@ -100,30 +100,82 @@ func TestRecoverOrphanApproved(t *testing.T) {
 }
 
 // Досылку оборвала остановка службы посреди попытки: ушло ли — неизвестно,
-// поэтому это сбой, а не «дошлём потом»; остановленная досылка следующие
-// черновики не берёт.
+// поэтому это сбой, а не «дошлём потом»: досылка его больше не трогает.
 func TestRecoverCancelledIsFailure(t *testing.T) {
 	s := watchEnv(t)
 	s.SendPolicy = "bot_approval"
 	box := outbox.New(s.DataDir())
-	d, err := box.Create(outbox.CreateOpts{Chat: "closed-chat", Text: "раз", TTLMin: 60})
+	d, err := box.Create(outbox.CreateOpts{Chat: "test", Text: "раз", TTLMin: 60})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = box.Approve(d.ID, "auto_send"); err != nil {
+	if _, err := box.Approve(d.ID, "auto_send"); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	recoverApproved(ctx, s, time.Now().Add(time.Hour), "test")
-	if raw, _ := os.ReadFile(s.AuditPath()); strings.Contains(string(raw), "recover_interrupted") {
-		t.Fatal("досылка пошла после остановки")
+	calls := 0
+	old := sendClaimed
+	sendClaimed = func(context.Context, *config.Settings, string, string) (*omap.Map, error) {
+		calls++
+		cancel() // служба останавливается посреди отправки
+		return nil, context.Canceled
 	}
-	if got := deliver(ctx, s, d.ID, "test"); !strings.Contains(got, "Не отправлено") {
-		t.Fatalf("итог при обрыве: %q", got)
+	t.Cleanup(func() { sendClaimed = old })
+	if got := deliver(ctx, s, d.ID, "auto_send"); !strings.Contains(got, "Не отправлено") || calls != 1 {
+		t.Fatalf("итог при обрыве: %q, отправок %d", got, calls)
 	}
 	if got, _ := box.Get(d.ID); got.SendError == nil {
 		t.Fatalf("обрыв не записан: %+v", got)
+	}
+	recoverApproved(context.Background(), s, time.Now().Add(time.Hour), "test")
+	if calls != 1 {
+		t.Fatalf("досылка повторила оборванное: %d", calls)
+	}
+}
+
+// Ошибка после начала отправки без пометки — «могло уйти»: без повтора и
+// с записанным сбоем; точно не дошедшее (NotSent) повторяется.
+func TestDeliverRetriesOnlyNotSent(t *testing.T) {
+	if _, ok := classifySend(errors.New("i/o timeout")).(*Uncertain); !ok {
+		t.Fatal("сбой без пометки не стал Uncertain")
+	}
+	var ns *NotSent
+	if !errors.As(classifySend(notSent(errors.New("нет связи"))), &ns) {
+		t.Fatal("NotSent потерян")
+	}
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	run := func(fail func(n int) error) (int, *outbox.Draft) {
+		d := approved(t, box, "test")
+		calls := 0
+		old := sendClaimed
+		sendClaimed = func(context.Context, *config.Settings, string, string) (*omap.Map, error) {
+			calls++
+			if err := fail(calls); err != nil {
+				return nil, err
+			}
+			return omap.New().Set("message_id", 1), nil
+		}
+		defer func() { sendClaimed = old }()
+		deliver(ctx, s, d.ID, "test")
+		got, _ := box.Get(d.ID)
+		return calls, got
+	}
+	if calls, got := run(func(int) error { return &Uncertain{Err: errors.New("i/o timeout")} }); calls != 1 || got.SendError == nil {
+		t.Fatalf("могло уйти: отправок %d, черновик %+v", calls, got)
+	}
+	was := retryPause
+	retryPause = time.Millisecond
+	t.Cleanup(func() { retryPause = was })
+	if calls, _ := run(func(n int) error {
+		if n == 1 {
+			return notSent(errors.New("нет связи"))
+		}
+		return nil
+	}); calls != 2 {
+		t.Fatalf("точно не дошедшее не повторено: %d", calls)
 	}
 }
 

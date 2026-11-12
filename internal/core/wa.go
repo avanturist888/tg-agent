@@ -505,7 +505,7 @@ func (waNet) deliver(ctx context.Context, s *config.Settings, rule config.ChatRu
 	defer cancel()
 	c, ch, err := waChat(wctx, rule)
 	if err != nil {
-		return nil, err
+		return nil, notSent(err) // связи нет или чат не найден — ничего не ушло
 	}
 	text := d.Text
 	if d.Fmt != "plain" {

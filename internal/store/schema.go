@@ -117,7 +117,10 @@ CREATE TABLE chat_set_blocked (
 	// 2: сколько раз черновик брали в отправку (outbox.ClaimSend) — пишется
 	// до первого байта в сеть. Была попытка, а итога нет — могло уйти:
 	// автоматически такой черновик больше не отправляется.
-	`ALTER TABLE drafts ADD COLUMN send_attempts INTEGER NOT NULL DEFAULT 0;`,
+	// Захват, оставшийся от схемы 1 (sender_pid есть), — тоже попытка: его
+	// процесс мог умереть, уже отправив.
+	`ALTER TABLE drafts ADD COLUMN send_attempts INTEGER NOT NULL DEFAULT 0;
+UPDATE drafts SET send_attempts = 1 WHERE sender_pid IS NOT NULL;`,
 }
 
 // Version — версия схемы, которую знает эта сборка.

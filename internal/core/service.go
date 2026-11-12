@@ -34,6 +34,54 @@ func (e *Denied) Error() string { return e.Msg }
 
 func denied(format string, a ...any) error { return &Denied{fmt.Sprintf(format, a...)} }
 
+// Отправка черновика сорвалась — дошло ли до получателя? От ответа зависит,
+// можно ли повторить её самим.
+//
+// NotSent — точно не дошло: связи нет, чат не найден, файл не загрузился,
+// сервер ответил отказом. Повтор безопасен.
+//
+// Uncertain — запрос мог уйти, а ответа нет (обрыв, таймаут, ошибка после
+// начала отправки): сообщение могло дойти. Сами не повторяем — иначе оно
+// задвоится у получателя; решает человек или агент (tg_send_draft).
+// Ошибка без пометки после начала отправки считается Uncertain (classifySend).
+type NotSent struct{ Err error }
+
+func (e *NotSent) Error() string { return e.Err.Error() }
+func (e *NotSent) Unwrap() error { return e.Err }
+
+type Uncertain struct{ Err error }
+
+func (e *Uncertain) Error() string {
+	return e.Err.Error() + " — сообщение могло уйти, повторять сам не стал"
+}
+func (e *Uncertain) Unwrap() error { return e.Err }
+
+func notSent(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ns *NotSent
+	if errors.As(err, &ns) {
+		return err
+	}
+	return &NotSent{Err: err}
+}
+
+// classifySend — ошибка отправки без пометки, «дошло или нет», — Uncertain.
+// Запрет (Denied, Bad) и NotSent остаются как есть.
+func classifySend(err error) error {
+	var (
+		d  *Denied
+		b  *Bad
+		ns *NotSent
+		u  *Uncertain
+	)
+	if err == nil || errors.As(err, &d) || errors.As(err, &b) || errors.As(err, &ns) || errors.As(err, &u) {
+		return err
+	}
+	return &Uncertain{Err: err}
+}
+
 func clamp(limit int, s *config.Settings) int {
 	if limit <= 0 {
 		limit = 50
@@ -1122,7 +1170,7 @@ func deliverClaimed(ctx context.Context, s *config.Settings, draftID, by string)
 		err = deliverTelegram(ctx, s, rule, d, result)
 	}
 	if err != nil {
-		return nil, err
+		return nil, classifySend(err)
 	}
 	return finishDelivery(s, rule, d, draftID, by, result)
 }
@@ -1130,22 +1178,28 @@ func deliverClaimed(ctx context.Context, s *config.Settings, draftID, by string)
 // deliverTelegram — отправка черновика в Telegram; ответ — в result.
 func deliverTelegram(ctx context.Context, s *config.Settings, rule config.ChatRule, d *outbox.Draft, result *omap.Map) error {
 	// человек уже нажал «Отправить» — ждём сессию сколько нужно, а не падаем
-	return tgc.Run(ctx, s, tgc.Opts{Wait: 300 * time.Second, Caller: "deliver_approved"}, func(ctx context.Context, c *tgc.Conn) error {
+	started := false // до этого — ни байта получателю: сбой можно повторить
+	err := tgc.Run(ctx, s, tgc.Opts{Wait: 300 * time.Second, Caller: "deliver_approved"}, func(ctx context.Context, c *tgc.Conn) error {
 		t, err := c.Resolve(ctx, rule)
 		if err != nil {
-			return err
+			return notSent(err)
 		}
 		t.Topic = d.Topic
+		started = true
 		if d.Bot != nil { // действие в BotFather: диалог ведёт служба, токен — в хранилище
 			r, err := runBotOp(ctx, s, c, t, d)
 			if err != nil {
-				return err
+				return err // диалог из нескольких шагов: что ушло — неизвестно
 			}
 			result.Merge(r)
 			return nil
 		}
 		r, err := sendDraft(ctx, c, t, d)
 		if err != nil {
+			var dn *Denied
+			if !errors.As(err, &dn) && tgc.Rejected(err) {
+				return notSent(err) // Telegram ответил отказом — сообщения нет
+			}
 			return err
 		}
 		// именно дописать в result вызывающего: присвоение параметру его
@@ -1153,6 +1207,10 @@ func deliverTelegram(ctx context.Context, s *config.Settings, rule config.ChatRu
 		result.Merge(r)
 		return nil
 	})
+	if err != nil && !started {
+		return notSent(err) // сессия не взялась, связи нет
+	}
+	return err
 }
 
 // draftSender — то, чем sendDraft отправляет (tgc.Conn; в тестах — подделка).

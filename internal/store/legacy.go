@@ -447,7 +447,11 @@ func liveSenders(dir string) string {
 	var ids []string
 	for _, e := range entries {
 		id, ok := strings.CutSuffix(e.Name(), ".lock")
-		if ok && lock.Held(filepath.Join(dir, id)) {
+		if !ok {
+			continue
+		}
+		// только смотрим: мёртвый лок — след прерванной отправки (importOutbox)
+		if _, alive := lock.Peek(filepath.Join(dir, id)); alive {
 			ids = append(ids, id)
 		}
 	}
@@ -500,7 +504,18 @@ func importOutbox(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 	// черновик, который старая сборка сейчас отправляет, перенести нельзя:
 	// в базе у него не было бы отметки захвата, и новая служба отправила бы
 	// его второй раз — ждём, пока старая закончит (её итог будет в файле)
-	if who := liveSenders(filepath.Join(filepath.Dir(path), "sending")); who != "" {
+	sending := filepath.Join(filepath.Dir(path), "sending")
+	// мёртвый лок отправки — след прерванной отправки: её процесс мог уже
+	// отправить (живые — ждём ниже)
+	left := map[string]bool{}
+	if entries, err := os.ReadDir(sending); err == nil {
+		for _, e := range entries {
+			if id, ok := strings.CutSuffix(e.Name(), ".lock"); ok {
+				left[id] = true
+			}
+		}
+	}
+	if who := liveSenders(sending); who != "" {
 		return 0, fmt.Errorf("%w: старая сборка ещё отправляет черновик %s", ErrRetry, who)
 	}
 	var drafts []json.RawMessage
@@ -528,8 +543,14 @@ func importOutbox(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 		err := tx.QueryRowContext(ctx, "SELECT status FROM drafts WHERE id = ?", d.ID).Scan(&cur)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			if _, err := tx.ExecContext(ctx, "INSERT INTO drafts(id, status, expires, send_at, body) VALUES(?, ?, ?, ?, ?)",
-				d.ID, d.Status, unixOf(d.ExpiresAt), sendAt, compact(raw)); err != nil {
+			// лок отправки старой сборки остался (живых здесь нет — их ждали
+			// выше): её процесс умер посреди отправки, сообщение могло уйти
+			attempts := 0
+			if left[d.ID] && d.Status == "approved" {
+				attempts = 1
+			}
+			if _, err := tx.ExecContext(ctx, "INSERT INTO drafts(id, status, expires, send_at, body, send_attempts) VALUES(?, ?, ?, ?, ?, ?)",
+				d.ID, d.Status, unixOf(d.ExpiresAt), sendAt, compact(raw), attempts); err != nil {
 				return 0, err
 			}
 		case err != nil:

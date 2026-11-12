@@ -187,6 +187,21 @@ func Held(path string) bool {
 	return true
 }
 
+// Peek — лок path, не трогая его: есть ли файл и жив ли его владелец.
+// В отличие от Held не снимает мёртвый лок — он остаётся следом (например,
+// прерванной отправки). Нечитаемый файл (его как раз пишут) — живой.
+func Peek(path string) (present, alive bool) {
+	raw, err := os.ReadFile(path + ".lock")
+	if err != nil {
+		return !errors.Is(err, os.ErrNotExist), !errors.Is(err, os.ErrNotExist)
+	}
+	var m meta
+	if json.Unmarshal(raw, &m) != nil || m.PID == 0 {
+		return true, true
+	}
+	return true, pidAlive(m.PID, m.TS)
+}
+
 // PIDAlive — жив ли процесс pid, взявший что-то в момент since (unix, с
 // долями секунды): умерший — нет, и процесс, получивший тот же pid позже
 // since, — тоже нет.

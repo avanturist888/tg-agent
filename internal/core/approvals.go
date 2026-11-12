@@ -123,6 +123,10 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 	if status == "" {
 		return // итог напишет тот, кто черновик сейчас отправляет (deliver)
 	}
+	// итог пишется и тогда, когда вызывающего уже обрывают (служба
+	// останавливается): иначе карточка так и висела бы на «Отправляю…»
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
 	if cardID != nil && *cardID != 0 {
 		bot.FinishCard(ctx, s, *cardID, d, title(s, d), status, d.Note)
 		unpinDraftCard(ctx, s, d.ID) // решено — внимание владельца больше не нужно
@@ -130,6 +134,9 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 }
 
 var sendClaimed = deliverClaimed // тесты подменяют
+
+// retryPause — пауза перед повтором того, что точно не дошло (тесты сокращают).
+var retryPause = 15 * time.Second
 
 // deliver — отправить одобренный черновик и вернуть строку итога для карточки.
 // Человек уже нажал «Отправить» (или окно отмены закрылось): временные сбои
@@ -198,8 +205,14 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 			break
 		}
 		errMsg = fmt.Sprintf("%s: %v", errName(err), err)
-		var d *Denied
-		if errors.As(err, &d) { // запрет (чат закрыт, статус не тот, часть ушла) — повтор не поможет
+		var (
+			d *Denied
+			u *Uncertain
+		)
+		// запрет (чат закрыт, статус не тот, часть ушла) — повтор не поможет;
+		// могло уйти (обрыв после начала отправки) — повтор задвоил бы.
+		// Повторяем только то, что точно не дошло (NotSent) или без отправки
+		if errors.As(err, &d) || errors.As(err, &u) {
 			break
 		}
 		_ = audit.Log(s.AuditPath(), "send_failed", "draft_id", draftID, "attempt", attempt, "error", err.Error())
@@ -207,7 +220,7 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 			select {
 			case <-ctx.Done():
 				attempt = 3
-			case <-time.After(15 * time.Second):
+			case <-time.After(retryPause):
 			}
 		}
 	}
@@ -238,9 +251,12 @@ func errName(err error) string {
 		d *Denied
 		b *lock.Busy
 	)
+	var u *Uncertain
 	switch {
 	case errors.As(err, &d):
 		return "Denied"
+	case errors.As(err, &u):
+		return "Uncertain"
 	case errors.As(err, &b):
 		return "SessionBusy"
 	}
@@ -655,7 +671,27 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 // сбоем «могло уйти» (Claim.Retry). В режимах без бота статус approved
 // законно ждёт агента или CLI.
 func RecoverInterrupted(ctx context.Context, s *config.Settings) {
+	refreshFailedCards(ctx, s)
 	recoverApproved(ctx, s, processStarted, "дослано после перезапуска службы")
+}
+
+// refreshFailedCards — итог сорвавшихся черновиков ещё раз в их карточки:
+// прошлая служба могла записать сбой, но не успеть (или не суметь) показать
+// его — карточка висела бы на «Отправляю…», а владелец не знал бы, что
+// одобренное не ушло.
+func refreshFailedCards(ctx context.Context, s *config.Settings) {
+	drafts, err := outbox.New(s.DataDir()).List(outbox.Approved)
+	if err != nil {
+		return
+	}
+	for _, d := range drafts {
+		if ctx.Err() != nil {
+			return
+		}
+		if d.SendError != nil && d.BotMessageID != nil && *d.BotMessageID != 0 {
+			card(ctx, s, d.BotMessageID, d, "⚠️ **Не отправлено** — "+bot.MDEscape(*d.SendError))
+		}
+	}
 }
 
 // recoverOrphansAfter — одобренное раньше этого срока и всё ещё не
@@ -695,9 +731,7 @@ func recoverApproved(ctx context.Context, s *config.Settings, cutoff time.Time, 
 		dctx, cancel := context.WithTimeout(ctx, recoverBudget)
 		summary := deliver(dctx, s, d.ID, by+" ("+why+")")
 		cancel()
-		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute) // итог в карточку — и после остановки
-		card(cctx, s, d.BotMessageID, d, summary)
-		ccancel()
+		card(ctx, s, d.BotMessageID, d, summary)
 	}
 }
 

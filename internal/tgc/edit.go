@@ -74,3 +74,10 @@ func (c *Conn) EditMessage(ctx context.Context, t Target, id int, text, format s
 	}
 	return result("plain"), nil
 }
+
+// Rejected — Telegram ответил на запрос ошибкой RPC: запрос разобран и
+// отклонён, а не потерян по дороге (отправка — точно не состоялась).
+func Rejected(err error) bool {
+	_, ok := tgerr.As(err)
+	return ok
+}

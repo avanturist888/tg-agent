@@ -500,3 +500,50 @@ func TestLegacyNotesMerge(t *testing.T) {
 		t.Fatalf("main = %s, work = %s", main, work)
 	}
 }
+
+// База схемы 1 с захватом, чей процесс умер (мог уже отправить): после
+// перехода на схему 2 это попытка, а не первая отправка.
+func TestMigrateKeepsClaimAsAttempt(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, FileName)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{migrations[0],
+		`INSERT INTO drafts(id, status, expires, sender_pid, sender_since, body) VALUES('a', 'approved', 0, 999999, 1, '{"id":"a"}')`,
+		`INSERT INTO drafts(id, status, expires, body) VALUES('b', 'approved', 0, '{"id":"b"}')`,
+		`PRAGMA user_version = 1`} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw.Close()
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, db, "SELECT send_attempts FROM drafts WHERE id = 'a'"); n != 1 {
+		t.Fatalf("захват схемы 1: попыток %d", n)
+	}
+	if n := count(t, db, "SELECT send_attempts FROM drafts WHERE id = 'b'"); n != 0 {
+		t.Fatalf("без захвата: попыток %d", n)
+	}
+}
+
+// Лок отправки, оставшийся от старой сборки (её процесс умер посреди
+// отправки), переносится попыткой: такой черновик сам не уйдёт второй раз.
+func TestLegacyDeadSendLockIsAttempt(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "approved", "expires_at": "2099-01-01T00:00:00Z"},
+		{"id": "b", "status": "approved", "expires_at": "2099-01-01T00:00:00Z"}]`)
+	write(t, filepath.Join(dir, "sending", "a.lock"), `{"pid": 999999, "ts": 1}`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, b := count(t, db, "SELECT send_attempts FROM drafts WHERE id = 'a'"), count(t, db, "SELECT send_attempts FROM drafts WHERE id = 'b'"); a != 1 || b != 0 {
+		t.Fatalf("попытки: a %d, b %d", a, b)
+	}
+}

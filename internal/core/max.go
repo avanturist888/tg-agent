@@ -437,7 +437,7 @@ func maxText(d *outbox.Draft) (string, []maxc.Element) {
 func maxDeliver(ctx context.Context, s *config.Settings, rule config.ChatRule, d *outbox.Draft) (*omap.Map, error) {
 	chatID, err := maxChatID(rule)
 	if err != nil {
-		return nil, err
+		return nil, notSent(err)
 	}
 	// человек уже нажал «Отправить» — подождать связь подольше
 	wctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -446,11 +446,11 @@ func maxDeliver(ctx context.Context, s *config.Settings, rule config.ChatRule, d
 	cl := maxRT.client
 	maxRT.Unlock()
 	if cl == nil {
-		return nil, ErrNoMax
+		return nil, notSent(ErrNoMax)
 	}
 	c, err := cl.Conn(wctx)
 	if err != nil {
-		return nil, fmt.Errorf("нет связи с MAX: %w", err)
+		return nil, notSent(fmt.Errorf("нет связи с MAX: %w", err))
 	}
 	text, els := maxText(d)
 	if d.EditOf != 0 {
@@ -466,7 +466,7 @@ func maxDeliver(ctx context.Context, s *config.Settings, rule config.ChatRule, d
 	}
 	attaches, err := maxUpload(ctx, c, d.Files)
 	if err != nil {
-		return nil, err
+		return nil, notSent(err) // файлы не загрузились — сообщения ещё не было
 	}
 	// разные виды вложений в одном сообщении сервер не принимает: фото —
 	// вместе (с текстом), каждый файл, видео и голосовое — отдельно
