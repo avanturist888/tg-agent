@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"tgagent/internal/store"
 )
 
 // Реальный outbox.json (если есть) переживает чтение и запись без потерь.
@@ -35,18 +37,25 @@ func TestRoundTripRealFile(t *testing.T) {
 
 func TestExtraFieldsKeptAndScheduled(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "outbox.json")
+	path := filepath.Join(dir, "outbox.json") // установка до переезда на state.db
 	os.WriteFile(path, []byte(`[{"future_field": {"x": 1}, "id": "a", "chat": "c", "text": "t", "reply_to": null,
 	  "created_at": "2026-01-01T00:00:00+00:00", "expires_at": "2099-01-01T00:00:00+00:00", "status": "pending",
 	  "files": [], "history": []}]`), 0o600)
-	o := New(path)
+	o := New(dir)
 	if _, err := o.Approve("a", "x"); err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := os.ReadFile(path)
-	var v []map[string]any
-	json.Unmarshal(raw, &v)
-	if v[0]["future_field"] == nil || v[0]["status"] != "approved" {
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw string
+	if err := db.Q().QueryRow("SELECT body FROM drafts WHERE id = 'a'").Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var v map[string]any
+	json.Unmarshal([]byte(raw), &v)
+	if v["future_field"] == nil || v["status"] != "approved" {
 		t.Fatalf("потеряно поле или статус: %s", raw)
 	}
 	at := time.Now().Add(-time.Second)
@@ -66,7 +75,7 @@ func TestExtraFieldsKeptAndScheduled(t *testing.T) {
 
 // «Отправить сейчас» у автоотправки: одобрение до срока, таймер его не трогает.
 func TestApproveScheduledBeforeDue(t *testing.T) {
-	o := New(filepath.Join(t.TempDir(), "outbox.json"))
+	o := New(t.TempDir())
 	at := time.Now().Add(-time.Second)
 	d, err := o.Create(CreateOpts{Chat: "c", Text: "hi", TTLMin: 60, SendAt: &at})
 	if err != nil {

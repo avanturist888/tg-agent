@@ -6,12 +6,13 @@ package core
 // текстом. Поэтому диалог ведёт служба, а не агент: действие — обычный
 // черновик в чат BotFather (то же подтверждение или автоотправка, что у
 // сообщений), токен из ответа служба проверяет (getMe), кладёт в хранилище
-// (data/bot_tokens.json) и сразу удаляет сообщение с ним из чата. Агент
+// (диспетчер учётных данных) и сразу удаляет сообщение с ним из чата. Агент
 // видит только итог: какой бот, сохранён ли токен. Сам токен — трубой
 // `tg bot-token @bot | …` или записью в .env по просьбе агента (env_file).
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
 	"tgagent/internal/secret"
+	"tgagent/internal/store"
 	"tgagent/internal/tgc"
 	"tgagent/internal/wincred"
 )
@@ -126,7 +128,7 @@ func DraftBotOp(ctx context.Context, s *config.Settings, b outbox.BotSpec, note 
 	if err != nil {
 		return nil, err
 	}
-	opts := outbox.CreateOpts{ID: outbox.NewID(), Chat: rule.Alias, TTLMin: s.DraftTTLMin, Note: note,
+	opts := outbox.CreateOpts{Chat: rule.Alias, TTLMin: s.DraftTTLMin, Note: note,
 		Origin: draftOrigin(s), Bot: &b}
 	// удаление бота необратимо: только кнопкой владельца, даже в чате с автоотправкой
 	auto := rule.AutoSend() && b.Action != "deletebot"
@@ -134,7 +136,7 @@ func DraftBotOp(ctx context.Context, s *config.Settings, b outbox.BotSpec, note 
 		at := time.Now().Add(time.Duration(s.AutoSendDelaySec) * time.Second)
 		opts.SendAt = &at
 	}
-	d, err := outbox.New(s.OutboxPath()).Create(opts)
+	d, err := outbox.New(s.DataDir()).Create(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -347,7 +349,7 @@ func messageText(m any) (int, string, bool) {
 
 // ── хранилище токенов ────────────────────────────────────────────────────
 
-// BotEntry — бот в хранилище: сведения — data/bot_tokens.json, сам токен —
+// BotEntry — бот в хранилище: сведения — таблица bots в state.db, сам токен —
 // в диспетчере учётных данных Windows (botCredTarget), не файлом: так он не
 // уходит в бэкап и копию папки и не находится поиском по data/.
 type BotEntry struct {
@@ -360,9 +362,49 @@ type BotEntry struct {
 	Env      []string `json:"env,omitempty"` // куда ещё записан
 }
 
+// vaultMu — чтение и замена сведений о ботах в этом процессе по очереди
+// (сами записи — таблица bots основного data/).
 var vaultMu sync.Mutex
 
-func vaultPath() string { return filepath.Join(config.DataPath(), "bot_tokens.json") }
+var botsTab = store.NewTable[*BotEntry](store.TBots)
+
+func vaultDB() (*store.DB, error) { return store.Open(config.DataPath()) }
+
+// bot_tokens.json до переезда: токены, ещё лежащие в нём, — сначала в
+// диспетчер учётных данных (в базе секретов нет); не записался хоть один —
+// перенос откладывается, файл остаётся как был.
+func init() {
+	store.RegisterLegacy(store.Legacy{File: "bot_tokens.json", Import: importVault})
+}
+
+func importVault(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	if strings.TrimSpace(string(raw)) == "" {
+		return 0, nil
+	}
+	m := map[string]*BotEntry{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return 0, fmt.Errorf("%w: %v", store.ErrCorrupt, err)
+	}
+	for key, e := range m {
+		if e == nil {
+			continue
+		}
+		if e.Token != "" {
+			if err := credSet(botCredTarget(key), e.Token); err != nil {
+				return 0, fmt.Errorf("%w: токен @%s не записался в диспетчер: %v", store.ErrRetry, key, err)
+			}
+			e.Token = ""
+		}
+		if _, err := botsTab.Insert(ctx, tx, key, e); err != nil {
+			return 0, err
+		}
+	}
+	return len(m), nil
+}
 
 // botCredTarget — имя записи токена в диспетчере учётных данных.
 func botCredTarget(key string) string { return "tg-agent/bot/" + key }
@@ -373,25 +415,16 @@ var (
 	credGet = wincred.Get
 )
 
-// loadVault — сведения о ботах; токены, ещё лежащие в файле, переносит в
-// диспетчер и убирает из файла. Вызывать под vaultMu.
+// loadVault — сведения о ботах (без токенов: они в диспетчере). Вызывать
+// под vaultMu.
 func loadVault() map[string]*BotEntry {
-	out := map[string]*BotEntry{}
-	if raw, err := os.ReadFile(vaultPath()); err == nil {
-		_ = json.Unmarshal(raw, &out)
+	db, err := vaultDB()
+	if err != nil {
+		return map[string]*BotEntry{}
 	}
-	moved := false
-	for key, e := range out {
-		if e.Token == "" {
-			continue
-		}
-		if err := credSet(botCredTarget(key), e.Token); err != nil {
-			continue // не перенёсся — пусть остаётся в файле, чем пропадёт
-		}
-		e.Token, moved = "", true
-	}
-	if moved {
-		_ = writeVault(out)
+	out, err := botsTab.All(context.Background(), db.Q())
+	if err != nil {
+		return map[string]*BotEntry{}
 	}
 	return out
 }
@@ -402,12 +435,24 @@ func vaultToken(key string) (string, bool) {
 	return tok, err == nil && tok != ""
 }
 
+// writeVault — записать сведения о ботах (то, что loadVault прочитал и
+// поменял под vaultMu).
 func writeVault(v map[string]*BotEntry) error {
-	raw, err := json.MarshalIndent(v, "", "  ")
+	db, err := vaultDB()
 	if err != nil {
 		return err
 	}
-	return fsx.WriteFile(vaultPath(), raw, 0o600)
+	return botsTab.Edit(context.Background(), db, func(m map[string]*BotEntry) bool {
+		clear(m)
+		for k, e := range v {
+			if e != nil {
+				cp := *e
+				cp.Token = "" // секрет — только в диспетчере
+				m[k] = &cp
+			}
+		}
+		return true
+	})
 }
 
 // vaultHas — у бота с этим id в хранилище ровно этот токен.
@@ -553,45 +598,46 @@ func writeEnv(path, key, value string) error {
 
 // ── итог действия для tg_wait_approval ───────────────────────────────────
 
-var botOpsMu sync.Mutex
-
-func botOpsPath(s *config.Settings) string { return filepath.Join(s.DataDir(), "bot_ops.json") }
+// botOpsTab — итоги действий в BotFather по id черновика.
+var botOpsTab = store.NewTable[json.RawMessage](store.TBotOps)
 
 func saveBotOp(s *config.Settings, draftID string, r *omap.Map) {
-	botOpsMu.Lock()
-	defer botOpsMu.Unlock()
-	all := map[string]json.RawMessage{}
-	if raw, err := os.ReadFile(botOpsPath(s)); err == nil {
-		_ = json.Unmarshal(raw, &all)
-	}
 	b, err := r.MarshalJSON()
 	if err != nil {
 		return
 	}
-	all[draftID] = secretSafe(b)
-	if len(all) > 100 { // id растут со временем: самые старые — по ключу
-		keys := make([]string, 0, len(all))
-		for k := range all {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys[:len(all)-100] {
-			delete(all, k)
-		}
+	db, err := stateDB(s)
+	if err != nil {
+		logEvent(s, "bot_op_save_failed", "draft_id", draftID, "error", err.Error())
+		return
 	}
-	out, _ := json.MarshalIndent(all, "", "  ")
-	_ = fsx.WriteFile(botOpsPath(s), out, 0o600)
+	err = botOpsTab.Edit(context.Background(), db, func(all map[string]json.RawMessage) bool {
+		all[draftID] = secretSafe(b)
+		if len(all) > 100 { // id растут со временем: самые старые — по ключу
+			keys := make([]string, 0, len(all))
+			for k := range all {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys[:len(all)-100] {
+				delete(all, k)
+			}
+		}
+		return true
+	})
+	if err != nil {
+		logEvent(s, "bot_op_save_failed", "draft_id", draftID, "error", err.Error())
+	}
 }
 
 func secretSafe(b []byte) json.RawMessage { return json.RawMessage(secret.Mask(string(b))) }
 
 // botOpResult — что вышло у действия в BotFather (nil — не было).
 func botOpResult(s *config.Settings, draftID string) json.RawMessage {
-	botOpsMu.Lock()
-	defer botOpsMu.Unlock()
-	all := map[string]json.RawMessage{}
-	if raw, err := os.ReadFile(botOpsPath(s)); err == nil {
-		_ = json.Unmarshal(raw, &all)
+	db, err := stateDB(s)
+	if err != nil {
+		return nil
 	}
-	return all[draftID]
+	r, _, _ := botOpsTab.Get(context.Background(), db.Q(), draftID)
+	return r
 }

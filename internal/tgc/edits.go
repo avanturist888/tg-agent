@@ -2,13 +2,12 @@ package tgc
 
 import (
 	"context"
-	"encoding/json"
-	"os"
+	"database/sql"
 	"strconv"
 	"sync"
 	"time"
 
-	"tgagent/internal/fsx"
+	"tgagent/internal/store"
 
 	"github.com/gotd/td/tg"
 )
@@ -21,7 +20,9 @@ import (
 // свежая (моложе editFresh) или сделана, пока служба не работала (позже
 // её прошлой остановки: такие приходят при догонке пропущенного).
 //
-// Даты правок и отметка «служба работала до» живут в data/edit_dates.json.
+// Даты правок (таблица edit_dates) и отметка «служба работала до» (kv
+// edits_alive) живут в data/state.db; в памяти — всё, на диск — изменения
+// раз в editsFlush. Пишет только служба.
 
 // editFresh — правку старше этого без известной прежней даты (и не из
 // простоя службы) считаем реакцией или другим служебным обновлением.
@@ -37,53 +38,84 @@ const (
 type editTracker struct {
 	mu    sync.Mutex
 	seen  map[string]int // peer:id → edit_date, о которой уже знаем
+	dirty map[string]int // что записать со следующим save
 	since time.Time      // служба не работала с этого момента (прошлая остановка)
-	path  string
-	dirty bool
+	dir   string
 }
 
-type editsFile struct {
-	Alive int64          `json:"alive"` // последний раз служба была жива (unix)
-	Seen  map[string]int `json:"seen"`
-}
+var edits = &editTracker{seen: map[string]int{}, dirty: map[string]int{}}
 
-var edits = &editTracker{seen: map[string]int{}}
-
-// open — даты правок и время прошлой остановки службы с диска.
-func (t *editTracker) open(path string) {
+// open — даты правок и время прошлой остановки службы из базы.
+func (t *editTracker) open(dir string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.path = path
-	raw, err := os.ReadFile(path)
+	t.dir = dir
+	db, err := store.Open(dir)
 	if err != nil {
 		return
 	}
-	var f editsFile
-	if json.Unmarshal(raw, &f) != nil {
+	ctx := context.Background()
+	var alive int64
+	if ok, _ := store.GetKV(ctx, db.Q(), store.KeyEditsAlive, &alive); ok && alive > 0 {
+		t.since = time.Unix(alive, 0).Add(-editsSlack)
+	}
+	rows, err := db.Q().QueryContext(ctx, "SELECT key, edit_date FROM edit_dates ORDER BY seen DESC LIMIT ?", editsMax)
+	if err != nil {
 		return
 	}
-	if f.Seen != nil {
-		t.seen = f.Seen
-	}
-	if f.Alive > 0 {
-		t.since = time.Unix(f.Alive, 0).Add(-editsSlack)
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			k string
+			d int
+		)
+		if rows.Scan(&k, &d) == nil {
+			t.seen[k] = d
+		}
 	}
 }
 
 func (t *editTracker) save(now time.Time) {
 	t.mu.Lock()
-	if t.path == "" {
+	if t.dir == "" {
 		t.mu.Unlock()
 		return
 	}
-	raw, err := json.Marshal(editsFile{Alive: now.Unix(), Seen: t.seen})
-	path := t.path
-	t.dirty = false
+	dirty := t.dirty
+	t.dirty = map[string]int{}
+	dir := t.dir
 	t.mu.Unlock()
-	if err != nil {
-		return
+	db, err := store.Open(dir)
+	if err == nil {
+		ctx := context.Background()
+		err = db.Write(ctx, func(tx *sql.Tx) error {
+			for k, d := range dirty {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO edit_dates(key, edit_date, seen) VALUES(?, ?, ?)
+					ON CONFLICT(key) DO UPDATE SET edit_date = excluded.edit_date, seen = excluded.seen`,
+					k, d, now.Unix()); err != nil {
+					return err
+				}
+			}
+			if len(dirty) > 0 {
+				// старше editsMax последних — не нужны: такую правку без
+				// известной даты и так отсекут editFresh и since
+				if _, err := tx.ExecContext(ctx, `DELETE FROM edit_dates WHERE key IN
+					(SELECT key FROM edit_dates ORDER BY seen DESC LIMIT -1 OFFSET ?)`, editsMax); err != nil {
+					return err
+				}
+			}
+			return store.PutKV(ctx, tx, store.KeyEditsAlive, now.Unix())
+		})
 	}
-	_ = fsx.WriteFile(path, raw, 0o600)
+	if err != nil {
+		t.mu.Lock()
+		for k, d := range dirty {
+			if _, newer := t.dirty[k]; !newer {
+				t.dirty[k] = d
+			}
+		}
+		t.mu.Unlock()
+	}
 }
 
 // keep — отмечать на диске, что служба жива (и сбрасывать даты правок).
@@ -110,7 +142,10 @@ func (t *editTracker) isNew(m tg.MessageClass, now time.Time) bool {
 		clear(t.seen)
 	}
 	t.seen[key] = msg.EditDate
-	t.dirty = true
+	if t.dirty == nil {
+		t.dirty = map[string]int{}
+	}
+	t.dirty[key] = msg.EditDate
 	if known {
 		return msg.EditDate != last
 	}

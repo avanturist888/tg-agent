@@ -1,27 +1,21 @@
-// Package outbox — очередь черновиков data/outbox.json.
+// Package outbox — очередь черновиков (таблица drafts в data/state.db).
 //
-// Агент кладёт сюда текст, человек подтверждает. Файл общий для всех
-// процессов, поэтому любые изменения — под локом. Поля, которых этот код не
-// знает (от более новой сборки), сохраняются при перезаписи: MCP-сервер живёт,
-// пока открыта сессия Claude Code, и может быть старше соседей.
+// Агент кладёт сюда текст, человек подтверждает. Очередь общая для всех
+// процессов профиля, каждое изменение — одна транзакция (db.go). Поля,
+// которых этот код не знает (от более новой сборки), сохраняются при
+// перезаписи: черновик хранится целиком, как JSON.
 package outbox
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"tgagent/internal/audit"
-	"tgagent/internal/fsx"
-	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 )
 
@@ -33,9 +27,6 @@ const (
 	Cancelled = "cancelled"
 	Expired   = "expired"
 )
-
-// LockTimeout — сколько ждать лок очереди.
-const LockTimeout = 45 * time.Second
 
 // NotFound — нет черновика с таким id.
 type NotFound struct{ ID string }
@@ -289,72 +280,11 @@ func (d *Draft) HistoryEvents() []map[string]any {
 	return out
 }
 
-// Outbox — очередь черновиков.
-type Outbox struct{ Path string }
-
-func New(path string) *Outbox {
-	_ = os.MkdirAll(filepath.Dir(path), 0o700)
-	return &Outbox{Path: path}
-}
-
-func (o *Outbox) read() ([]*Draft, error) {
-	data, err := os.ReadFile(o.Path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if len(bytes.TrimSpace(data)) == 0 {
-		return nil, nil
-	}
-	var drafts []*Draft
-	if err := json.Unmarshal(data, &drafts); err != nil {
-		// Испорченный файл не должен останавливать отправку у всех агентов
-		// (9.11.2026 outbox.json обнулился при сбое питания, и отправка
-		// стояла до утра): откладываем его рядом, не удаляя, и начинаем заново.
-		moved, qerr := fsx.Quarantine(o.Path)
-		if qerr != nil {
-			return nil, fmt.Errorf("outbox.json повреждён (%v), отложить его не вышло: %w", err, qerr)
-		}
-		_ = audit.Log(filepath.Join(filepath.Dir(o.Path), "audit.jsonl"), "outbox_corrupt",
-			"error", err.Error(), "zeroed", fsx.Zeroed(data), "moved_to", moved)
-		return nil, nil
-	}
-	return drafts, nil
-}
-
-func (o *Outbox) write(drafts []*Draft) error {
-	if drafts == nil {
-		drafts = []*Draft{}
-	}
-	raw, err := omap.Marshal(drafts)
-	if err != nil {
-		return err
-	}
-	var buf bytes.Buffer
-	if err := json.Indent(&buf, raw, "", "  "); err != nil {
-		return err
-	}
-	return fsx.WriteFile(o.Path, buf.Bytes(), 0o600)
-}
-
-func touchExpired(drafts []*Draft) {
-	now := time.Now()
-	for _, d := range drafts {
-		if d.IsExpired(now) {
-			d.Status = Expired
-		}
-	}
-}
-
-func (o *Outbox) locked(fn func() error) error {
-	return lock.With(context.Background(), o.Path, LockTimeout, fn)
-}
-
-// NewID — id вида 0924-0750-85aa: дата, время UTC и случайный хвост.
+// NewID — id вида 0924-0750-85aa1f: дата, время UTC и случайный хвост
+// (3 байта: при сотнях черновиков в минуту совпадение почти исключено, а
+// Create и FreshID исключают его совсем).
 func NewID() string {
-	b := make([]byte, 2)
+	b := make([]byte, 3)
 	_, _ = rand.Read(b)
 	return time.Now().UTC().Format("0102-1504") + "-" + hex.EncodeToString(b)
 }
@@ -387,130 +317,56 @@ type CreateOpts struct {
 	Bot *BotSpec
 }
 
-func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
-	now := time.Now()
-	id := opts.ID
-	if id == "" {
-		id = NewID()
+// ApprovedBy — кем одобрен черновик (последнее событие approved).
+// AgentName — имя агента из контейнера, создавшего черновик ("" — местный агент).
+func (d *Draft) AgentName() string {
+	name, ok := strings.CutPrefix(d.Origin, "agent:")
+	if !ok {
+		return ""
 	}
-	fmtName := opts.Fmt
-	if fmtName == "" {
-		fmtName = "markdown"
+	return name
+}
+
+func cmpOr(v, def string) string {
+	if v == "" {
+		return def
 	}
-	d := &Draft{
-		ID:         id,
-		Chat:       opts.Chat,
-		Text:       opts.Text,
-		ReplyTo:    opts.ReplyTo,
-		CreatedAt:  audit.FormatTime(now),
-		ExpiresAt:  audit.FormatTime(now.Add(time.Duration(opts.TTLMin) * time.Minute)),
-		Status:     Pending,
-		Origin:     cmpOr(opts.Origin, "agent"),
-		Fmt:        fmtName,
-		Files:      opts.Files,
-		Note:       opts.Note,
-		Topic:      opts.Topic,
-		TopicTitle: opts.TopicTitle,
-		EditOf:     opts.EditOf,
-		EditOld:    opts.EditOld,
-		Poll:       opts.Poll,
-		Vote:       opts.Vote,
-		Bot:        opts.Bot,
-	}
-	if opts.SendAt != nil {
-		at := audit.FormatTime(*opts.SendAt)
-		d.Status = Scheduled
-		d.SendAt = &at
-		d.AddHistory("event", "scheduled", "by", "auto_send", "at", audit.FormatTime(now), "send_at", at)
-	}
-	err := o.locked(func() error {
-		drafts, err := o.read()
-		if err != nil {
-			return err
+	return v
+}
+
+func (d *Draft) ApprovedBy() string {
+	by := ""
+	for _, h := range d.HistoryEvents() {
+		if h["event"] == "approved" {
+			by, _ = h["by"].(string)
 		}
-		touchExpired(drafts)
-		drafts = append(drafts, d)
-		if len(drafts) > 200 {
-			drafts = drafts[len(drafts)-200:]
+	}
+	return by
+}
+
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
+
+// EditText — владелец поправил текст ещё не решённого черновика.
+func (o *Outbox) EditText(id, text, by string) (*Draft, error) {
+	return o.Update(id, func(d *Draft) error {
+		if d.Status != Pending && d.Status != Scheduled {
+			return &BadState{fmt.Sprintf("Черновик %s в статусе '%s', править поздно", id, d.Status)}
 		}
-		return o.write(drafts)
+		d.Text = text
+		d.AddHistory("event", "edited", "by", by, "at", audit.Now())
+		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	return d, nil
 }
-
-// List — черновики (status == "" — все).
-func (o *Outbox) List(status string) ([]*Draft, error) {
-	var drafts []*Draft
-	err := o.locked(func() error {
-		var err error
-		drafts, err = o.read()
-		if err != nil {
-			return err
-		}
-		touchExpired(drafts)
-		return o.write(drafts)
-	})
-	if err != nil {
-		return nil, err
-	}
-	if status == "" {
-		return drafts, nil
-	}
-	out := drafts[:0:0]
-	for _, d := range drafts {
-		if d.Status == status {
-			out = append(out, d)
-		}
-	}
-	return out, nil
-}
-
-func (o *Outbox) Get(id string) (*Draft, error) {
-	drafts, err := o.List("")
-	if err != nil {
-		return nil, err
-	}
-	for _, d := range drafts {
-		if d.ID == id {
-			return d, nil
-		}
-	}
-	return nil, &NotFound{ID: id}
-}
-
-// Update — изменить черновик под локом; mutate может отказать ошибкой.
-func (o *Outbox) Update(id string, mutate func(*Draft) error) (*Draft, error) {
-	var found *Draft
-	err := o.locked(func() error {
-		drafts, err := o.read()
-		if err != nil {
-			return err
-		}
-		touchExpired(drafts)
-		for _, d := range drafts {
-			if d.ID == id {
-				if err := mutate(d); err != nil {
-					return err
-				}
-				found = d
-				return o.write(drafts)
-			}
-		}
-		return &NotFound{ID: id}
-	})
-	if err != nil {
-		return nil, err
-	}
-	return found, nil
-}
-
 func (o *Outbox) Approve(id, by string) (*Draft, error) {
 	return o.Update(id, func(d *Draft) error {
 		// scheduled — владелец не стал ждать окна автоотправки: «Отправить сейчас».
-		// Захват под локом очереди, так что таймер его уже не подхватит.
+		// Одобрение — в транзакции очереди, так что таймер его уже не подхватит.
 		if d.Status != Pending && d.Status != Scheduled {
 			return &BadState{fmt.Sprintf("Черновик %s в статусе '%s', подтвердить нельзя", id, d.Status)}
 		}
@@ -560,109 +416,6 @@ func (o *Outbox) MarkSent(id string, messageID int64, at string) (*Draft, error)
 		d.SentAt = &at
 		d.MessageID = &messageID
 		d.AddHistory("event", "sent", "at", at, "message_id", messageID)
-		return nil
-	})
-}
-
-// ClaimDue — забрать запланированные черновики, чьё время пришло: перевести
-// их в approved (by auto_send) под локом, чтобы отправил ровно один процесс.
-func (o *Outbox) ClaimDue(now time.Time) ([]*Draft, error) {
-	var due []*Draft
-	err := o.locked(func() error {
-		drafts, err := o.read()
-		if err != nil {
-			return err
-		}
-		touchExpired(drafts)
-		changed := false
-		for _, d := range drafts {
-			if d.Status != Scheduled || d.SendAt == nil {
-				continue
-			}
-			at, err := time.Parse(time.RFC3339, *d.SendAt)
-			if err != nil || now.Before(at) {
-				continue
-			}
-			ts := audit.FormatTime(now)
-			d.Status = Approved
-			d.ApprovedAt = &ts
-			d.AddHistory("event", "approved", "by", "auto_send", "at", ts)
-			due = append(due, d)
-			changed = true
-		}
-		if !changed {
-			return nil
-		}
-		return o.write(drafts)
-	})
-	return due, err
-}
-
-// NextDue — ближайшее время автоотправки (nil — ничего не запланировано).
-func (o *Outbox) NextDue() (*time.Time, error) {
-	drafts, err := o.List(Scheduled)
-	if err != nil {
-		return nil, err
-	}
-	var next *time.Time
-	for _, d := range drafts {
-		if d.SendAt == nil {
-			continue
-		}
-		at, err := time.Parse(time.RFC3339, *d.SendAt)
-		if err != nil {
-			continue
-		}
-		if next == nil || at.Before(*next) {
-			next = &at
-		}
-	}
-	return next, nil
-}
-
-// ApprovedBy — кем одобрен черновик (последнее событие approved).
-// AgentName — имя агента из контейнера, создавшего черновик ("" — местный агент).
-func (d *Draft) AgentName() string {
-	name, ok := strings.CutPrefix(d.Origin, "agent:")
-	if !ok {
-		return ""
-	}
-	return name
-}
-
-func cmpOr(v, def string) string {
-	if v == "" {
-		return def
-	}
-	return v
-}
-
-func (d *Draft) ApprovedBy() string {
-	by := ""
-	for _, h := range d.HistoryEvents() {
-		if h["event"] == "approved" {
-			by, _ = h["by"].(string)
-		}
-	}
-	return by
-}
-
-func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n])
-}
-
-// EditText — владелец поправил текст ещё не решённого черновика.
-func (o *Outbox) EditText(id, text, by string) (*Draft, error) {
-	return o.Update(id, func(d *Draft) error {
-		if d.Status != Pending && d.Status != Scheduled {
-			return &BadState{fmt.Sprintf("Черновик %s в статусе '%s', править поздно", id, d.Status)}
-		}
-		d.Text = text
-		d.AddHistory("event", "edited", "by", by, "at", audit.Now())
 		return nil
 	})
 }

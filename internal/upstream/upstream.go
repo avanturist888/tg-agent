@@ -7,15 +7,12 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"time"
 
-	"tgagent/internal/fsx"
+	"tgagent/internal/store"
 )
 
 // Values — что видно у источника сейчас: ключ → значение.
@@ -54,7 +51,7 @@ type Result struct {
 // Changed — есть что сообщить владельцу.
 func (r Result) Changed() bool { return r.Err == nil && !r.First && len(r.Diffs) > 0 }
 
-// State — data/upstream.json.
+// State — состояние проверок (таблица upstream_sources в data/state.db).
 type State struct {
 	Sources map[string]*SourceState `json:"sources"`
 }
@@ -67,31 +64,34 @@ type SourceState struct {
 	Fails   int       `json:"fails,omitempty"` // проверок подряд с ошибкой
 }
 
-// Load — состояние с диска; нет файла — пустое.
-func Load(path string) (*State, error) {
-	st := &State{Sources: map[string]*SourceState{}}
-	raw, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return st, nil
-	}
+var sourcesTab = store.NewTable[*SourceState](store.TUpstreamSources)
+
+// Load — состояние из базы профиля в dir (data/); ничего нет — пустое.
+func Load(dir string) (*State, error) {
+	db, err := store.Open(dir)
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(raw, st); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+	m, err := sourcesTab.All(context.Background(), db.Q())
+	if err != nil {
+		return nil, err
 	}
-	if st.Sources == nil {
-		st.Sources = map[string]*SourceState{}
-	}
-	return st, nil
+	return &State{Sources: m}, nil
 }
 
-func (st *State) Save(path string) error {
-	raw, err := json.MarshalIndent(st, "", "  ")
+// Save — записать состояние целиком (источник, которого нет в st, убирается).
+func (st *State) Save(dir string) error {
+	db, err := store.Open(dir)
 	if err != nil {
 		return err
 	}
-	return fsx.WriteFile(path, raw, 0o600)
+	return sourcesTab.Edit(context.Background(), db, func(m map[string]*SourceState) bool {
+		clear(m)
+		for k, v := range st.Sources {
+			m[k] = v
+		}
+		return true
+	})
 }
 
 // Check — проверить источники; состояние не трогает.

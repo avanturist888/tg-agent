@@ -15,7 +15,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -28,7 +27,7 @@ import (
 
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
-	"tgagent/internal/fsx"
+	"tgagent/internal/store"
 	"tgagent/internal/upstream"
 )
 
@@ -50,8 +49,6 @@ var (
 	upstreamWake    = wakeProjectAgent
 )
 
-func upstreamPath(s *config.Settings) string { return filepath.Join(s.DataDir(), "upstream.json") }
-
 // pinnedCard — закреплённая, ещё не разобранная карточка источника. Хранится
 // отдельно от состояния проверок под своим коротким замком: «Разобрано» не
 // ждёт проверку, которая держит upstreamMu, пока ходит в сеть.
@@ -64,33 +61,15 @@ type pinnedCard struct {
 	At time.Time `json:"at,omitempty"`
 }
 
-var pinnedMu sync.Mutex
+var cardsTab = store.NewTable[pinnedCard](store.TUpstreamCards)
 
-func pinnedPath(s *config.Settings) string {
-	return filepath.Join(s.DataDir(), "upstream_cards.json")
-}
-
-// updatePinned — прочитать карточки, поменять f и записать (под pinnedMu).
+// updatePinned — прочитать карточки, поменять f и записать одной транзакцией.
 func updatePinned(s *config.Settings, f func(map[string]pinnedCard)) error {
-	pinnedMu.Lock()
-	defer pinnedMu.Unlock()
-	path := pinnedPath(s)
-	cards := map[string]pinnedCard{}
-	raw, err := os.ReadFile(path)
-	switch {
-	case err == nil:
-		if err := json.Unmarshal(raw, &cards); err != nil {
-			cards = map[string]pinnedCard{} // испорчен — начать заново: пропадут лишь замены
-		}
-	case !errors.Is(err, os.ErrNotExist):
-		return err
-	}
-	f(cards)
-	raw, err = json.MarshalIndent(cards, "", "  ")
+	db, err := stateDB(s)
 	if err != nil {
 		return err
 	}
-	return fsx.WriteFile(path, raw, 0o600)
+	return cardsTab.Edit(context.Background(), db, func(m map[string]pinnedCard) bool { f(m); return true })
 }
 
 // RunUpstream — проверки по расписанию; одна на установку — в службе
@@ -115,8 +94,7 @@ func RunUpstream(ctx context.Context, loader func() (*config.Settings, error)) {
 func CheckUpstream(ctx context.Context, s *config.Settings) (*upstream.State, error) {
 	upstreamMu.Lock()
 	defer upstreamMu.Unlock()
-	path := upstreamPath(s)
-	st, err := upstream.Load(path)
+	st, err := upstream.Load(s.DataDir())
 	if err != nil {
 		logEvent(s, "upstream_check_failed", "error", err.Error())
 		return nil, err
@@ -155,7 +133,7 @@ func CheckUpstream(ctx context.Context, s *config.Settings) (*upstream.State, er
 			st.Apply(r, now)
 		}
 	}
-	if err := st.Save(path); err != nil {
+	if err := st.Save(s.DataDir()); err != nil {
 		logEvent(s, "upstream_check_failed", "error", err.Error())
 		return st, err
 	}
@@ -547,16 +525,17 @@ type UpstreamThread struct {
 	Set    time.Time `json:"set"`
 }
 
-func upstreamThreadPath() string { return filepath.Join(config.DataPath(), "upstream_thread.json") }
+func upstreamDB() (*store.DB, error) { return store.Open(config.DataPath()) }
 
 // ReadUpstreamThread — назначенный тред; nil — каждый раз новый.
 func ReadUpstreamThread() *UpstreamThread {
-	raw, err := os.ReadFile(upstreamThreadPath())
+	db, err := upstreamDB()
 	if err != nil {
 		return nil
 	}
 	var t UpstreamThread
-	if json.Unmarshal(raw, &t) != nil || strings.TrimSpace(t.Thread) == "" {
+	if ok, err := store.GetKV(context.Background(), db.Q(), store.KeyUpstreamThread, &t); !ok || err != nil ||
+		strings.TrimSpace(t.Thread) == "" {
 		return nil
 	}
 	return &t
@@ -564,19 +543,16 @@ func ReadUpstreamThread() *UpstreamThread {
 
 // SetUpstreamThread — назначить тред ("" — снова новый тред на каждое изменение).
 func SetUpstreamThread(thread string) error {
+	db, err := upstreamDB()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
 	thread = strings.TrimSpace(thread)
 	if thread == "" {
-		err := os.Remove(upstreamThreadPath())
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
+		return store.DelKV(ctx, db.Q(), store.KeyUpstreamThread)
 	}
-	raw, _ := json.MarshalIndent(UpstreamThread{Thread: thread, Set: time.Now()}, "", "  ")
-	if err := os.MkdirAll(config.DataPath(), 0o700); err != nil {
-		return err
-	}
-	return fsx.WriteFile(upstreamThreadPath(), raw, 0o600)
+	return store.PutKV(ctx, db.Q(), store.KeyUpstreamThread, UpstreamThread{Thread: thread, Set: time.Now()})
 }
 
 var nestorSend = func(ctx context.Context, exe, text string, args ...string) error {

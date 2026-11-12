@@ -196,7 +196,7 @@ func maxFeed(s *config.Settings, rule config.ChatRule, msgs []maxc.Message) {
 		ids = append(ids, int(m.ID))
 	}
 	slices.Sort(ids)
-	if _, err := appendNewer(FeedPath(s, rule.Alias), ids); err != nil {
+	if _, err := appendNewer(s, rule.Alias, ids); err != nil {
 		logEvent(s, "feed_failed", "chat", rule.Alias, "error", err.Error())
 	}
 }
@@ -621,7 +621,7 @@ func MaxState(ctx context.Context) (*MaxStatus, error) {
 
 // maxNearestSent — точный id нашего отправленного сообщения по округлённому.
 func maxNearestSent(s *config.Settings, alias string, id int64) int64 {
-	drafts, err := outbox.New(s.OutboxPath()).List(outbox.Sent)
+	drafts, err := outbox.New(s.DataDir()).List(outbox.Sent)
 	if err != nil {
 		return id
 	}

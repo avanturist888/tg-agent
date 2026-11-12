@@ -4,50 +4,34 @@ package core
 // (ручное подтверждение), закреплена в чате с ботом, чтобы не потеряться среди
 // карточек автоотправки, — без владельца такое сообщение не уйдёт. Решили
 // (кнопкой, мимо кнопок, протухло) — откреплена. Какие закреплены —
-// data/pinned_drafts.json (черновик → карточка).
+// таблица pinned_drafts (черновик → карточка).
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"os"
-	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
-	"tgagent/internal/fsx"
 	"tgagent/internal/outbox"
+	"tgagent/internal/store"
 )
 
 var (
-	pinsMu   sync.Mutex
 	pinBot   = bot.Call // тесты подменяют
 	sweeping atomic.Bool
 )
 
-func pinsPath(s *config.Settings) string { return filepath.Join(s.DataDir(), "pinned_drafts.json") }
+// pinsTab — закреплённые карточки: черновик → id карточки.
+var pinsTab = store.NewTable[int64](store.TPinnedDrafts)
 
-// editPins — прочитать, поменять f и записать (под pinsMu).
+// editPins — прочитать, поменять f и записать одной транзакцией.
 func editPins(s *config.Settings, f func(map[string]int64)) error {
-	pinsMu.Lock()
-	defer pinsMu.Unlock()
-	path := pinsPath(s)
-	pins := map[string]int64{}
-	raw, err := os.ReadFile(path)
-	switch {
-	case err == nil:
-		if json.Unmarshal(raw, &pins) != nil {
-			pins = map[string]int64{}
-		}
-	case !errors.Is(err, os.ErrNotExist):
+	db, err := stateDB(s)
+	if err != nil {
 		return err
 	}
-	f(pins)
-	raw, _ = json.MarshalIndent(pins, "", "  ")
-	return fsx.WriteFile(path, raw, 0o600)
+	return pinsTab.Edit(context.Background(), db, func(m map[string]int64) bool { f(m); return true })
 }
 
 // pinDraftCard — закрепить карточку, которая ждёт владельца.
@@ -90,7 +74,7 @@ func sweepPins(ctx context.Context, s *config.Settings) {
 			pins[k] = v
 		}
 	})
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	now := time.Now()
 	for id, cardID := range pins {
 		d, err := box.Get(id)

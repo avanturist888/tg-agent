@@ -97,14 +97,14 @@ func DraftPoll(ctx context.Context, s *config.Settings, chat string, p outbox.Po
 	if err != nil {
 		return nil, err
 	}
-	opts := outbox.CreateOpts{ID: outbox.NewID(), Chat: rule.Alias, ReplyTo: replyTo, TTLMin: s.DraftTTLMin,
+	opts := outbox.CreateOpts{Chat: rule.Alias, ReplyTo: replyTo, TTLMin: s.DraftTTLMin,
 		Note: note, Origin: draftOrigin(s), Topic: topic, TopicTitle: topicName, Poll: &p}
 	auto := rule.AutoSend()
 	if auto {
 		at := time.Now().Add(time.Duration(s.AutoSendDelaySec) * time.Second)
 		opts.SendAt = &at
 	}
-	d, err := outbox.New(s.OutboxPath()).Create(opts)
+	d, err := outbox.New(s.DataDir()).Create(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -227,14 +227,14 @@ func DraftVote(ctx context.Context, s *config.Settings, chat string, messageID i
 		options = []int{}
 	}
 	v := &outbox.VoteSpec{MessageID: messageID, Options: options, Question: fmt.Sprint(q), Labels: labels}
-	opts2 := outbox.CreateOpts{ID: outbox.NewID(), Chat: rule.Alias, TTLMin: s.DraftTTLMin, Note: note,
+	opts2 := outbox.CreateOpts{Chat: rule.Alias, TTLMin: s.DraftTTLMin, Note: note,
 		Origin: draftOrigin(s), Vote: v}
 	auto := rule.AutoSend()
 	if auto {
 		at := time.Now().Add(time.Duration(s.AutoSendDelaySec) * time.Second)
 		opts2.SendAt = &at
 	}
-	d, err := outbox.New(s.OutboxPath()).Create(opts2)
+	d, err := outbox.New(s.DataDir()).Create(opts2)
 	if err != nil {
 		return nil, err
 	}

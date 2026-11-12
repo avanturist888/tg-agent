@@ -2,10 +2,9 @@ package tgc
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,78 +13,129 @@ import (
 	"github.com/gotd/td/tg"
 
 	"tgagent/internal/config"
-	"tgagent/internal/fsx"
-	"tgagent/internal/lock"
+	"tgagent/internal/store"
 )
 
-// PeerCache — access_hash пользователей и каналов (data/peers.json).
+// PeerCache — access_hash пользователей и каналов (таблицы peer_* в
+// data/state.db).
 //
 // Без access_hash Telegram не даёт обратиться к пользователю или каналу по
-// id, поэтому храним их отдельным файлом рядом с сессией.
+// id. Кэш читается целиком при подключении, а Save пишет только то, что
+// поменялось с прошлого раза (pending), — поверх записанного другими
+// процессами, ничего у них не затирая.
 type PeerCache struct {
-	path string
-	mu   sync.Mutex
-	data peerData
-	// dirty — есть несохранённые изменения
-	dirty bool
+	dir     string
+	mu      sync.Mutex
+	data    peerData
+	pending peerData // изменения с прошлого Save
 }
 
 type peerData struct {
-	Self      int64             `json:"self,omitempty"`
-	Users     map[string]int64  `json:"users"`
-	Channels  map[string]int64  `json:"channels"`
-	Usernames map[string]string `json:"usernames"` // username (lower) → "user:ID" / "channel:ID"
+	Self      int64
+	Users     map[int64]int64
+	Channels  map[int64]int64
+	Usernames map[string]string // username (lower) → "user:ID" / "channel:ID"
 }
 
-func LoadPeers(path string) *PeerCache {
-	c := &PeerCache{path: path, data: peerData{
-		Users: map[string]int64{}, Channels: map[string]int64{}, Usernames: map[string]string{},
-	}}
-	if raw, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(raw, &c.data)
+func newPeerData() peerData {
+	return peerData{Users: map[int64]int64{}, Channels: map[int64]int64{}, Usernames: map[string]string{}}
+}
+
+// LoadPeers — кэш из базы профиля в dir ("" — только в памяти).
+func LoadPeers(dir string) *PeerCache {
+	c := &PeerCache{dir: dir, data: newPeerData(), pending: newPeerData()}
+	if dir == "" {
+		return c
 	}
-	if c.data.Users == nil {
-		c.data.Users = map[string]int64{}
+	db, err := store.Open(dir)
+	if err != nil {
+		return c
 	}
-	if c.data.Channels == nil {
-		c.data.Channels = map[string]int64{}
+	ctx := context.Background()
+	q := db.Q()
+	for table, m := range map[string]map[int64]int64{"peer_users": c.data.Users, "peer_channels": c.data.Channels} {
+		rows, err := q.QueryContext(ctx, "SELECT id, access_hash FROM "+table)
+		if err != nil {
+			continue
+		}
+		for rows.Next() {
+			var id, h int64
+			if rows.Scan(&id, &h) == nil {
+				m[id] = h
+			}
+		}
+		rows.Close()
 	}
-	if c.data.Usernames == nil {
-		c.data.Usernames = map[string]string{}
+	if rows, err := q.QueryContext(ctx, "SELECT name, ref FROM peer_usernames"); err == nil {
+		for rows.Next() {
+			var name, ref string
+			if rows.Scan(&name, &ref) == nil {
+				c.data.Usernames[name] = ref
+			}
+		}
+		rows.Close()
 	}
+	_, _ = store.GetKV(ctx, q, store.KeyPeersSelf, &c.data.Self)
 	return c
 }
 
-// Save пишет кэш на диск, если он менялся (слияние с тем, что записали другие).
+// Save пишет в базу то, что поменялось с прошлого раза.
 func (c *PeerCache) Save() {
 	c.mu.Lock()
-	if !c.dirty {
+	p := c.pending
+	if c.dir == "" || (p.Self == 0 && len(p.Users) == 0 && len(p.Channels) == 0 && len(p.Usernames) == 0) {
 		c.mu.Unlock()
 		return
 	}
-	mine := c.data
-	c.dirty = false
+	c.pending = newPeerData()
 	c.mu.Unlock()
-	_ = lock.With(context.Background(), c.path, 10*time.Second, func() error {
-		merged := LoadPeers(c.path).data
-		for k, v := range mine.Users {
-			merged.Users[k] = v
+	db, err := store.Open(c.dir)
+	if err == nil {
+		ctx := context.Background()
+		err = db.Write(ctx, func(tx *sql.Tx) error {
+			for table, m := range map[string]map[int64]int64{"peer_users": p.Users, "peer_channels": p.Channels} {
+				for id, h := range m {
+					if _, err := tx.ExecContext(ctx, "INSERT INTO "+table+`(id, access_hash) VALUES(?, ?)
+						ON CONFLICT(id) DO UPDATE SET access_hash = excluded.access_hash`, id, h); err != nil {
+						return err
+					}
+				}
+			}
+			for name, ref := range p.Usernames {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO peer_usernames(name, ref) VALUES(?, ?)
+					ON CONFLICT(name) DO UPDATE SET ref = excluded.ref`, name, ref); err != nil {
+					return err
+				}
+			}
+			if p.Self != 0 {
+				return store.PutKV(ctx, tx, store.KeyPeersSelf, p.Self)
+			}
+			return nil
+		})
+	}
+	if err != nil {
+		// не записалось — вернуть в очередь, запишется со следующим Save
+		c.mu.Lock()
+		for id, h := range p.Users {
+			if _, newer := c.pending.Users[id]; !newer {
+				c.pending.Users[id] = h
+			}
 		}
-		for k, v := range mine.Channels {
-			merged.Channels[k] = v
+		for id, h := range p.Channels {
+			if _, newer := c.pending.Channels[id]; !newer {
+				c.pending.Channels[id] = h
+			}
 		}
-		for k, v := range mine.Usernames {
-			merged.Usernames[k] = v
+		for n, ref := range p.Usernames {
+			if _, newer := c.pending.Usernames[n]; !newer {
+				c.pending.Usernames[n] = ref
+			}
 		}
-		if mine.Self != 0 {
-			merged.Self = mine.Self
+		if c.pending.Self == 0 {
+			c.pending.Self = p.Self
 		}
-		raw, err := json.MarshalIndent(merged, "", " ")
-		if err != nil {
-			return err
-		}
-		return fsx.WriteFile(c.path, raw, 0o600)
-	})
+		c.mu.Unlock()
+	}
 }
 
 // Remember — запомнить пользователей и чаты из любого ответа Telegram.
@@ -97,23 +147,16 @@ func (c *PeerCache) Remember(users []tg.UserClass, chats []tg.ChatClass) {
 		if !ok {
 			continue
 		}
-		key := strconv.FormatInt(user.ID, 10)
 		if hash, ok := user.GetAccessHash(); ok && !user.Min {
-			if c.data.Users[key] != hash {
-				c.data.Users[key] = hash
-				c.dirty = true
+			if c.data.Users[user.ID] != hash {
+				c.data.Users[user.ID], c.pending.Users[user.ID] = hash, hash
 			}
 		}
 		if user.Self && c.data.Self != user.ID {
-			c.data.Self = user.ID
-			c.dirty = true
+			c.data.Self, c.pending.Self = user.ID, user.ID
 		}
 		if name, ok := user.GetUsername(); ok && name != "" {
-			ref := "user:" + key
-			if c.data.Usernames[strings.ToLower(name)] != ref {
-				c.data.Usernames[strings.ToLower(name)] = ref
-				c.dirty = true
-			}
+			c.setUsername(name, "user:"+strconv.FormatInt(user.ID, 10))
 		}
 	}
 	for _, ch := range chats {
@@ -121,20 +164,21 @@ func (c *PeerCache) Remember(users []tg.UserClass, chats []tg.ChatClass) {
 		if !ok {
 			continue
 		}
-		key := strconv.FormatInt(channel.ID, 10)
 		if hash, ok := channel.GetAccessHash(); ok && !channel.Min {
-			if c.data.Channels[key] != hash {
-				c.data.Channels[key] = hash
-				c.dirty = true
+			if c.data.Channels[channel.ID] != hash {
+				c.data.Channels[channel.ID], c.pending.Channels[channel.ID] = hash, hash
 			}
 		}
 		if name, ok := channel.GetUsername(); ok && name != "" {
-			ref := "channel:" + key
-			if c.data.Usernames[strings.ToLower(name)] != ref {
-				c.data.Usernames[strings.ToLower(name)] = ref
-				c.dirty = true
-			}
+			c.setUsername(name, "channel:"+strconv.FormatInt(channel.ID, 10))
 		}
+	}
+}
+
+func (c *PeerCache) setUsername(name, ref string) {
+	key := strings.ToLower(name)
+	if c.data.Usernames[key] != ref {
+		c.data.Usernames[key], c.pending.Usernames[key] = ref, ref
 	}
 }
 
@@ -167,14 +211,14 @@ func (c *PeerCache) MarkedByUsername(name string) int64 {
 func (c *PeerCache) user(id int64) (int64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	h, ok := c.data.Users[strconv.FormatInt(id, 10)]
+	h, ok := c.data.Users[id]
 	return h, ok
 }
 
 func (c *PeerCache) channel(id int64) (int64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	h, ok := c.data.Channels[strconv.FormatInt(id, 10)]
+	h, ok := c.data.Channels[id]
 	return h, ok
 }
 

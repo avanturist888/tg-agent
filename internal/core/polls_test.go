@@ -72,7 +72,7 @@ func TestPollInfo(t *testing.T) {
 
 func TestPollDraftRoundTrip(t *testing.T) {
 	s := watchEnv(t)
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	p := &outbox.PollSpec{Question: "Кто идёт?", Options: []string{"я", "не я"}, Anonymous: false, Multiple: true}
 	d, err := box.Create(outbox.CreateOpts{Chat: "test", TTLMin: 60, Poll: p})
 	if err != nil {

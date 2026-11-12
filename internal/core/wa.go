@@ -345,7 +345,7 @@ func waOnEvent(loader func() (*config.Settings, error), c *wac.Client, ev wac.Ev
 				markOutgoing(rule.Alias, id)
 			}
 		}
-		if _, err := appendNewer(FeedPath(s, rule.Alias), ids); err != nil {
+		if _, err := appendNewer(s, rule.Alias, ids); err != nil {
 			logEvent(s, "feed_failed", "chat", rule.Alias, "error", err.Error())
 		}
 	case wac.EventEdit:
@@ -382,7 +382,7 @@ func (waNet) catchup(ctx context.Context, s *config.Settings) {
 			ids = append(ids, int(m.ID))
 		}
 		slices.Sort(ids) // в хранилище по времени; ленте нужны номера по возрастанию
-		if _, err := appendNewer(FeedPath(s, rule.Alias), ids); err != nil {
+		if _, err := appendNewer(s, rule.Alias, ids); err != nil {
 			logEvent(s, "feed_failed", "chat", rule.Alias, "error", err.Error())
 		}
 	}
@@ -561,7 +561,7 @@ func (waNet) deliver(ctx context.Context, s *config.Settings, rule config.ChatRu
 	for i, id := range ids {
 		feed[i] = int(id)
 	}
-	_, _ = appendNewer(FeedPath(s, rule.Alias), feed)
+	_, _ = appendNewer(s, rule.Alias, feed)
 	out := omap.New().Set("message_id", ids[0]).Set("format", d.Fmt)
 	if len(ids) > 1 {
 		out.Set("file_message_ids", ids[1:])
@@ -732,7 +732,7 @@ func waTranscribe(ctx context.Context, s *config.Settings, rule config.ChatRule,
 		sec := info.Seconds
 		dur = &sec
 	}
-	cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
+	cache := tgc.TranscriptCache{Dir: s.DataDir()}
 	key := fmt.Sprintf("%s:%d", rule.Alias, m.ID)
 	if cached, ok := cache.Get(key); ok {
 		return cached, dur, nil
@@ -785,7 +785,7 @@ func (waNet) transcribe(ctx context.Context, s *config.Settings, rule config.Cha
 // новые — не больше TranscribePerCall за вызов, как в Telegram).
 func waAttachTranscripts(ctx context.Context, s *config.Settings, rule config.ChatRule, c *wac.Client, msgs []wac.Message, out []*omap.Map) {
 	budget := s.TranscribePerCall
-	cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
+	cache := tgc.TranscriptCache{Dir: s.DataDir()}
 	for i := range msgs {
 		if msgs[i].Kind != "voice" && msgs[i].Kind != "video_note" {
 			continue
@@ -888,7 +888,7 @@ func (waNet) folderChats(ctx context.Context, s *config.Settings, folder string)
 		}
 	}
 	pending := map[int64]string{}
-	for _, r := range loadAccess(accessPath(s)) {
+	for _, r := range loadAccess(s) {
 		if r.Status == accessPending {
 			pending[r.Peer] = r.ID
 		}

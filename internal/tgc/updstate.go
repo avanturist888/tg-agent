@@ -1,6 +1,7 @@
 package tgc
 
-// Отметка обновлений Telegram на диске (data/updates_state.json).
+// Отметка обновлений Telegram на диске (kv updates_state и таблица
+// update_channels в data/state.db).
 //
 // Менеджер обновлений gotd догоняет пропущенное запросом «что изменилось с
 // pts N». С отметкой только в памяти он догонял лишь обрывы сети внутри
@@ -10,31 +11,38 @@ package tgc
 // пропущенное обычными событиями — насколько далеко назад, решает Telegram
 // (слишком долгий простой — updates.differenceTooLong, остаётся сверка).
 //
-// Запись — не на каждый pts, а раз в несколько секунд: при падении служба
-// повторит последние события, а это безвредно (ленты не дублируются,
-// правку с той же датой отсекает editTracker).
+// Запись — не на каждый pts, а раз в несколько секунд и только того, что
+// поменялось: при падении служба повторит последние события, а это
+// безвредно (ленты не дублируются, правку с той же датой отсекает
+// editTracker). Пишет только служба.
 
 import (
 	"context"
-	"encoding/json"
-	"os"
-	"strconv"
+	"database/sql"
 	"sync"
 	"time"
 
-	"tgagent/internal/fsx"
-
 	"github.com/gotd/td/telegram/updates"
+
+	"tgagent/internal/store"
 )
 
 const updStateFlush = 3 * time.Second
 
 type updState struct {
-	path  string
-	mu    sync.Mutex
-	dirty bool
-	data  updStateFile
-	// peers — запасной источник access_hash каналов (data/peers.json): канал,
+	dir  string
+	mu   sync.Mutex
+	user int64
+	// state — общая отметка (nil — ещё не было)
+	state *updates.State
+	pts   map[int64]int   // канал → pts
+	hash  map[int64]int64 // канал → access_hash
+	// что записать: общая отметка, каналы; wipe — сначала стереть все
+	// каналы (сменился аккаунт)
+	dirtyState bool
+	dirtyCh    map[int64]bool
+	wipe       bool
+	// peers — запасной источник access_hash каналов (таблицы peer_*): канал,
 	// известный только из списка диалогов, иначе стоил бы менеджеру лишнего
 	// getDifference на первом же своём событии
 	peers *PeerCache
@@ -47,62 +55,138 @@ func (u *updState) usePeers(p *PeerCache) {
 	u.mu.Unlock()
 }
 
-type updStateFile struct {
-	User     int64            `json:"user"`
-	State    *updates.State   `json:"state,omitempty"`
-	Channels map[string]int   `json:"channels"`      // id канала → pts
-	Hashes   map[string]int64 `json:"access_hashes"` // id канала → access_hash
+// updHead — общая отметка в kv.
+type updHead struct {
+	User  int64          `json:"user"`
+	State *updates.State `json:"state"`
 }
 
-func openUpdState(path string) *updState {
-	u := &updState{path: path}
-	if raw, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(raw, &u.data)
+func openUpdState(dir string) *updState {
+	u := &updState{dir: dir, pts: map[int64]int{}, hash: map[int64]int64{}, dirtyCh: map[int64]bool{}}
+	db, err := store.Open(dir)
+	if err != nil {
+		return u
 	}
-	if u.data.Channels == nil {
-		u.data.Channels = map[string]int{}
+	ctx := context.Background()
+	var head updHead
+	if ok, err := store.GetKV(ctx, db.Q(), store.KeyUpdatesState, &head); !ok || err != nil {
+		return u
 	}
-	if u.data.Hashes == nil {
-		u.data.Hashes = map[string]int64{}
+	u.user, u.state = head.User, head.State
+	rows, err := db.Q().QueryContext(ctx, "SELECT channel_id, pts, access_hash FROM update_channels")
+	if err != nil {
+		return u
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			id   int64
+			pts  sql.NullInt64
+			hash sql.NullInt64
+		)
+		if rows.Scan(&id, &pts, &hash) != nil {
+			continue
+		}
+		if pts.Valid {
+			u.pts[id] = int(pts.Int64)
+		}
+		if hash.Valid {
+			u.hash[id] = hash.Int64
+		}
 	}
 	return u
 }
 
-func chKey(id int64) string { return strconv.FormatInt(id, 10) }
-
-// forUser — данные этого аккаунта; другой аккаунт (вход заново) — с чистого листа.
+// forUser — отметка принадлежит аккаунту: другой аккаунт начинает с нуля.
 func (u *updState) forUser(userID int64) {
-	if u.data.User != userID {
-		u.data = updStateFile{User: userID, Channels: map[string]int{}, Hashes: map[string]int64{}}
-		u.dirty = true
+	if u.user != userID {
+		u.user, u.state = userID, nil
+		u.pts, u.hash, u.dirtyCh = map[int64]int{}, map[int64]int64{}, map[int64]bool{}
+		u.wipe, u.dirtyState = true, true
 	}
 }
 
-// reset — забыть всё (выход из аккаунта).
+// reset — выход из аккаунта: отметку забыть сразу.
 func (u *updState) reset() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.data = updStateFile{Channels: map[string]int{}, Hashes: map[string]int64{}}
-	u.dirty = false
-	_ = os.Remove(u.path)
+	u.user, u.state = 0, nil
+	u.pts, u.hash, u.dirtyCh = map[int64]int{}, map[int64]int64{}, map[int64]bool{}
+	u.wipe, u.dirtyState = false, false
+	db, err := store.Open(u.dir)
+	if err != nil {
+		return
+	}
+	ctx := context.Background()
+	_ = db.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM update_channels"); err != nil {
+			return err
+		}
+		return store.DelKV(ctx, tx, store.KeyUpdatesState)
+	})
 }
 
 func (u *updState) flush() {
 	u.mu.Lock()
-	if !u.dirty {
+	if !u.dirtyState && len(u.dirtyCh) == 0 && !u.wipe {
 		u.mu.Unlock()
 		return
 	}
-	raw, err := json.Marshal(u.data)
-	u.dirty = false
-	u.mu.Unlock()
-	if err != nil {
-		return
+	head := updHead{User: u.user}
+	if u.state != nil {
+		st := *u.state
+		head.State = &st
 	}
-	_ = fsx.WriteFile(u.path, raw, 0o600)
+	wipe := u.wipe
+	type ch struct {
+		id        int64
+		pts, hash any // nil — не знаем (NULL)
+	}
+	var chans []ch
+	for id := range u.dirtyCh {
+		c := ch{id: id}
+		if v, ok := u.pts[id]; ok {
+			c.pts = v
+		}
+		if v, ok := u.hash[id]; ok {
+			c.hash = v
+		}
+		chans = append(chans, c)
+	}
+	u.dirtyState, u.wipe, u.dirtyCh = false, false, map[int64]bool{}
+	u.mu.Unlock()
+
+	db, err := store.Open(u.dir)
+	if err == nil {
+		ctx := context.Background()
+		err = db.Write(ctx, func(tx *sql.Tx) error {
+			if wipe {
+				if _, err := tx.ExecContext(ctx, "DELETE FROM update_channels"); err != nil {
+					return err
+				}
+			}
+			for _, c := range chans {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO update_channels(channel_id, pts, access_hash) VALUES(?, ?, ?)
+					ON CONFLICT(channel_id) DO UPDATE SET pts = excluded.pts, access_hash = excluded.access_hash`,
+					c.id, c.pts, c.hash); err != nil {
+					return err
+				}
+			}
+			return store.PutKV(ctx, tx, store.KeyUpdatesState, head)
+		})
+	}
+	if err != nil {
+		// не записалось — повторить со следующим flush
+		u.mu.Lock()
+		u.dirtyState = true
+		u.wipe = u.wipe || wipe
+		for _, c := range chans {
+			u.dirtyCh[c.id] = true
+		}
+		u.mu.Unlock()
+	}
 }
 
-// keep — сбрасывать на диск, пока служба жива, и в конце.
 func (u *updState) keep(ctx context.Context) {
 	for ctx.Err() == nil {
 		sleep(ctx, updStateFlush)
@@ -115,11 +199,11 @@ func (u *updState) edit(userID int64, fn func(st *updates.State)) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.forUser(userID)
-	if u.data.State == nil {
-		u.data.State = &updates.State{}
+	if u.state == nil {
+		u.state = &updates.State{}
 	}
-	fn(u.data.State)
-	u.dirty = true
+	fn(u.state)
+	u.dirtyState = true
 	return nil
 }
 
@@ -128,10 +212,10 @@ func (u *updState) edit(userID int64, fn func(st *updates.State)) error {
 func (u *updState) GetState(_ context.Context, userID int64) (updates.State, bool, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.data.User != userID || u.data.State == nil {
+	if u.user != userID || u.state == nil {
 		return updates.State{}, false, nil
 	}
-	return *u.data.State, true, nil
+	return *u.state, true, nil
 }
 
 func (u *updState) SetState(_ context.Context, userID int64, state updates.State) error {
@@ -161,10 +245,10 @@ func (u *updState) SetDateSeq(_ context.Context, userID int64, date, seq int) er
 func (u *updState) GetChannelPts(_ context.Context, userID, channelID int64) (int, bool, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.data.User != userID {
+	if u.user != userID {
 		return 0, false, nil
 	}
-	pts, ok := u.data.Channels[chKey(channelID)]
+	pts, ok := u.pts[channelID]
 	return pts, ok, nil
 }
 
@@ -172,22 +256,20 @@ func (u *updState) SetChannelPts(_ context.Context, userID, channelID int64, pts
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.forUser(userID)
-	u.data.Channels[chKey(channelID)] = pts
-	u.dirty = true
+	u.pts[channelID] = pts
+	u.dirtyCh[channelID] = true
 	return nil
 }
 
 func (u *updState) ForEachChannels(ctx context.Context, userID int64, f func(ctx context.Context, channelID int64, pts int) error) error {
 	u.mu.Lock()
-	if u.data.User != userID {
+	if u.user != userID {
 		u.mu.Unlock()
 		return nil
 	}
-	chans := make(map[int64]int, len(u.data.Channels))
-	for k, pts := range u.data.Channels {
-		if id, err := strconv.ParseInt(k, 10, 64); err == nil {
-			chans[id] = pts
-		}
+	chans := make(map[int64]int, len(u.pts))
+	for id, pts := range u.pts {
+		chans[id] = pts
 	}
 	u.mu.Unlock()
 	for id, pts := range chans {
@@ -204,9 +286,9 @@ func (u *updState) SetChannelAccessHash(_ context.Context, userID, channelID, ac
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.forUser(userID)
-	if u.data.Hashes[chKey(channelID)] != accessHash {
-		u.data.Hashes[chKey(channelID)] = accessHash
-		u.dirty = true
+	if h, ok := u.hash[channelID]; !ok || h != accessHash {
+		u.hash[channelID] = accessHash
+		u.dirtyCh[channelID] = true
 	}
 	return nil
 }
@@ -214,8 +296,8 @@ func (u *updState) SetChannelAccessHash(_ context.Context, userID, channelID, ac
 func (u *updState) GetChannelAccessHash(_ context.Context, userID, channelID int64) (int64, bool, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.data.User == userID {
-		if h, ok := u.data.Hashes[chKey(channelID)]; ok {
+	if u.user == userID {
+		if h, ok := u.hash[channelID]; ok {
 			return h, true, nil
 		}
 	}

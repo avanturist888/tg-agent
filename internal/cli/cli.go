@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -30,6 +31,7 @@ import (
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
 	"tgagent/internal/service"
+	"tgagent/internal/store"
 	"tgagent/internal/svc"
 	"tgagent/internal/tgc"
 )
@@ -624,7 +626,7 @@ func cmdDrafts(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	drafts, err := outbox.New(s.OutboxPath()).List(*status)
+	drafts, err := outbox.New(s.DataDir()).List(*status)
 	if err != nil {
 		return fail(err)
 	}
@@ -686,7 +688,7 @@ func cmdApprove(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	d, err := box.Get(pos[0])
 	if err != nil {
 		return fail(err)
@@ -831,8 +833,7 @@ func cmdFeeds(ctx context.Context, args []string) int {
 	}
 	for _, r := range s.Rules() {
 		if r.Read {
-			path := core.FeedPath(s, r.Alias)
-			fmt.Printf("  %-28s последний id %-10d %s\n", r.Alias, core.LastID(path), path)
+			fmt.Printf("  %-28s последний id %d\n", r.Alias, core.FeedLast(s, r.Alias))
 		}
 	}
 	return 0
@@ -982,6 +983,13 @@ func cmdDoctor(ctx context.Context, args []string) int {
 	}
 	if s.APIID == exampleAPIID {
 		problems = append(problems, "в .env остались значения-заглушки из .env.example — впиши свои с my.telegram.org")
+	}
+	if db, err := store.Open(s.DataDir()); err != nil {
+		fmt.Println("[x] база состояния:", err)
+		problems = append(problems, "база состояния data/state.db не открывается — черновики, подписки и ленты недоступны")
+	} else {
+		fmt.Printf("[v] база состояния: %s (схема %d, перенесено старых файлов: %d)\n",
+			filepath.Join(db.Dir, store.FileName), store.Version(), db.LegacyImported())
 	}
 	up := service.Up(ctx)
 	var status service.Status

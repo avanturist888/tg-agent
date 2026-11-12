@@ -2,11 +2,8 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,10 +13,10 @@ import (
 	"tgagent/internal/audit"
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
-	"tgagent/internal/fsx"
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
+	"tgagent/internal/store"
 	"tgagent/internal/svc"
 	"tgagent/internal/tgc"
 )
@@ -44,16 +41,25 @@ func botID(s *config.Settings) string {
 	return id
 }
 
-func readOffset(s *config.Settings) int64 {
-	raw, err := os.ReadFile(s.OffsetPath())
+// botOffset — смещение getUpdates и чей бот (kv bot_offset).
+type botOffset struct {
+	Offset int64  `json:"offset"`
+	Bot    string `json:"bot"`
+}
+
+func loadOffset(s *config.Settings) (botOffset, bool) {
+	var v botOffset
+	db, err := stateDB(s)
 	if err != nil {
-		return 0
+		return v, false
 	}
-	var v struct {
-		Offset int64  `json:"offset"`
-		Bot    string `json:"bot"`
-	}
-	if json.Unmarshal(raw, &v) != nil {
+	ok, err := store.GetKV(context.Background(), db.Q(), store.KeyBotOffset, &v)
+	return v, ok && err == nil
+}
+
+func readOffset(s *config.Settings) int64 {
+	v, ok := loadOffset(s)
+	if !ok {
 		return 0
 	}
 	if v.Bot != "" && v.Bot != botID(s) {
@@ -65,22 +71,20 @@ func readOffset(s *config.Settings) int64 {
 // tagOffset — старая запись смещения без id бота: подписать текущим ботом,
 // пока он не сменился (служба делает это при старте).
 func tagOffset(s *config.Settings) {
-	raw, err := os.ReadFile(s.OffsetPath())
-	if err != nil {
-		return
-	}
-	var v struct {
-		Offset int64  `json:"offset"`
-		Bot    string `json:"bot"`
-	}
-	if json.Unmarshal(raw, &v) == nil && v.Bot == "" {
+	if v, ok := loadOffset(s); ok && v.Bot == "" {
 		writeOffset(s, v.Offset)
 	}
 }
 
 func writeOffset(s *config.Settings, offset int64) {
-	raw, _ := json.Marshal(map[string]any{"offset": offset, "bot": botID(s)})
-	_ = fsx.WriteFile(s.OffsetPath(), raw, 0o600)
+	db, err := stateDB(s)
+	if err != nil {
+		_ = audit.Log(s.AuditPath(), "bot_offset_failed", "error", err.Error())
+		return
+	}
+	if err := store.PutKV(context.Background(), db.Q(), store.KeyBotOffset, botOffset{Offset: offset, Bot: botID(s)}); err != nil {
+		_ = audit.Log(s.AuditPath(), "bot_offset_failed", "error", err.Error())
+	}
 }
 
 // Notify показывает черновик в боте; 0 — бот молчит.
@@ -90,7 +94,7 @@ func Notify(ctx context.Context, s *config.Settings, d *outbox.Draft, title, not
 		_ = audit.Log(s.AuditPath(), "card_failed", "draft_id", d.ID, "error", err.Error())
 		return 0
 	}
-	if _, err := outbox.New(s.OutboxPath()).AttachCard(d.ID, id); err != nil {
+	if _, err := outbox.New(s.DataDir()).AttachCard(d.ID, id); err != nil {
 		_ = audit.Log(s.AuditPath(), "card_attach_failed", "draft_id", d.ID, "error", err.Error())
 	}
 	d.BotMessageID = &id
@@ -134,21 +138,27 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 // трогает — итог в неё пишет тот, кто отправляет (deliver — через своего
 // вызывающего, DeliverApproved — сам). Ждать его не нужно: ожидание держало
 // бы разбор кнопок и следующие черновики.
+//
+// Черновик, который уже не approved (его успели отправить, отменить, он
+// протух), не отправляется: итог — по его статусу.
 func deliver(ctx context.Context, s *config.Settings, draftID, by string) string {
-	box := outbox.New(s.OutboxPath())
-	claim, err := claimDelivery(s, draftID)
-	if err != nil {
+	box := outbox.New(s.DataDir())
+	claim, cur, err := box.ClaimSend(draftID)
+	switch {
+	case errors.Is(err, outbox.ErrSending):
+		_ = audit.Log(s.AuditPath(), "send_already_running", "draft_id", draftID, "by", by)
+		return ""
+	case err != nil:
 		// без захвата отправлять нельзя: другой процесс мог бы отправить тот же
 		// черновик; сбой виден, повтор — tg_send_draft
 		msg := "не удалось взять черновик в отправку: " + err.Error()
 		_, _ = box.MarkSendError(draftID, msg)
 		return "⚠️ **Не отправлено** — " + bot.MDEscape(msg)
+	case claim == nil:
+		_ = audit.Log(s.AuditPath(), "send_skipped", "draft_id", draftID, "by", by, "status", cur.Status)
+		return finalSummary(s, cur)
 	}
-	if claim == nil {
-		_ = audit.Log(s.AuditPath(), "send_already_running", "draft_id", draftID, "by", by)
-		return ""
-	}
-	defer claim.release()
+	defer claim.Release()
 	var (
 		result *omap.Map
 		errMsg string
@@ -258,7 +268,7 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		parts = append(parts, "")
 	}
 	draftID, verdict := parts[1], parts[2]
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	d, err := box.Get(draftID)
 	if err != nil {
 		bot.AnswerCallback(ctx, s, q.ID, "Черновик не найден.")
@@ -292,9 +302,15 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		card(ctx, s, cardID, d, "✋ **Отменено** — сообщение не ушло.")
 		return
 	}
-	if isFinal(d.Status) || d.Status == outbox.Approved {
+	if d.Status == outbox.Approved {
+		// его сейчас отправляет другой путь — итог в карточку напишет он
+		bot.AnswerCallback(ctx, s, q.ID, "Уже отправляется.")
+		return
+	}
+	if isFinal(d.Status) {
+		// кнопки остались (карточку не обновили) — показать настоящий итог
 		bot.AnswerCallback(ctx, s, q.ID, "Уже "+d.Status+".")
-		card(ctx, s, cardID, d, fmt.Sprintf("⏹ Уже обработано (%s).", d.Status))
+		card(ctx, s, cardID, d, finalSummary(s, d))
 		return
 	}
 	if d.IsExpired(time.Now()) {
@@ -353,7 +369,7 @@ func samePtr(a, b *int64) bool {
 
 // CloseCard гасит карточку, если черновик решили мимо кнопок.
 func CloseCard(ctx context.Context, s *config.Settings, draftID string, result *omap.Map, summary string) {
-	d, err := outbox.New(s.OutboxPath()).Get(draftID)
+	d, err := outbox.New(s.DataDir()).Get(draftID)
 	if err != nil {
 		return
 	}
@@ -377,7 +393,7 @@ var sendingDue sync.Mutex
 func SendDue(ctx context.Context, s *config.Settings) {
 	sendingDue.Lock()
 	defer sendingDue.Unlock()
-	due, err := outbox.New(s.OutboxPath()).ClaimDue(time.Now())
+	due, err := outbox.New(s.DataDir()).ClaimDue(time.Now())
 	if err != nil {
 		_ = audit.Log(s.AuditPath(), "auto_send_claim_failed", "error", err.Error())
 		return
@@ -413,7 +429,7 @@ func RunAutoSend(ctx context.Context, loader func() (*config.Settings, error)) {
 		if err != nil {
 			continue
 		}
-		if next, err := outbox.New(s.OutboxPath()).NextDue(); err == nil && next != nil && !time.Now().Before(*next) {
+		if next, err := outbox.New(s.DataDir()).NextDue(); err == nil && next != nil && !time.Now().Before(*next) {
 			SendDue(ctx, s)
 		}
 		maybeSweepPins(ctx, s, &swept) // протухшие карточки — открепить
@@ -443,7 +459,7 @@ func SendDueLoop(ctx context.Context, loader func() (*config.Settings, error)) e
 		if err != nil {
 			return err
 		}
-		next, err := outbox.New(s.OutboxPath()).NextDue()
+		next, err := outbox.New(s.DataDir()).NextDue()
 		if err != nil {
 			return err
 		}
@@ -477,7 +493,7 @@ func Pump(ctx context.Context, s *config.Settings, until time.Time, stop func() 
 		window := int(time.Until(until).Seconds())
 		window = max(1, min(pollTimeout, window))
 		// ближайшая автоотправка — не ждём дольше неё
-		if next, err := outbox.New(s.OutboxPath()).NextDue(); err == nil && next != nil {
+		if next, err := outbox.New(s.DataDir()).NextDue(); err == nil && next != nil {
 			window = max(1, min(window, int(time.Until(*next).Seconds())+1))
 		}
 		updates, err := bot.GetUpdates(ctx, s, offset, window)
@@ -526,7 +542,7 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 
 // WaitForDecision — дождаться нажатия кнопки. Работает и с демоном, и без него.
 func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, timeout time.Duration) (*omap.Map, error) {
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	deadline := time.Now().Add(timeout)
 	resolved := func() bool {
 		d, err := box.Get(draftID)
@@ -609,7 +625,7 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 // но прошлая служба не успела отправить — её убили между нажатием и
 // отправкой. В режимах без бота статус approved законно ждёт агента или CLI.
 func RecoverInterrupted(ctx context.Context, s *config.Settings) {
-	drafts, err := outbox.New(s.OutboxPath()).List(outbox.Approved)
+	drafts, err := outbox.New(s.DataDir()).List(outbox.Approved)
 	if err != nil {
 		return
 	}
@@ -649,60 +665,20 @@ func approvedBefore(d *outbox.Draft, t time.Time) bool {
 	return err != nil || !at.After(t.Truncate(time.Second))
 }
 
-// Захват черновика в отправку. Статус approved до конца отправки не
-// меняется, поэтому два пути (кнопка, автоотправка, досылка после
-// перезапуска, tg_send_draft, tgw send-due без службы) без захвата отправили
-// бы черновик дважды — 12.11.2026 так и вышло. Захват — лок-файл на черновик
-// (data/sending/<id>.lock): его видят и другие процессы, а лок умершего
-// процесса снимается сам (pid владельца). delivering — тот же захват между
-// путями внутри процесса (дешевле и без диска).
-var delivering sync.Map
-
-func deliveryLockPath(s *config.Settings, id string) string {
-	return filepath.Join(s.DataDir(), "sending", id)
-}
-
-// delivery — взятый в отправку черновик; release — отпустить.
-type delivery struct {
-	id   string
-	file *lock.File
-}
-
-func (d *delivery) release() {
-	if d.file != nil {
-		d.file.Release()
-	}
-	delivering.Delete(d.id)
-}
-
-// claimWait — сколько ждать лок-файл черновика: лок умершего процесса
-// снимается при первой попытке, а взять его можно со следующей (каждые
-// 250 мс) — с нулевым ожиданием такой черновик остался бы неотправленным.
-const claimWait = time.Second
-
-// claimDelivery — взять черновик в отправку. (nil, nil) — его уже
-// отправляют (этот или другой процесс); ошибка — захват не вышел (каталог
-// или файл лока), отправлять тогда нельзя.
-func claimDelivery(s *config.Settings, id string) (*delivery, error) {
-	if _, busy := delivering.LoadOrStore(id, struct{}{}); busy {
-		return nil, nil
-	}
-	path := deliveryLockPath(s, id)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		delivering.Delete(id)
-		_ = audit.Log(s.AuditPath(), "send_lock_failed", "draft_id", id, "error", err.Error())
-		return nil, err
-	}
-	f := lock.New(path, claimWait)
-	if err := f.Acquire(context.Background()); err != nil {
-		delivering.Delete(id)
-		if lock.IsBusy(err) {
-			return nil, nil
+// finalSummary — итог для карточки по решённому черновику ("" — ещё не решён).
+func finalSummary(s *config.Settings, d *outbox.Draft) string {
+	switch d.Status {
+	case outbox.Sent:
+		if d.MessageID != nil {
+			return sentSummary(s, d, *d.MessageID)
 		}
-		_ = audit.Log(s.AuditPath(), "send_lock_failed", "draft_id", id, "error", err.Error())
-		return nil, err
+		return "✅ **Отправлено**"
+	case outbox.Cancelled:
+		return "✋ **Отменено** — сообщение не ушло."
+	case outbox.Expired:
+		return "⌛ **Протухло** — агент готовил это давно."
 	}
-	return &delivery{id: id, file: f}, nil
+	return ""
 }
 
 func sentSummary(s *config.Settings, d *outbox.Draft, mid any) string {
@@ -762,12 +738,12 @@ func SweepOnce(ctx context.Context, s *config.Settings) (int64, error) {
 
 // PendingSummary — что ждёт нажатия кнопки.
 func PendingSummary(s *config.Settings) ([]*outbox.Draft, error) {
-	return outbox.New(s.OutboxPath()).List(outbox.Pending)
+	return outbox.New(s.DataDir()).List(outbox.Pending)
 }
 
 // ApproveAndSend — одобрить и отправить черновик из GUI (как кнопка в боте).
 func ApproveAndSend(ctx context.Context, s *config.Settings, draftID, by string) (string, error) {
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	d, err := box.Get(draftID)
 	if err != nil {
 		return "", err
@@ -795,7 +771,7 @@ func EditDraft(ctx context.Context, s *config.Settings, draftID, text, by string
 	if n := len([]rune(text)); n > 32768 {
 		return &Bad{fmt.Sprintf("Слишком длинно: %d символов, предел Telegram — 32768.", n)}
 	}
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	if d, err := box.Get(draftID); err == nil && text == "" && len(d.Files) == 0 {
 		return &Bad{"Пустое сообщение: нужен текст или файлы."}
 	}

@@ -30,7 +30,7 @@ func RepairSentIDs(ctx context.Context, s *config.Settings) {
 	if !s.IsTelegram() {
 		return
 	}
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	drafts, err := box.List(outbox.Sent)
 	if err != nil {
 		return

@@ -5,26 +5,24 @@ package core
 // окно управления) и агенты (tg_account_note). Агенты видят их в
 // tg_list_chats.
 //
-// Файл один на установку — data/account_notes.json основного профиля: бот и
-// окно видят заметки всех аккаунтов, не спрашивая их служб, а служба любого
-// аккаунта пишет туда под локом.
+// Заметки одни на установку — таблица account_notes в state.db основного
+// профиля: бот и окно видят заметки всех аккаунтов, не спрашивая их служб,
+// а служба любого аккаунта пишет туда транзакцией.
 
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"tgagent/internal/config"
-	"tgagent/internal/fsx"
-	"tgagent/internal/lock"
 	"tgagent/internal/omap"
+	"tgagent/internal/store"
 	"tgagent/internal/tgc"
 )
 
@@ -55,34 +53,42 @@ func (n AccountNote) Author() string {
 	return "агент"
 }
 
-func notesPath() string {
-	return filepath.Join(config.HomeOf(config.MainAccount), "data", "account_notes.json")
+// Заметки — одни на установку: в базе основного профиля.
+var notesTab = store.NewTable[[]AccountNote](store.TAccountNotes)
+
+func notesDB() (*store.DB, error) {
+	return store.Open(filepath.Join(config.HomeOf(config.MainAccount), "data"))
 }
 
 func loadNotes() map[string][]AccountNote {
-	out := map[string][]AccountNote{}
-	raw, err := os.ReadFile(notesPath())
-	if err == nil {
-		_ = json.Unmarshal(raw, &out)
+	db, err := notesDB()
+	if err != nil {
+		return map[string][]AccountNote{}
 	}
-	return out
+	m, err := notesTab.All(context.Background(), db.Q())
+	if err != nil {
+		return map[string][]AccountNote{}
+	}
+	return m
 }
 
 func editNotes(fn func(map[string][]AccountNote) error) error {
-	path := notesPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	db, err := notesDB()
+	if err != nil {
 		return err
 	}
-	return lock.With(context.Background(), path, 5*time.Second, func() error {
-		notes := loadNotes()
-		if err := fn(notes); err != nil {
-			return err
-		}
-		raw, err := json.MarshalIndent(notes, "", "  ")
-		if err != nil {
-			return err
-		}
-		return fsx.WriteFile(path, raw, 0o600)
+	return db.Write(context.Background(), func(tx *sql.Tx) error {
+		return notesTab.EditTx(context.Background(), tx, func(m map[string][]AccountNote) (bool, error) {
+			if err := fn(m); err != nil {
+				return false, err
+			}
+			for k, v := range m {
+				if len(v) == 0 {
+					delete(m, k) // аккаунт без заметок — без записи
+				}
+			}
+			return true, nil
+		})
 	})
 }
 
@@ -200,18 +206,19 @@ func (u accountUser) label() string {
 	return name
 }
 
-func userPath(account string) string {
-	return filepath.Join(config.HomeOf(account), "data", "account.json")
+// accountDB — база профиля аккаунта (в ней kv account — чей он).
+func accountDB(account string) (*store.DB, error) {
+	return store.Open(filepath.Join(config.HomeOf(account), "data"))
 }
 
 // AccountLabel — чей аккаунт (имя и @username из Telegram); "" — ещё не знаем.
 func AccountLabel(account string) string {
-	raw, err := os.ReadFile(userPath(account))
+	db, err := accountDB(account)
 	if err != nil {
 		return ""
 	}
 	var u accountUser
-	if json.Unmarshal(raw, &u) != nil {
+	if ok, err := store.GetKV(context.Background(), db.Q(), store.KeyAccount, &u); !ok || err != nil {
 		return ""
 	}
 	return u.label()
@@ -241,8 +248,8 @@ func selfLabel(ctx context.Context, s *config.Settings) string {
 		}
 		return ""
 	}
-	if raw, err := json.Marshal(u); err == nil {
-		_ = fsx.WriteFile(userPath(config.AccountName()), raw, 0o600)
+	if db, err := accountDB(config.AccountName()); err == nil {
+		_ = store.PutKV(ctx, db.Q(), store.KeyAccount, u)
 	}
 	return u.label()
 }

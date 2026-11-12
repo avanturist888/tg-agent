@@ -4,7 +4,7 @@ package core
 //
 // Владелец открывает папку или все публичные каналы одним правилом, а кто в
 // группе сейчас, служба пересчитывает сама (раз в 10 минут и сразу, как
-// правило появилось): data/chat_sets.json. config.Load дописывает эти чаты к
+// правило появилось): data/state.db. config.Load дописывает эти чаты к
 // белому списку с правами из правила — снятое правило закрывает их сразу.
 
 import (
@@ -63,7 +63,7 @@ func RefreshSets(ctx context.Context, s *config.Settings, force bool) (bool, err
 			return false, nil
 		}
 		st.Sets = map[string]config.SetState{}
-		return true, config.SaveSetsState(st)
+		return true, config.SaveSetMembers(st)
 	}
 	stale := force || time.Since(st.Updated) > setsEvery
 	for _, set := range s.Sets {
@@ -104,7 +104,7 @@ func RefreshSets(ctx context.Context, s *config.Settings, force bool) (bool, err
 		logEvent(s, "chat_set_changed", kv...)
 	}
 	st.Sets, st.Updated = fresh, time.Now()
-	return changed, config.SaveSetsState(st)
+	return changed, config.SaveSetMembers(st)
 }
 
 func tgSetMembers(ctx context.Context, s *config.Settings) (map[string]config.SetState, error) {
@@ -293,36 +293,24 @@ func blockForAgent(s *config.Settings, peer int64) error {
 	if len(s.Sets) == 0 {
 		return nil
 	}
-	setsMu.Lock()
-	defer setsMu.Unlock()
+	// блоки пишутся отдельно от состава (BlockSetChat): пересчёт групп,
+	// идущий в это время, их не затрёт
 	st := config.LoadSetsState()
-	dirty := false
 	for _, set := range s.Sets {
 		state := st.Sets[set.Key]
 		member := slices.ContainsFunc(state.Members, func(m config.SetMember) bool { return m.Peer == peer })
 		if !member && !st.IsBlocked(set.Key, peer) {
-			st.Blocked[set.Key] = append(st.Blocked[set.Key], peer)
-			dirty = true
+			if err := config.BlockSetChat(set.Key, peer); err != nil {
+				return err
+			}
 		}
 	}
-	if !dirty {
-		return nil
-	}
-	return config.SaveSetsState(st)
+	return nil
 }
 
 // clearBlocked — владелец заново открыл группу целиком: и чаты, которые туда
 // положил агент, тоже.
-func clearBlocked(key string) {
-	setsMu.Lock()
-	defer setsMu.Unlock()
-	st := config.LoadSetsState()
-	if len(st.Blocked[key]) == 0 {
-		return
-	}
-	delete(st.Blocked, key)
-	_ = config.SaveSetsState(st)
-}
+func clearBlocked(key string) { _ = config.ClearSetBlocked(key) }
 
 // setOf — правило на группу по ключу.
 func setOf(s *config.Settings, key string) (config.ChatSet, bool) {

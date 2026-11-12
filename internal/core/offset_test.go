@@ -2,6 +2,7 @@ package core
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"tgagent/internal/config"
@@ -16,7 +17,8 @@ func TestOffsetFollowsBot(t *testing.T) {
 	second := &config.Settings{BotToken: "222:bbb"}
 
 	// старая запись без id бота: служба при старте подписывает её текущим ботом
-	os.WriteFile(first.OffsetPath(), []byte(`{"offset": 900}`), 0o600)
+	// (bot_offset.json до переезда на state.db)
+	os.WriteFile(filepath.Join(config.DataPath(), "bot_offset.json"), []byte(`{"offset": 900}`), 0o600)
 	tagOffset(first)
 	if got := readOffset(first); got != 900 {
 		t.Fatalf("тот же бот: смещение %d", got)

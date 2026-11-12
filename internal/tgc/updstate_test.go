@@ -2,7 +2,6 @@ package tgc
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 
 	"github.com/gotd/td/telegram/updates"
@@ -11,7 +10,7 @@ import (
 
 func TestUpdStateSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "updates_state.json")
+	path := t.TempDir()
 	u := openUpdState(path)
 	if _, found, _ := u.GetState(ctx, 7); found {
 		t.Fatal("пусто — состояния нет")
@@ -48,16 +47,16 @@ func TestUpdStateSurvivesRestart(t *testing.T) {
 	}
 }
 
-// Канал, известный только из списка диалогов (peers.json), менеджер
+// Канал, известный только из списка диалогов (кэш пиров), менеджер
 // обновлений получает без лишнего getDifference; чужому аккаунту — нет.
 func TestUpdStateChannelHashFromPeers(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	u := openUpdState(filepath.Join(dir, "updates_state.json"))
+	u := openUpdState(dir)
 	if _, ok, _ := u.GetChannelAccessHash(ctx, 7, 555); ok {
 		t.Fatal("без кэша пиров хеша нет")
 	}
-	p := LoadPeers(filepath.Join(dir, "peers.json"))
+	p := LoadPeers("") // только в памяти
 	ch := &tg.Channel{ID: 555}
 	ch.SetAccessHash(321)
 	p.Remember([]tg.UserClass{&tg.User{ID: 7, Self: true}}, []tg.ChatClass{ch})

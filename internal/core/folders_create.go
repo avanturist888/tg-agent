@@ -12,7 +12,7 @@ package core
 //     агент сам собрал бы открытую агентам папку.
 //   - Удалить можно только созданную агентом папку или папку без чатов:
 //     чужая раскладка владельца — его работа. Созданные агентом — в
-//     data/agent_folders.json (номер и название). Учёт сверяется со списком
+//     таблице agent_folders (номер и название). Учёт сверяется со списком
 //     папок при каждом обращении: папки нет или у неё другое название —
 //     запись снимается насовсем (владелец переименовал её или удалил, и
 //     вернуть название обратно не значит вернуть папку агенту).
@@ -22,7 +22,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,9 +33,9 @@ import (
 	"unicode/utf8"
 
 	"tgagent/internal/config"
-	"tgagent/internal/fsx"
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
+	"tgagent/internal/store"
 	"tgagent/internal/tgc"
 )
 
@@ -59,13 +58,29 @@ type agentFolder struct {
 	Created time.Time `json:"created"`
 }
 
-func agentFoldersPath() string { return filepath.Join(config.DataPath(), "agent_folders.json") }
+// agentFoldersTab — папки, которые завёл агент (ключ — номер папки).
+var agentFoldersTab = store.NewTable[agentFolder](store.TAgentFolders)
+
+func foldersDB() (*store.DB, error) { return store.Open(config.DataPath()) }
+
+// foldersLockPath — лок операций с фильтрами папок: они идут в Telegram,
+// поэтому это не транзакция базы, а межпроцессный лок на время операции.
+func foldersLockPath() string { return filepath.Join(config.DataPath(), "folders") }
 
 func loadAgentFolders() []agentFolder {
-	var out []agentFolder
-	if raw, err := os.ReadFile(agentFoldersPath()); err == nil {
-		_ = json.Unmarshal(raw, &out)
+	db, err := foldersDB()
+	if err != nil {
+		return nil
 	}
+	m, err := agentFoldersTab.All(context.Background(), db.Q())
+	if err != nil {
+		return nil
+	}
+	out := make([]agentFolder, 0, len(m))
+	for _, f := range m {
+		out = append(out, f)
+	}
+	slices.SortFunc(out, func(a, b agentFolder) int { return a.ID - b.ID })
 	return out
 }
 
@@ -87,7 +102,7 @@ var unsavedBook struct {
 // withFolders — операция с папками под локом; учёт пишется в конце, даже
 // если операция не удалась (сверка со списком уже могла снять записи).
 func withFolders(ctx context.Context, s *config.Settings, fn func(*agentBook) error) error {
-	path := agentFoldersPath()
+	path := foldersLockPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -125,11 +140,17 @@ func haveAgentFolders() bool {
 }
 
 func saveAgentFolders(list []agentFolder) error {
-	raw, err := json.MarshalIndent(list, "", "  ")
+	db, err := foldersDB()
 	if err != nil {
 		return err
 	}
-	return fsx.WriteFile(agentFoldersPath(), raw, 0o600)
+	return agentFoldersTab.Edit(context.Background(), db, func(m map[string]agentFolder) bool {
+		clear(m)
+		for _, f := range list {
+			m[strconv.Itoa(f.ID)] = f
+		}
+		return true
+	})
 }
 
 // sync — снять записи, которым в списке папок нет пары номер + название.
@@ -192,8 +213,7 @@ func listedFolders(ctx context.Context, s *config.Settings, fetch func() ([]tgc.
 // состава, чаты вне папок): каждый увиденный список сверяется с учётом
 // (see), иначе увиденное агентом переименование не сняло бы запись.
 // Учёт пуст — без лока, see ничего не делает и отдаёт nil. Фоновый
-// пересчёт групп (RunSets) сверку не делает: он держит setsMu, а правка
-// папок берёт setsMu (blockForAgent) уже под этим локом.
+// пересчёт групп (RunSets) сверку не делает: учёт сверяют операции агента.
 func watchFolders(ctx context.Context, s *config.Settings, fn func(see func([]tgc.Folder) *agentBook) error) error {
 	if !haveAgentFolders() {
 		return fn(func([]tgc.Folder) *agentBook { return nil })

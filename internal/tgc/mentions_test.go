@@ -1,7 +1,6 @@
 package tgc
 
 import (
-	"path/filepath"
 	"testing"
 
 	"github.com/gotd/td/tg"
@@ -32,7 +31,7 @@ func TestMentions(t *testing.T) {
 }
 
 func TestMentionEntityFallback(t *testing.T) {
-	c := &Conn{Peers: LoadPeers(filepath.Join(t.TempDir(), "peers.json"))}
+	c := &Conn{Peers: LoadPeers(t.TempDir())}
 	u := &tg.User{ID: 6437927917, FirstName: "Светлана"}
 	u.SetAccessHash(777)
 	c.Peers.Remember([]tg.UserClass{u}, nil)

@@ -158,7 +158,7 @@ func (c *Conn) start(ctx context.Context, client *telegram.Client, s *config.Set
 				"`%s login` и ввести код из Telegram.", config.CLIHint())}
 		}
 	}
-	c.Peers = LoadPeers(s.PeersPath())
+	c.Peers = LoadPeers(s.DataDir())
 	return fn(ctx, c)
 }
 

@@ -103,7 +103,7 @@ func RequestSetAccess(ctx context.Context, s *config.Settings, o SetAccessOpts) 
 // submitSetRequest — запрос на группу или действие: не задвоить, карточка
 // владельцу, запись, ответ агенту.
 func submitSetRequest(ctx context.Context, s *config.Settings, req *accessRequest, out *omap.Map) (*omap.Map, error) {
-	for _, r := range loadAccess(accessPath(s)) {
+	for _, r := range loadAccess(s) {
 		if r.Status == accessPending && r.Scope == req.Scope && r.Folder == req.Folder && (r.Send || !req.Send) {
 			return out.Set("request_id", r.ID).Set("status", accessPending).Set("next_step",
 				"Такой запрос уже ждёт владельца. Дождись: tg_wait_access(request_id)."), nil
@@ -114,7 +114,13 @@ func submitSetRequest(ctx context.Context, s *config.Settings, req *accessReques
 		return nil, fmt.Errorf("карточка в бот не ушла: %w", err)
 	}
 	req.CardID = card
-	if err := editAccess(s, func(m map[string]*accessRequest) bool { m[req.ID] = req; return true }); err != nil {
+	if err := editAccess(s, func(m map[string]*accessRequest) bool {
+		for m[req.ID] != nil { // id случайный: совпадение не должно затереть чужой запрос
+			req.ID = outbox.NewID()
+		}
+		m[req.ID] = req
+		return true
+	}); err != nil {
 		return nil, err
 	}
 	logEvent(s, "access_requested", "request_id", req.ID, "scope", req.Scope, "folder", req.Folder, "title", req.Title,

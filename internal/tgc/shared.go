@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -206,8 +205,8 @@ func Serve(ctx context.Context, s *config.Settings, ev Events, onReady func(ctx 
 
 	// отметка обновлений и даты правок на диске: после перезапуска служба
 	// догоняет пропущенное за время простоя (updstate.go, edits.go)
-	upd := openUpdState(filepath.Join(s.DataDir(), "updates_state.json"))
-	edits.open(filepath.Join(s.DataDir(), "edit_dates.json"))
+	upd := openUpdState(s.DataDir())
+	edits.open(s.DataDir())
 	go upd.keep(ctx)
 	go edits.keep(ctx)
 
@@ -265,7 +264,7 @@ func Serve(ctx context.Context, s *config.Settings, ev Events, onReady func(ctx 
 // пересоздание клиента и Done его не заменит. Проще не становится.
 func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage, upd *updState, ev Events,
 	onReady func(ctx context.Context, c *Conn), onNoLogin func(ctx context.Context)) error {
-	c := &Conn{Settings: s, hub: newUpdateHub(), Peers: LoadPeers(s.PeersPath())}
+	c := &Conn{Settings: s, hub: newUpdateHub(), Peers: LoadPeers(s.DataDir())}
 	upd.usePeers(c.Peers)
 	d := tg.NewUpdateDispatcher()
 	message := func(handler OnMessage, e tg.Entities, m tg.MessageClass) func(ctx context.Context) {

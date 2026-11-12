@@ -10,12 +10,13 @@ import (
 )
 
 func TestTranscriptCacheKeepsEngine(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "transcripts.json")
-	// старая запись — просто текст, это была расшифровка Telegram
-	if err := os.WriteFile(path, []byte(`{"chat:1": "старый текст"}`), 0o600); err != nil {
+	dir := t.TempDir()
+	// старая запись (transcripts.json до переезда на state.db) — просто
+	// текст, это была расшифровка Telegram
+	if err := os.WriteFile(filepath.Join(dir, "transcripts.json"), []byte(`{"chat:1": "старый текст"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cache := TranscriptCache{Path: path}
+	cache := TranscriptCache{Dir: dir}
 	if got, ok := cache.Get("chat:1"); !ok || got.Text != "старый текст" || got.Engine != EngineTelegram {
 		t.Fatalf("старая запись: %+v %v", got, ok)
 	}

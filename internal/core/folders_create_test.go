@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 	"testing"
 
@@ -149,15 +148,19 @@ func TestAgentBookUnsaved(t *testing.T) {
 	if err := withFolders(ctx, s, func(b *agentBook) error { b.put(5, "A"); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	// запись учёта ломается, чтение — нет: файл только для чтения (на
-	// Windows rename поверх него не проходит)
-	path := agentFoldersPath()
-	if err := os.Chmod(path, 0o400); err != nil {
+	// запись учёта ломается, чтение — нет
+	db, err := foldersDB()
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+	for _, op := range []string{"INSERT", "UPDATE", "DELETE"} {
+		if _, err := db.Q().Exec("CREATE TRIGGER no_" + op + " BEFORE " + op +
+			" ON agent_folders BEGIN SELECT RAISE(ABORT, 'запись сломана'); END"); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if saveAgentFolders(nil) == nil {
-		t.Skip("запись поверх файла только для чтения здесь проходит")
+		t.Fatal("запись не сломалась")
 	}
 	mine([]tgc.Folder{{ID: 5, Title: "B"}}) // владелец переименовал
 	if !unsavedBook.has {

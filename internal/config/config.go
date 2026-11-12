@@ -197,13 +197,8 @@ func (s *Settings) DataDir() string         { return DataPath() }
 func (s *Settings) BotReady() bool          { return s.BotToken != "" && s.ApprovalChatID != 0 }
 func (s *Settings) UpdatesLockPath() string { return filepath.Join(s.DataDir(), "bot-updates") }
 func (s *Settings) DownloadsDir() string    { return filepath.Join(s.DataDir(), "downloads") }
-func (s *Settings) TranscriptsPath() string { return filepath.Join(s.DataDir(), "transcripts.json") }
-func (s *Settings) OffsetPath() string      { return filepath.Join(s.DataDir(), "bot_offset.json") }
-func (s *Settings) OutboxPath() string      { return filepath.Join(s.DataDir(), "outbox.json") }
 func (s *Settings) AuditPath() string       { return filepath.Join(s.DataDir(), "audit.jsonl") }
-func (s *Settings) PeersPath() string       { return filepath.Join(s.DataDir(), "peers.json") }
 func (s *Settings) OutboxFilesDir() string  { return filepath.Join(s.DataDir(), "outbox_files") }
-func (s *Settings) FeedsDir() string        { return filepath.Join(s.DataDir(), "feeds") }
 func (s *Settings) ChatsPath() string       { return ChatsFile() }
 
 // Rules — правила в порядке из chats.toml.

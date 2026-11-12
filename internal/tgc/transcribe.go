@@ -2,70 +2,46 @@ package tgc
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/gotd/td/tg"
 
 	"tgagent/internal/config"
-	"tgagent/internal/fsx"
-	"tgagent/internal/lock"
 	"tgagent/internal/omap"
+	"tgagent/internal/store"
 )
 
-// TranscriptCache — расшифровки по ключу «чат:сообщение» в data/transcripts.json.
-// Голосовое не меняется, поэтому готовый текст храним навсегда. Запись —
-// {text, engine, language}; старые записи — просто текст Telegram.
-type TranscriptCache struct{ Path string }
-
-type cachedTranscript struct {
-	Text     string `json:"text"`
-	Engine   string `json:"engine"`
-	Language string `json:"language,omitempty"`
-}
-
-func (c TranscriptCache) load() map[string]json.RawMessage {
-	data := map[string]json.RawMessage{}
-	if raw, err := os.ReadFile(c.Path); err == nil {
-		_ = json.Unmarshal(raw, &data)
-	}
-	return data
-}
+// TranscriptCache — расшифровки по ключу «чат:сообщение» (таблица
+// transcripts в data/state.db профиля Dir). Голосовое не меняется, поэтому
+// готовый текст храним навсегда, с движком, которым расшифровано.
+type TranscriptCache struct{ Dir string }
 
 // Get — готовая расшифровка из кэша.
 func (c TranscriptCache) Get(key string) (Transcript, bool) {
-	raw, ok := c.load()[key]
-	if !ok {
+	db, err := store.Open(c.Dir)
+	if err != nil {
 		return Transcript{}, false
 	}
-	var text string
-	if json.Unmarshal(raw, &text) == nil {
-		return Transcript{Status: "done", Text: text, Engine: EngineTelegram}, true
-	}
-	var v cachedTranscript
-	if json.Unmarshal(raw, &v) != nil {
+	var t Transcript
+	err = db.Q().QueryRowContext(context.Background(), "SELECT text, engine, language FROM transcripts WHERE key = ?", key).
+		Scan(&t.Text, &t.Engine, &t.Language)
+	if err != nil {
 		return Transcript{}, false
 	}
-	return Transcript{Status: "done", Text: v.Text, Engine: v.Engine, Language: v.Language}, true
+	t.Status = "done"
+	return t, true
 }
 
 // Put — запомнить готовую расшифровку.
 func (c TranscriptCache) Put(key string, got Transcript) {
-	_ = lock.With(context.Background(), c.Path, 45*time.Second, func() error {
-		data := c.load()
-		entry, err := json.Marshal(cachedTranscript{Text: got.Text, Engine: got.Engine, Language: got.Language})
-		if err != nil {
-			return err
-		}
-		data[key] = entry
-		raw, err := omap.Marshal(data)
-		if err != nil {
-			return err
-		}
-		return fsx.WriteFile(c.Path, raw, 0o600)
-	})
+	db, err := store.Open(c.Dir)
+	if err != nil {
+		return
+	}
+	_, _ = db.Q().ExecContext(context.Background(), `INSERT INTO transcripts(key, text, engine, language) VALUES(?, ?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET text = excluded.text, engine = excluded.engine, language = excluded.language`,
+		key, got.Text, got.Engine, got.Language)
 }
 
 // STTHint — что делать, если Telegram не расшифровал.

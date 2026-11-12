@@ -7,17 +7,15 @@ package core
 // Адрес канала и токен знает только потомок сессии — MCP-прослойка `tg mcp`:
 // она передаёт их с каждым вызовом инструмента и раз в минуту (hello). Так
 // подписка переживает перезапуск службы и возобновление сессии: сессию ищем
-// по её id, адрес канала берём свежий. Хранится в data/subscriptions.json.
+// по её id, адрес канала берём свежий. Хранится в таблице subscriptions.
 //
 // В уведомлении только alias и id: текст сообщений агент читает сам через
 // tg_read_chat, чужой текст в обход проверок к нему не попадает.
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -29,9 +27,9 @@ import (
 
 	"tgagent/internal/audit"
 	"tgagent/internal/config"
-	"tgagent/internal/fsx"
 	"tgagent/internal/inbox"
 	"tgagent/internal/omap"
+	"tgagent/internal/store"
 	"tgagent/internal/t3"
 	"tgagent/internal/tgc"
 )
@@ -96,9 +94,7 @@ func sessionThread(ctx context.Context, session string) string {
 // в hello (сессия только что назвалась), если она и есть текущая сессия
 // треда, иначе в текущую, а если её не узнать — в самую свежую подписку.
 func joinThreadSubs(ctx context.Context, s *config.Settings, hello *inbox.Addr) {
-	subMu.Lock()
-	subs := loadSubs(subsPath(s))
-	subMu.Unlock()
+	subs := loadSubs(s)
 	if len(subs) == 0 || (len(subs) == 1 && hello == nil) {
 		return
 	}
@@ -388,7 +384,6 @@ func topicBreakdown(ids []int, topics map[int]topicRef) string {
 }
 
 var (
-	subMu   sync.Mutex // файл подписок меняют по очереди
 	subWake = make(chan struct{}, 1)
 )
 
@@ -400,14 +395,15 @@ func pokeSubs() {
 	}
 }
 
-func subsPath(s *config.Settings) string { return filepath.Join(s.DataDir(), "subscriptions.json") }
+// subsTab — подписки по ключу сессии.
+var subsTab = store.NewTable[*subscription](store.TSubscriptions)
 
-func loadSubs(path string) map[string]*subscription {
-	subs := map[string]*subscription{}
-	if raw, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(raw, &subs)
-	}
-	for _, sub := range subs {
+func normSubs(subs map[string]*subscription) map[string]*subscription {
+	for k, sub := range subs {
+		if sub == nil {
+			delete(subs, k)
+			continue
+		}
 		if sub.Chats == nil {
 			sub.Chats = map[string]int{}
 		}
@@ -415,26 +411,29 @@ func loadSubs(path string) map[string]*subscription {
 	return subs
 }
 
-func saveSubs(path string, subs any) error {
-	raw, err := json.MarshalIndent(subs, "", "  ")
+// loadSubs — все подписки (не прочитались — пусто: рассылка подождёт
+// следующего раза, а не разошлёт по неполному списку).
+func loadSubs(s *config.Settings) map[string]*subscription {
+	db, err := stateDB(s)
+	if err != nil {
+		return map[string]*subscription{}
+	}
+	subs, err := subsTab.All(context.Background(), db.Q())
+	if err != nil {
+		return map[string]*subscription{}
+	}
+	return normSubs(subs)
+}
+
+// editSubs — прочитать, поменять и записать подписки одной транзакцией.
+func editSubs(s *config.Settings, fn func(subs map[string]*subscription) bool) error {
+	db, err := stateDB(s)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	return fsx.WriteFile(path, raw, 0o600)
-}
-
-// editSubs — прочитать, поменять и записать подписки под замком.
-func editSubs(s *config.Settings, fn func(subs map[string]*subscription) bool) error {
-	subMu.Lock()
-	defer subMu.Unlock()
-	subs := loadSubs(subsPath(s))
-	if !fn(subs) {
-		return nil
-	}
-	return saveSubs(subsPath(s), subs)
+	return subsTab.Edit(context.Background(), db, func(subs map[string]*subscription) bool {
+		return fn(normSubs(subs))
+	})
 }
 
 // ── чей это вызов ────────────────────────────────────────────────────────
@@ -609,14 +608,12 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, o SubOpts) 
 			filter.Text = append(filter.Text, v)
 		}
 	}
-	last := LastID(FeedPath(s, rule.Alias))
+	last := FeedLast(s, rule.Alias)
 	from := last
 	if o.After > 0 {
 		from = o.After
 	}
-	subMu.Lock()
-	current := loadSubs(subsPath(s))
-	subMu.Unlock()
+	current := loadSubs(s)
 	take := stale(ctx, a, rule.Alias, current)
 	var taken []*omap.Map
 	for _, h := range take {
@@ -819,9 +816,7 @@ func RunNotifier(ctx context.Context, loader func() (*config.Settings, error)) {
 // повторить для сессий, которых только что будили.
 func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Time) time.Duration {
 	joinThreadSubs(ctx, s, nil)
-	subMu.Lock()
-	subs := loadSubs(subsPath(s))
-	subMu.Unlock()
+	subs := loadSubs(s)
 	rs := routeChats(ctx, s, subs) // кому какое сообщение (чаты, куда можно писать)
 	listeners := map[string]int{}  // alias → сколько сессий слушает
 	for _, sub := range subs {
@@ -837,7 +832,7 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 		canPass := false           // есть сообщения, которые можно передать (tg_pass)
 		for _, alias := range sortedChats(sub) {
 			from := sub.Chats[alias]
-			ids := idsAfter(FeedPath(s, alias), from)
+			ids := idsAfter(s, alias, from)
 			if len(ids) > 0 {
 				seen[alias] = ids[len(ids)-1]
 			}
@@ -1086,7 +1081,7 @@ func FeedOnDelete(loader func() (*config.Settings, error)) func(ctx context.Cont
 			if id <= -1_000_000_000_000 {
 				continue // канал или супергруппа: их удаления приходят с peer
 			}
-			if found := inFeed(FeedPath(s, rule.Alias), ids); len(found) > 0 {
+			if found := inFeed(s, rule.Alias, ids); len(found) > 0 {
 				noteChange(s, rule.Alias, found, true)
 			}
 		}
@@ -1094,13 +1089,13 @@ func FeedOnDelete(loader func() (*config.Settings, error)) func(ctx context.Cont
 }
 
 // inFeed — какие из ids есть в ленте чата.
-func inFeed(path string, ids []int) []int {
+func inFeed(s *config.Settings, alias string, ids []int) []int {
 	want := map[int]bool{}
 	for _, id := range ids {
 		want[id] = true
 	}
 	var out []int
-	for _, id := range idsAfter(path, 0) {
+	for _, id := range idsAfter(s, alias, 0) {
 		if want[id] {
 			out = append(out, id)
 		}
@@ -1113,9 +1108,7 @@ func inFeed(path string, ids []int) []int {
 // из уведомления о новых сообщениях.
 func noteChange(s *config.Settings, alias string, ids []int, deleted bool) {
 	changed := false
-	routeMu.Lock()
-	rs := loadRoutes(s)[alias]
-	routeMu.Unlock()
+	rs := loadChatRoutes(s, alias)
 	_ = editSubs(s, func(subs map[string]*subscription) bool {
 		for key, sub := range subs {
 			upto, ok := sub.Chats[alias]
@@ -1238,23 +1231,6 @@ func sortedKeys(m map[string]int) []string {
 		out = append(out, k)
 	}
 	slices.Sort(out)
-	return out
-}
-
-// idsAfter — id из ленты новее from, по возрастанию.
-func idsAfter(path string, from int) []int {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var out []int
-	last := from
-	for _, f := range strings.Fields(string(raw)) {
-		if id, err := strconv.Atoi(f); err == nil && id > last {
-			out = append(out, id)
-			last = id
-		}
-	}
 	return out
 }
 

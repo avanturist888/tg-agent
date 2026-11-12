@@ -129,12 +129,7 @@ func ListChatsWith(ctx context.Context, s *config.Settings, o ListOpts) (*omap.M
 			item.Delete("note") // заметка группы — в sets, а не у каждого из сотни чатов
 		}
 		if rule.Read {
-			path := FeedPath(s, rule.Alias)
-			feed := omap.New().Set("path", path).Set("last_id", LastID(path))
-			if s.Agent != nil || rule.Via != "" {
-				feed = omap.New().Set("last_id", LastID(path)) // путь на диске шлюза агенту ни к чему
-			}
-			item.Set("feed", feed)
+			item.Set("feed", omap.New().Set("last_id", FeedLast(s, rule.Alias)))
 		}
 		chats = append(chats, item)
 	}
@@ -181,6 +176,11 @@ func ListChatsWith(ctx context.Context, s *config.Settings, o ListOpts) (*omap.M
 		out.Set("account_notes", notesView(notes))
 	}
 	out.Set("send_policy", s.SendPolicy)
+	if s.Agent == nil {
+		// папка установки — для `<tg-agent>\bin\tg.exe watch` (Monitor) из
+		// AGENTS.md; агенту из контейнера путь на диске шлюза ни к чему
+		out.Set("tg_agent", config.Root)
+	}
 	if !o.ActiveSince.IsZero() {
 		out.Set("active_since", o.ActiveSince.UTC().Format(time.RFC3339)).Set("total_chats", len(rules))
 	}
@@ -360,7 +360,7 @@ func readTelegram(ctx context.Context, s *config.Settings, rule config.ChatRule,
 			return err
 		}
 		if o.Transcribe {
-			cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
+			cache := tgc.TranscriptCache{Dir: s.DataDir()}
 			c.AttachTranscripts(ctx, t, rule, append(*messages, parents...), cache, s.TranscribePerCall, localSTT(s, rule))
 		}
 		return nil
@@ -723,7 +723,7 @@ func TranscribeMessage(ctx context.Context, s *config.Settings, chat string, mes
 	if engine == tgc.EngineTelegram {
 		local.Local = nil
 	}
-	cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
+	cache := tgc.TranscriptCache{Dir: s.DataDir()}
 	key := fmt.Sprintf("%s:%d", rule.Alias, messageID)
 	if cached, ok := cache.Get(key); ok && !cached.Stale(local) &&
 		(engine == "" || engine == "auto" || strings.HasPrefix(cached.Engine, engine)) {
@@ -913,7 +913,10 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 			return nil, err
 		}
 	}
-	id := outbox.NewID()
+	id, err := outbox.New(s.DataDir()).FreshID() // до вложений: их снимок лежит под id черновика
+	if err != nil {
+		return nil, err
+	}
 	var snaps []outbox.FileSnap
 	if len(files) > 0 {
 		snaps, err = attach.Snapshot(s, id, files, asFiles)
@@ -928,7 +931,7 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 		at := time.Now().Add(time.Duration(s.AutoSendDelaySec) * time.Second)
 		opts.SendAt = &at
 	}
-	d, err := outbox.New(s.OutboxPath()).Create(opts)
+	d, err := outbox.New(s.DataDir()).Create(opts)
 	if err != nil {
 		attach.Drop(s, id)
 		return nil, err
@@ -1019,7 +1022,7 @@ func finishDraft(ctx context.Context, s *config.Settings, rule config.ChatRule, 
 
 // WaitApproval — дождаться, пока человек нажмёт кнопку (или уйдёт автоотправка).
 func WaitApproval(ctx context.Context, s *config.Settings, draftID string, timeoutSec int) (*omap.Map, error) {
-	d, err := outbox.New(s.OutboxPath()).Get(draftID)
+	d, err := outbox.New(s.DataDir()).Get(draftID)
 	if err != nil {
 		return nil, err
 	}
@@ -1047,37 +1050,37 @@ func WaitApproval(ctx context.Context, s *config.Settings, draftID string, timeo
 // (кнопка, tg approve, автоотправка). Единственная точка, где сообщение
 // реально уходит в Telegram.
 func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string) (*omap.Map, error) {
-	claim, err := claimDelivery(s, draftID)
-	if err != nil {
-		err = fmt.Errorf("не удалось взять черновик в отправку: %w", err)
-	} else if claim == nil {
+	box := outbox.New(s.DataDir())
+	claim, cur, err := box.ClaimSend(draftID)
+	switch {
+	case errors.Is(err, outbox.ErrSending):
 		return nil, denied("Черновик %s уже отправляется — второй раз не отправляю. Итог — tg_wait_approval(draft_id).", draftID)
+	case err != nil:
+		return nil, err
+	case claim == nil:
+		return nil, denied("Черновик %s в статусе '%s', отправить нельзя.", draftID, cur.Status)
 	}
-	var result *omap.Map
-	if err == nil {
-		defer claim.release()
-		result, err = deliverClaimed(ctx, s, draftID, by)
-	}
-	var dn *Denied
-	if err != nil && !errors.As(err, &dn) {
-		// как у deliver: сбой виден в tg_wait_approval (send_failed) и в
-		// карточке, а не висит «Отправляю…»
-		box := outbox.New(s.OutboxPath())
-		if d, gerr := box.Get(draftID); gerr == nil && d.Status == outbox.Sent {
-			return nil, err // ушло, сорвалось уже после — ошибку не ставим
-		}
-		msg := fmt.Sprintf("%s: %v", errName(err), err)
-		if d, merr := box.MarkSendError(draftID, msg); merr == nil {
-			card(ctx, s, d.BotMessageID, d, "⚠️ **Не отправлено** — "+bot.MDEscape(msg))
+	defer claim.Release()
+	result, err := deliverClaimed(ctx, s, draftID, by)
+	if err != nil {
+		// как у deliver: сбой (и запрет — чат закрыт, часть ушла в MAX или
+		// WhatsApp) виден в tg_wait_approval (send_failed) и в карточке, а не
+		// висит «Отправляю…». Уже не approved (ушло, сорвалось после) — ошибку
+		// не ставим.
+		if d, gerr := box.Get(draftID); gerr == nil && d.Status == outbox.Approved {
+			msg := fmt.Sprintf("%s: %v", errName(err), err)
+			if d, merr := box.MarkSendError(draftID, msg); merr == nil {
+				card(ctx, s, d.BotMessageID, d, "⚠️ **Не отправлено** — "+bot.MDEscape(msg))
+			}
 		}
 	}
 	return result, err
 }
 
 // deliverClaimed — DeliverApproved для черновика, уже взятого в отправку
-// (claimDelivery).
+// (outbox.ClaimSend).
 func deliverClaimed(ctx context.Context, s *config.Settings, draftID, by string) (*omap.Map, error) {
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	d, err := box.Get(draftID)
 	if err != nil {
 		return nil, err
@@ -1182,7 +1185,7 @@ func sendDraft(ctx context.Context, c draftSender, t tgc.Target, d *outbox.Draft
 // finishDelivery — сообщение ушло: отметить черновик, убрать копии файлов,
 // записать в аудит.
 func finishDelivery(s *config.Settings, rule config.ChatRule, d *outbox.Draft, draftID, by string, result *omap.Map) (*omap.Map, error) {
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	mid, _ := result.Get("message_id")
 	msgID := toInt64(mid)
 	if _, err := box.MarkSent(draftID, msgID, audit.Now()); err != nil {
@@ -1215,7 +1218,7 @@ func toInt64(v any) int64 {
 
 // SendDraft — tg_send_draft / tg send.
 func SendDraft(ctx context.Context, s *config.Settings, draftID, confirmation string) (*omap.Map, error) {
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	d, err := box.Get(draftID)
 	if err != nil {
 		return nil, err
@@ -1265,7 +1268,7 @@ func SendDraft(ctx context.Context, s *config.Settings, draftID, confirmation st
 
 // ListDrafts — tg_list_drafts.
 func ListDrafts(s *config.Settings, status string) (*omap.Map, error) {
-	drafts, err := outbox.New(s.OutboxPath()).List(status)
+	drafts, err := outbox.New(s.DataDir()).List(status)
 	if err != nil {
 		return nil, err
 	}
@@ -1306,7 +1309,7 @@ func ListDrafts(s *config.Settings, status string) (*omap.Map, error) {
 
 // CancelDraft — tg_cancel_draft / tg reject.
 func CancelDraft(ctx context.Context, s *config.Settings, draftID, by string) (*omap.Map, error) {
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	if s.Agent != nil {
 		cur, err := box.Get(draftID)
 		if err != nil {

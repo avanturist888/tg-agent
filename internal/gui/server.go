@@ -249,7 +249,7 @@ func (s *Server) chats(w http.ResponseWriter, r *http.Request) {
 	for _, rule := range st.Rules() {
 		row := rule.AsMap().Set("id", rule.PeerString())
 		if rule.Read {
-			row.Set("last_id", core.LastID(core.FeedPath(st, rule.Alias)))
+			row.Set("last_id", core.FeedLast(st, rule.Alias))
 		}
 		rows = append(rows, row)
 	}
@@ -384,7 +384,7 @@ func (s *Server) drafts(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	drafts, err := outbox.New(st.OutboxPath()).List("")
+	drafts, err := outbox.New(st.DataDir()).List("")
 	if err != nil {
 		writeErr(w, err)
 		return

@@ -67,7 +67,7 @@ func idle(key string) func() bool {
 }
 
 func remoteSubOf(s *config.Settings, key string) *remoteSub {
-	return loadRemote(remotePath(s))[key]
+	return loadRemote(s)[key]
 }
 
 func turnText(cmd map[string]any) string {
@@ -79,8 +79,8 @@ func turnText(cmd map[string]any) string {
 func TestRemoteSubscribeWakesGatewayThread(t *testing.T) {
 	s, agent, f := remoteEnvSetup(t)
 	ctx := context.Background()
-	feed := FeedPath(s, "test")
-	appendNewer(feed, []int{10})
+	feed := "test"
+	appendNewer(s, feed, []int{10})
 	key := remoteKey("box", "test")
 
 	out, err := Subscribe(ctx, agent, "test", SubOpts{After: 0, Topic: 0, First: false})
@@ -96,7 +96,7 @@ func TestRemoteSubscribeWakesGatewayThread(t *testing.T) {
 	}
 
 	// новые сообщения — тред заводится и будится
-	appendNewer(feed, []int{11, 12})
+	appendNewer(s, feed, []int{11, 12})
 	notifyRemote(ctx, s)
 	waitUntil(t, "первый ход", func() bool { return len(f.Commands("thread.turn.start")) == 1 })
 	waitUntil(t, "конец первого хода", idle(key))
@@ -119,7 +119,7 @@ func TestRemoteSubscribeWakesGatewayThread(t *testing.T) {
 	}
 
 	// второе сообщение — тот же тред, без вступления
-	appendNewer(feed, []int{13})
+	appendNewer(s, feed, []int{13})
 	notifyRemote(ctx, s)
 	waitUntil(t, "второй ход", func() bool { return len(f.Commands("thread.turn.start")) == 2 })
 	waitUntil(t, "конец второго хода", idle(key))
@@ -133,7 +133,7 @@ func TestRemoteSubscribeWakesGatewayThread(t *testing.T) {
 
 	// свои отправки не будят, но отметку сдвигают
 	markOutgoing("test", 14)
-	appendNewer(feed, []int{14})
+	appendNewer(s, feed, []int{14})
 	notifyRemote(ctx, s)
 	time.Sleep(50 * time.Millisecond)
 	if len(f.Commands("thread.turn.start")) != 2 || remoteSubOf(s, key).After != 14 {
@@ -165,19 +165,19 @@ func TestRemoteSubscribeWakesGatewayThread(t *testing.T) {
 func TestRemoteThreadDeletedIsRecreated(t *testing.T) {
 	s, agent, f := remoteEnvSetup(t)
 	ctx := context.Background()
-	feed := FeedPath(s, "test")
+	feed := "test"
 	key := remoteKey("box", "test")
 	if _, err := Subscribe(ctx, agent, "test", SubOpts{After: 0, Topic: 0, First: false}); err != nil {
 		t.Fatal(err)
 	}
-	appendNewer(feed, []int{1})
+	appendNewer(s, feed, []int{1})
 	notifyRemote(ctx, s)
 	waitUntil(t, "первый ход", func() bool { return len(f.Commands("thread.turn.start")) == 1 })
 	waitUntil(t, "конец хода", idle(key))
 	old := remoteSubOf(s, key).Thread
 
 	f.Delete(old) // владелец удалил тред в T3
-	appendNewer(feed, []int{2})
+	appendNewer(s, feed, []int{2})
 	notifyRemote(ctx, s)
 	waitUntil(t, "ход в новом треде", func() bool { return len(f.Commands("thread.turn.start")) == 2 })
 	waitUntil(t, "конец хода", idle(key))
@@ -194,18 +194,18 @@ func TestRemoteWaitsForRunningTurn(t *testing.T) {
 	s, agent, f := remoteEnvSetup(t)
 	f.FinishAfter = 0 // ход идёт, пока тест его не закончит
 	ctx := context.Background()
-	feed := FeedPath(s, "test")
+	feed := "test"
 	key := remoteKey("box", "test")
 	if _, err := Subscribe(ctx, agent, "test", SubOpts{After: 0, Topic: 0, First: false}); err != nil {
 		t.Fatal(err)
 	}
-	appendNewer(feed, []int{5})
+	appendNewer(s, feed, []int{5})
 	notifyRemote(ctx, s)
 	waitUntil(t, "первый ход", func() bool { return len(f.Commands("thread.turn.start")) == 1 })
 	thread := remoteSubOf(s, key).Thread
 
 	// ход ещё идёт — новое сообщение копится
-	appendNewer(feed, []int{6})
+	appendNewer(s, feed, []int{6})
 	notifyRemote(ctx, s)
 	time.Sleep(100 * time.Millisecond)
 	if len(f.Commands("thread.turn.start")) != 1 {
@@ -225,12 +225,12 @@ func TestRemoteWaitsForRunningTurn(t *testing.T) {
 func TestRemoteUnsubscribeKeepsThread(t *testing.T) {
 	s, agent, f := remoteEnvSetup(t)
 	ctx := context.Background()
-	feed := FeedPath(s, "test")
+	feed := "test"
 	key := remoteKey("box", "test")
 	if _, err := Subscribe(ctx, agent, "test", SubOpts{After: 0, Topic: 0, First: false}); err != nil {
 		t.Fatal(err)
 	}
-	appendNewer(feed, []int{1})
+	appendNewer(s, feed, []int{1})
 	notifyRemote(ctx, s)
 	waitUntil(t, "ход", func() bool { return len(f.Commands("thread.turn.start")) == 1 })
 	waitUntil(t, "конец хода", idle(key))
@@ -239,7 +239,7 @@ func TestRemoteUnsubscribeKeepsThread(t *testing.T) {
 	if _, err := Unsubscribe(ctx, agent, "test"); err != nil {
 		t.Fatal(err)
 	}
-	appendNewer(feed, []int{2})
+	appendNewer(s, feed, []int{2})
 	notifyRemote(ctx, s)
 	time.Sleep(50 * time.Millisecond)
 	if len(f.Commands("thread.turn.start")) != 1 {
@@ -282,7 +282,7 @@ func TestRemoteAgentScope(t *testing.T) {
 	}
 
 	// черновики чужих чатов агенту не видны
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	mine, err := DraftMessage(ctx, agent, "test", "привет", nil, "", "", nil, false, 0)
 	if err != nil {
 		t.Fatal(err)

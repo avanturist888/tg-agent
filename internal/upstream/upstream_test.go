@@ -197,15 +197,15 @@ func TestApplyAndFailures(t *testing.T) {
 	if ss := st.Sources["bad"]; ss.Fails != 2 || !strings.Contains(ss.Error, "HTTP 404") || ss.Values != nil {
 		t.Fatalf("состояние после ошибок: %+v", ss)
 	}
-	path := t.TempDir() + "/upstream.json"
-	if err := st.Save(path); err != nil {
+	dir := t.TempDir()
+	if err := st.Save(dir); err != nil {
 		t.Fatal(err)
 	}
-	back, err := Load(path)
+	back, err := Load(dir)
 	if err != nil || back.Sources["bad"].Fails != 2 {
 		t.Fatalf("сохранение: %+v %v", back, err)
 	}
-	if empty, err := Load(t.TempDir() + "/none.json"); err != nil || len(empty.Sources) != 0 {
-		t.Fatalf("нет файла: %+v %v", empty, err)
+	if empty, err := Load(t.TempDir()); err != nil || len(empty.Sources) != 0 {
+		t.Fatalf("нет состояния: %+v %v", empty, err)
 	}
 }

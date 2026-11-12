@@ -186,3 +186,8 @@ func Held(path string) bool {
 	}
 	return true
 }
+
+// PIDAlive — жив ли процесс pid, взявший что-то в момент since (unix, с
+// долями секунды): умерший — нет, и процесс, получивший тот же pid позже
+// since, — тоже нет.
+func PIDAlive(pid int, since float64) bool { return pidAlive(pid, since) }

@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"io"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -55,14 +54,13 @@ func watchEnv(t *testing.T) *config.Settings {
 		Chats:     map[string]config.ChatRule{"test": {Alias: "test", Peer: int64(-100123), Read: true}},
 		ChatOrder: []string{"test"},
 	}
-	os.MkdirAll(s.FeedsDir(), 0o700)
 	return s
 }
 
 func TestWatchSeesAppends(t *testing.T) {
 	s := watchEnv(t)
-	feed := FeedPath(s, "test")
-	if _, err := appendNewer(feed, []int{10}); err != nil {
+	feed := "test"
+	if _, err := appendNewer(s, feed, []int{10}); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -73,7 +71,7 @@ func TestWatchSeesAppends(t *testing.T) {
 
 	for i, id := range []int{11, 12, 13} {
 		time.Sleep(300 * time.Millisecond)
-		if _, err := appendNewer(feed, []int{id}); err != nil {
+		if _, err := appendNewer(s, feed, []int{id}); err != nil {
 			t.Fatal(err)
 		}
 		want := "test " + []string{"11", "12", "13"}[i] + "\n"
@@ -104,11 +102,11 @@ func (w *closedWriter) Write(p []byte) (int, error) {
 
 func TestWatchExitsWithoutReader(t *testing.T) {
 	s := watchEnv(t)
-	feed := FeedPath(s, "test")
+	feed := "test"
 	done := make(chan error, 1)
 	go func() { done <- Watch(context.Background(), s, []string{"test"}, 0, &closedWriter{}) }()
 	time.Sleep(300 * time.Millisecond)
-	appendNewer(feed, []int{5})
+	appendNewer(s, feed, []int{5})
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
@@ -118,8 +116,8 @@ func TestWatchExitsWithoutReader(t *testing.T) {
 
 func TestWatchAfterCatchesUp(t *testing.T) {
 	s := watchEnv(t)
-	feed := FeedPath(s, "test")
-	if _, err := appendNewer(feed, []int{20, 21, 22}); err != nil {
+	feed := "test"
+	if _, err := appendNewer(s, feed, []int{20, 21, 22}); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())

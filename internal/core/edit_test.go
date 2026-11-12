@@ -10,7 +10,7 @@ import (
 
 func TestEditOnlyOwnSentMessages(t *testing.T) {
 	s := watchEnv(t)
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	d, err := box.Create(outbox.CreateOpts{Chat: "test", Text: "было", TTLMin: 60})
 	if err != nil {
 		t.Fatal(err)

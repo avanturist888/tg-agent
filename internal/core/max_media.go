@@ -145,7 +145,7 @@ func maxFolderChats(ctx context.Context, s *config.Settings, folder string) (*om
 		}
 	}
 	pending := map[int64]string{}
-	for _, r := range loadAccess(accessPath(s)) {
+	for _, r := range loadAccess(s) {
 		if r.Status == accessPending {
 			pending[r.Peer] = r.ID
 		}
@@ -492,7 +492,7 @@ func maxTranscribe(ctx context.Context, s *config.Settings, rule config.ChatRule
 		sec := float64(d) / 1000
 		dur = &sec
 	}
-	cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
+	cache := tgc.TranscriptCache{Dir: s.DataDir()}
 	key := fmt.Sprintf("%s:%d", rule.Alias, m.ID)
 	local := localSTT(s, rule)
 	if engine == "gigaam" {
@@ -556,7 +556,7 @@ func maxTranscribeMessage(ctx context.Context, s *config.Settings, rule config.C
 func maxAttachTranscripts(ctx context.Context, s *config.Settings, rule config.ChatRule, c *maxc.Conn, chatID int64,
 	msgs []maxc.Message, out []*omap.Map) {
 	budget := s.TranscribePerCall
-	cache := tgc.TranscriptCache{Path: s.TranscriptsPath()}
+	cache := tgc.TranscriptCache{Dir: s.DataDir()}
 	for i := range msgs {
 		a := maxMedia(&msgs[i])
 		if a == nil || !maxIsVoice(a) {

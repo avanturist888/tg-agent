@@ -13,6 +13,7 @@ import (
 	"tgagent/internal/config"
 	"tgagent/internal/core"
 	"tgagent/internal/mcpserver"
+	"tgagent/internal/store"
 	"tgagent/internal/svc"
 	"tgagent/internal/tgc"
 )
@@ -29,6 +30,14 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 	if err != nil {
 		return err
 	}
+	// база состояния — до всего остального: при первом запуске после
+	// обновления она переносит старые JSON-файлы, а не открылась (например,
+	// записана более новой сборкой) — работать дальше нельзя
+	db, err := store.Open(s.DataDir())
+	if err != nil {
+		_ = audit.Log(s.AuditPath(), "service_failed", "error", err.Error())
+		return err
+	}
 	core.RaisePriority()
 	tgc.EnableService() // до приёма запросов: они пойдут через общее соединение
 	srv, err := svc.Listen(handlers(), mcpserver.ErrorKind)
@@ -40,7 +49,7 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	done := make(chan struct{}, 8)
+	done := make(chan struct{}, 9)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		_ = srv.Serve(ctx)
@@ -64,6 +73,17 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 	go func() {
 		defer func() { done <- struct{}{} }()
 		core.RunUpstream(ctx, loader) // обновления MAX и PyMax → закреплённые карточки в боте
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		// старая сборка, ещё живая после обновления (открытое окно управления),
+		// может снова записать JSON-файл — влить и его
+		for ctx.Err() == nil {
+			sleep(ctx, legacySweepEvery)
+			if err := db.ImportLegacy(); err != nil {
+				_ = audit.Log(s.AuditPath(), "legacy_import_failed", "error", err.Error())
+			}
+		}
 	}()
 	svcCtx := ctx
 	go func() {
@@ -105,7 +125,7 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 		core.RecoverInterrupted(ctx, s) // у своего бота это делает RunButtons
 	}
 	<-ctx.Done()
-	for range 8 {
+	for range 9 {
 		<-done
 	}
 	_ = audit.Log(s.AuditPath(), "service_stop")
@@ -113,6 +133,9 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 }
 
 var repairOnce sync.Once
+
+// legacySweepEvery — как часто служба ищет старые JSON-файлы в data/.
+const legacySweepEvery = 10 * time.Minute
 
 func reconcile(ctx context.Context, loader func() (*config.Settings, error)) {
 	s, err := loader()

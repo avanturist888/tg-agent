@@ -43,7 +43,7 @@ func TestLiveApproveSendViaService(t *testing.T) {
 	if _, err := svc.Call(ctx, "approve_send", map[string]string{"id": id.(string), "by": "live-test"}, &res); err != nil {
 		t.Fatal(err)
 	}
-	d, err := outbox.New(s.OutboxPath()).Get(id.(string))
+	d, err := outbox.New(s.DataDir()).Get(id.(string))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,11 +53,11 @@ func TestLiveApproveSendViaService(t *testing.T) {
 	t.Logf("ушло за %v, message_id %d", time.Since(start).Round(time.Millisecond), *d.MessageID)
 
 	// лента: событие или сверка (раз в минуту) должны дописать id
-	feed := FeedPath(s, "saved")
+	feed := "saved"
 	deadline := time.Now().Add(75 * time.Second)
-	for LastID(feed) < int(*d.MessageID) {
+	for FeedLast(s, feed) < int(*d.MessageID) {
 		if time.Now().After(deadline) {
-			t.Fatalf("id %d не попал в ленту за 75 с (последний %d)", *d.MessageID, LastID(feed))
+			t.Fatalf("id %d не попал в ленту за 75 с (последний %d)", *d.MessageID, FeedLast(s, feed))
 		}
 		time.Sleep(500 * time.Millisecond)
 	}

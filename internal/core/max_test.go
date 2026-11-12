@@ -40,18 +40,18 @@ func TestMaxFeedsAndChanges(t *testing.T) {
 	maxOnEvent(loader, ev(maxc.EventNew, -9, &maxc.Message{ID: 1000, Sender: 5}))
 	maxOnEvent(loader, ev(maxc.EventNew, -9, &maxc.Message{ID: 1001, Sender: 100})) // своё
 	maxOnEvent(loader, ev(maxc.EventNew, -77, &maxc.Message{ID: 5000, Sender: 5}))  // чат не в списке
-	if got := LastID(FeedPath(s, "team")); got != 1001 {
+	if got := FeedLast(s, "team"); got != 1001 {
 		t.Fatalf("лента team: %d", got)
 	}
 	if !isOutgoing("team", 1001) || isOutgoing("team", 1000) {
 		t.Fatal("своё сообщение должно быть помечено, чужое — нет")
 	}
-	if got := idsAfter(FeedPath(s, "team"), 0); len(got) != 2 {
+	if got := idsAfter(s, "team", 0); len(got) != 2 {
 		t.Fatalf("в ленте %v", got)
 	}
 	// в «Избранном» всё от владельца — и оно будит, как в Telegram
 	maxOnEvent(loader, ev(maxc.EventNew, 0, &maxc.Message{ID: 2000, Sender: 100}))
-	if LastID(FeedPath(s, "saved")) != 2000 || isOutgoing("saved", 2000) {
+	if FeedLast(s, "saved") != 2000 || isOutgoing("saved", 2000) {
 		t.Fatal("сообщение владельца в Избранном должно будить подписку")
 	}
 
@@ -62,7 +62,7 @@ func TestMaxFeedsAndChanges(t *testing.T) {
 	}
 	maxOnEvent(loader, ev(maxc.EventEdit, -9, &maxc.Message{ID: 1000, Status: "EDITED"}))
 	maxOnEvent(loader, ev(maxc.EventDelete, -9, nil, 1001))
-	subs := loadSubs(subsPath(s))
+	subs := loadSubs(s)
 	if got := subs["sess"]; got == nil || len(got.Edited["team"]) != 1 || got.Edited["team"][0] != 1000 ||
 		len(got.Deleted["team"]) != 1 || got.Deleted["team"][0] != 1001 {
 		t.Fatalf("правки и удаления: %+v", got)

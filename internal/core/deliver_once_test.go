@@ -4,12 +4,10 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"tgagent/internal/lock"
 	"tgagent/internal/outbox"
 )
 
@@ -20,7 +18,7 @@ import (
 func TestRecoverSkipsOwnApproved(t *testing.T) {
 	s := watchEnv(t)
 	s.SendPolicy = "bot_approval"
-	box := outbox.New(s.OutboxPath())
+	box := outbox.New(s.DataDir())
 	d, err := box.Create(outbox.CreateOpts{Chat: "test", Text: "раз", TTLMin: 60})
 	if err != nil {
 		t.Fatal(err)
@@ -41,90 +39,68 @@ func TestRecoverSkipsOwnApproved(t *testing.T) {
 	}
 }
 
-func TestDeliverOnce(t *testing.T) {
-	s := watchEnv(t)
-	ctx := context.Background()
-	c, err := claimDelivery(s, "x")
-	if c == nil || err != nil {
-		t.Fatalf("первый захват: %v", err)
-	}
-	if c2, err := claimDelivery(s, "x"); c2 != nil || err != nil {
-		t.Fatalf("второй захват при идущей отправке: %v", err)
-	}
-	if got := deliver(ctx, s, "x", "test"); got != "" {
-		t.Fatalf("второй путь отправил: %q", got)
-	}
-	var d *Denied
-	if _, err := DeliverApproved(ctx, s, "x", "test"); err == nil || !errors.As(err, &d) {
-		t.Fatalf("tg_send_draft при идущей отправке: %v", err)
-	}
-	c.release()
-	if c, _ = claimDelivery(s, "x"); c == nil {
-		t.Fatal("после конца отправки")
-	}
-	c.release()
-}
-
-// Черновик держит другой процесс (его лок-файл): этот не отправляет и
-// карточку не трогает — итог пишет тот, кто отправляет.
-func TestDeliverOtherProcess(t *testing.T) {
-	s := watchEnv(t)
-	ctx := context.Background()
-	path := deliveryLockPath(s, "y")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	other := lock.New(path, 0)
-	if err := other.Acquire(ctx); err != nil {
-		t.Fatal(err)
-	}
-	defer other.Release()
-	if c, err := claimDelivery(s, "y"); c != nil || err != nil {
-		t.Fatalf("захват при чужом лок-файле: %v", err)
-	}
-	if got := deliver(ctx, s, "y", "test"); got != "" {
-		t.Fatalf("второй процесс отправил: %q", got)
-	}
-}
-
-// Лок завести нельзя — не отправлять (иначе другой процесс мог бы отправить
-// тот же черновик), а показать сбой.
-func TestDeliverNoLockNoSend(t *testing.T) {
-	s := watchEnv(t)
-	box := outbox.New(s.OutboxPath())
-	dr, err := box.Create(outbox.CreateOpts{Chat: "test", Text: "раз", TTLMin: 60})
+func approved(t *testing.T, box *outbox.Outbox, chat string) *outbox.Draft {
+	t.Helper()
+	d, err := box.Create(outbox.CreateOpts{Chat: chat, Text: "раз", TTLMin: 60})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := box.Approve(dr.ID, "test"); err != nil {
+	if d, err = box.Approve(d.ID, "test"); err != nil {
 		t.Fatal(err)
 	}
-	// на месте каталога локов — файл
-	if err := os.WriteFile(filepath.Join(s.DataDir(), "sending"), []byte("x"), 0o600); err != nil {
+	return d
+}
+
+// Черновик уже отправляет другой путь: второй не отправляет и карточку не
+// трогает (итог напишет первый), tg_send_draft отказывает.
+func TestDeliverOnce(t *testing.T) {
+	s := watchEnv(t)
+	ctx := context.Background()
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	c, _, err := box.ClaimSend(d.ID)
+	if c == nil || err != nil {
+		t.Fatalf("первый захват: %v", err)
+	}
+	if got := deliver(ctx, s, d.ID, "test"); got != "" {
+		t.Fatalf("второй путь отправил: %q", got)
+	}
+	var dn *Denied
+	if _, err := DeliverApproved(ctx, s, d.ID, "test"); err == nil || !errors.As(err, &dn) {
+		t.Fatalf("tg_send_draft при идущей отправке: %v", err)
+	}
+	if got, _ := box.Get(d.ID); got.SendError != nil {
+		t.Fatalf("отказ второму пути записан ошибкой черновика: %v", *got.SendError)
+	}
+	c.Release()
+}
+
+// Уже решённый черновик (его отправил другой путь) не отправляется снова, а
+// итог — по его статусу.
+func TestDeliverDecided(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	if _, err := box.MarkSent(d.ID, 77, "2026-11-12T10:00:00+00:00"); err != nil {
 		t.Fatal(err)
 	}
-	if got := deliver(context.Background(), s, dr.ID, "test"); !strings.Contains(got, "Не отправлено") {
+	if got := deliver(context.Background(), s, d.ID, "test"); !strings.Contains(got, "id 77") {
 		t.Fatalf("итог: %q", got)
-	}
-	if d, _ := box.Get(dr.ID); d.SendError == nil || d.Status != outbox.Approved {
-		t.Fatalf("черновик: %+v", d)
 	}
 }
 
-// Лок умершего процесса (упал посреди отправки) не мешает досылке взять
-// черновик: снимается при первой попытке, берётся со следующей.
-func TestClaimAfterDeadOwner(t *testing.T) {
+// Отказ после захвата (здесь — чат закрыт для отправки) записывается в
+// черновик: иначе tg_wait_approval и карточка так и висели бы на
+// «Отправляю…».
+func TestDeliverApprovedDeniedRecorded(t *testing.T) {
 	s := watchEnv(t)
-	path := deliveryLockPath(s, "z")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatal(err)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "closed-chat")
+	if _, err := DeliverApproved(context.Background(), s, d.ID, "test"); err == nil {
+		t.Fatal("отправка в закрытый чат прошла")
 	}
-	if err := os.WriteFile(path+".lock", []byte(`{"pid":999999,"ts":1}`), 0o600); err != nil {
-		t.Fatal(err)
+	got, _ := box.Get(d.ID)
+	if got.SendError == nil || got.Status != outbox.Approved {
+		t.Fatalf("черновик: %+v", got)
 	}
-	c, err := claimDelivery(s, "z")
-	if c == nil || err != nil {
-		t.Fatalf("лок умершего процесса не снят: %v", err)
-	}
-	c.release()
 }

@@ -20,22 +20,22 @@ package config
 //	[manage]
 //	folders = true        # агент может раскладывать чаты по папкам и архиву
 //
-// Кто сейчас в группе, пишет служба (data/chat_sets.json, core.RefreshSets);
+// Кто сейчас в группе, пишет служба (data/state.db, core.RefreshSets);
 // права берутся из chats.toml при каждом чтении настроек, поэтому снятое
 // правило закрывает чаты сразу, а не после пересчёта состава.
 
 import (
-	"encoding/json"
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	"tgagent/internal/fsx"
+	"tgagent/internal/store"
 
 	"github.com/BurntSushi/toml"
 )
@@ -202,7 +202,7 @@ type SetState struct {
 	Error   string      `json:"error,omitempty"` // папки нет и т.п.
 }
 
-// SetsState — data/chat_sets.json.
+// SetsState — что известно о группах (таблицы chat_sets* в data/state.db).
 type SetsState struct {
 	Updated time.Time           `json:"updated"`
 	Sets    map[string]SetState `json:"sets"`
@@ -213,37 +213,94 @@ type SetsState struct {
 	Blocked map[string][]int64 `json:"blocked,omitempty"`
 }
 
-func SetsPath() string { return filepath.Join(DataPath(), "chat_sets.json") }
+var setsTab = store.NewTable[SetState](store.TChatSets)
 
-// LoadSetsState — что служба знает о составе групп (нет файла — пусто).
+func setsDB() (*store.DB, error) { return store.Open(DataPath()) }
+
+// LoadSetsState — что служба знает о составе групп (ничего — пусто).
 func LoadSetsState() SetsState {
-	st := SetsState{}
-	if raw, err := os.ReadFile(SetsPath()); err == nil {
-		_ = json.Unmarshal(raw, &st)
+	st := SetsState{Sets: map[string]SetState{}, Aliases: map[string]string{}, Blocked: map[string][]int64{}}
+	db, err := setsDB()
+	if err != nil {
+		return st
 	}
-	if st.Sets == nil {
-		st.Sets = map[string]SetState{}
+	ctx := context.Background()
+	q := db.Q()
+	if m, err := setsTab.All(ctx, q); err == nil {
+		st.Sets = m
 	}
-	if st.Aliases == nil {
-		st.Aliases = map[string]string{}
+	_, _ = store.GetKV(ctx, q, store.KeySetsUpdated, &st.Updated)
+	if rows, err := q.QueryContext(ctx, "SELECT chat_id, alias FROM chat_set_aliases"); err == nil {
+		for rows.Next() {
+			var id, alias string
+			if rows.Scan(&id, &alias) == nil {
+				st.Aliases[id] = alias
+			}
+		}
+		rows.Close()
 	}
-	if st.Blocked == nil {
-		st.Blocked = map[string][]int64{}
+	if rows, err := q.QueryContext(ctx, "SELECT set_key, chat_id FROM chat_set_blocked ORDER BY set_key, chat_id"); err == nil {
+		for rows.Next() {
+			var key string
+			var id int64
+			if rows.Scan(&key, &id) == nil {
+				st.Blocked[key] = append(st.Blocked[key], id)
+			}
+		}
+		rows.Close()
 	}
 	return st
 }
 
-// SaveSetsState пишет состав групп атомарно.
-func SaveSetsState(st SetsState) error {
-	raw, err := json.MarshalIndent(st, "", "  ")
+// SaveSetMembers — записать пересчитанный состав групп (Sets, Updated) и
+// alias их чатов. Alias постоянные: записанные не убираются. Blocked не
+// трогает — его меняют BlockSetChat и ClearSetBlocked, в том числе из
+// другого процесса, пока служба ходит за составом в Telegram.
+func SaveSetMembers(st SetsState) error {
+	db, err := setsDB()
 	if err != nil {
 		return err
 	}
-	path := SetsPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	ctx := context.Background()
+	return db.Write(ctx, func(tx *sql.Tx) error {
+		if err := setsTab.EditTx(ctx, tx, func(m map[string]SetState) (bool, error) {
+			clear(m)
+			for k, v := range st.Sets {
+				m[k] = v
+			}
+			return true, nil
+		}); err != nil {
+			return err
+		}
+		for id, alias := range st.Aliases {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO chat_set_aliases(chat_id, alias) VALUES(?, ?)
+				ON CONFLICT(chat_id) DO UPDATE SET alias = excluded.alias`, id, alias); err != nil {
+				return err
+			}
+		}
+		return store.PutKV(ctx, tx, store.KeySetsUpdated, st.Updated)
+	})
+}
+
+// BlockSetChat — чат попал в группу из-за агента: доступа через неё не даёт.
+func BlockSetChat(key string, peer int64) error {
+	db, err := setsDB()
+	if err != nil {
 		return err
 	}
-	return fsx.WriteFile(path, raw, 0o600)
+	_, err = db.Q().ExecContext(context.Background(),
+		"INSERT OR IGNORE INTO chat_set_blocked(set_key, chat_id) VALUES(?, ?)", key, peer)
+	return err
+}
+
+// ClearSetBlocked — снять все блоки группы (владелец заново открыл её целиком).
+func ClearSetBlocked(key string) error {
+	db, err := setsDB()
+	if err != nil {
+		return err
+	}
+	_, err = db.Q().ExecContext(context.Background(), "DELETE FROM chat_set_blocked WHERE set_key = ?", key)
+	return err
 }
 
 // IsBlocked — чат попал в группу из-за агента.

@@ -25,7 +25,7 @@ import (
 // editTarget — отправленный через tg-agent черновик с этим сообщением
 // (последняя правка — тоже: у неё EditOf = id сообщения).
 func editTarget(s *config.Settings, alias string, msgID int64) (*outbox.Draft, error) {
-	drafts, err := outbox.New(s.OutboxPath()).List(outbox.Sent)
+	drafts, err := outbox.New(s.DataDir()).List(outbox.Sent)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +53,7 @@ func EditMessage(ctx context.Context, s *config.Settings, chat string, messageID
 		return nil, err
 	}
 	if draftID != "" { // правку можно указать и черновиком, которым сообщение ушло
-		d, err := outbox.New(s.OutboxPath()).Get(draftID)
+		d, err := outbox.New(s.DataDir()).Get(draftID)
 		if err != nil {
 			return nil, err
 		}
@@ -132,7 +132,7 @@ func EditMessage(ctx context.Context, s *config.Settings, chat string, messageID
 // editDraft — черновик правки: тот же путь подтверждения, что у сообщения.
 func editDraft(ctx context.Context, s *config.Settings, rule config.ChatRule, orig *outbox.Draft, messageID int64,
 	old, text, note, format string, mentionNotes []*omap.Map) (*omap.Map, error) {
-	opts := outbox.CreateOpts{ID: outbox.NewID(), Chat: rule.Alias, Text: text, TTLMin: s.DraftTTLMin, Note: note,
+	opts := outbox.CreateOpts{Chat: rule.Alias, Text: text, TTLMin: s.DraftTTLMin, Note: note,
 		Fmt: format, Origin: draftOrigin(s), Topic: orig.Topic, TopicTitle: orig.TopicTitle,
 		EditOf: messageID, EditOld: old}
 	auto := rule.AutoSend()
@@ -140,7 +140,7 @@ func editDraft(ctx context.Context, s *config.Settings, rule config.ChatRule, or
 		at := time.Now().Add(time.Duration(s.AutoSendDelaySec) * time.Second)
 		opts.SendAt = &at
 	}
-	d, err := outbox.New(s.OutboxPath()).Create(opts)
+	d, err := outbox.New(s.DataDir()).Create(opts)
 	if err != nil {
 		return nil, err
 	}

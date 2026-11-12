@@ -25,7 +25,7 @@ func TestGrantSet(t *testing.T) {
 		return &config.Settings{Sets: sets, Manage: manage}
 	}
 	// чат, положенный агентом, после нового решения о папке целиком открывается
-	if err := config.SaveSetsState(config.SetsState{Blocked: map[string][]int64{"folder:3": {-1005}}}); err != nil {
+	if err := config.BlockSetChat("folder:3", -1005); err != nil {
 		t.Fatal(err)
 	}
 	folder := &accessRequest{ID: "f", Scope: scopeFolder, Folder: "3", Title: "Новости", Reason: "сводка"}

@@ -1,18 +1,17 @@
 package core
 
-// Ленты новых сообщений: data/feeds/<alias>.ids — по id на строку.
+// Ленты новых сообщений: таблица feed в data/state.db — id сообщений чата.
 //
 // Пишет служба: Telegram сам присылает ей новые сообщения (FeedOnMessage), а
 // раз в минуту она сверяет верхние сообщения чатов (PollOnce) — на случай
-// пропусков и собственных отправок. Агенты файл только читают — это не стоит
-// ни сессии, ни сети, ни лока.
+// пропусков и собственных отправок. Читают подписки, tg watch и
+// tg_list_chats (feed.last_id) — без сессии и сети.
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,60 +24,39 @@ import (
 	"tgagent/internal/tgc"
 )
 
-func FeedPath(s *config.Settings, alias string) string {
-	return filepath.Join(s.FeedsDir(), alias+".ids")
-}
-
-// LastID — последний id в ленте (0, если ленты ещё нет).
-func LastID(path string) int {
-	f, err := os.Open(path)
+// FeedLast — последний id в ленте чата (0 — ленты ещё нет).
+func FeedLast(s *config.Settings, alias string) int {
+	db, err := stateDB(s)
 	if err != nil {
 		return 0
 	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
+	var last sql.NullInt64
+	if err := db.Q().QueryRowContext(context.Background(), "SELECT max(msg_id) FROM feed WHERE chat = ?", alias).Scan(&last); err != nil {
 		return 0
 	}
-	// после сбоя питания хвост дописанного файла бывает в нулях: их
-	// пропускаем, иначе лента сочла бы себя пустой
-	for _, back := range []int64{64, 64 << 10} {
-		if _, err := f.Seek(max(0, st.Size()-back), io.SeekStart); err != nil {
-			return 0
-		}
-		tail, _ := io.ReadAll(f)
-		fields := strings.Fields(strings.ReplaceAll(string(tail), "\x00", " "))
-		for i := len(fields) - 1; i >= 0; i-- {
-			if i == 0 && back < st.Size() {
-				break // первое поле могло начаться до границы чтения
-			}
-			if n, err := strconv.Atoi(fields[i]); err == nil {
-				return n
-			}
-		}
-		if back >= st.Size() {
-			break
-		}
-	}
-	return 0
+	return int(last.Int64)
 }
 
-func appendIDs(path string, ids []int) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+// idsAfter — id из ленты новее from, по возрастанию.
+func idsAfter(s *config.Settings, alias string, from int) []int {
+	db, err := stateDB(s)
 	if err != nil {
-		return err
+		return nil
 	}
-	defer f.Close()
-	var b strings.Builder
-	for _, id := range ids {
-		b.WriteString(strconv.Itoa(id))
-		b.WriteByte('\n')
+	rows, err := db.Q().QueryContext(context.Background(),
+		"SELECT msg_id FROM feed WHERE chat = ? AND msg_id > ? ORDER BY msg_id", alias, from)
+	if err != nil {
+		return nil
 	}
-	_, err = f.WriteString(b.String())
-	return err
+	defer rows.Close()
+	var out []int
+	for rows.Next() {
+		var id int
+		if rows.Scan(&id) == nil {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // PollOnce — сверка: дописать во все ленты то, что пришло после последнего
@@ -90,7 +68,7 @@ func PollOnce(ctx context.Context, s *config.Settings) (map[string]int, error) {
 	for _, r := range s.Rules() {
 		// чаты групп (папка, сотни публичных каналов) сверяем реже: новое и
 		// так приходит событиями, а сверка — только на случай пропусков
-		if r.Read && (r.Via == "" || groups || LastID(FeedPath(s, r.Alias)) == 0) {
+		if r.Read && (r.Via == "" || groups || FeedLast(s, r.Alias) == 0) {
 			rules = append(rules, r)
 		}
 	}
@@ -128,11 +106,10 @@ func PollOnce(ctx context.Context, s *config.Settings) (map[string]int, error) {
 				}
 			}
 			for alias, topID := range top {
-				path := FeedPath(s, alias)
-				known := LastID(path)
+				known := FeedLast(s, alias)
 				if known == 0 {
 					// новая лента начинается с текущего момента — историю не льём
-					if _, err := appendNewer(path, []int{topID}); err != nil {
+					if _, err := appendNewer(s, alias, []int{topID}); err != nil {
 						return err
 					}
 					continue
@@ -160,7 +137,7 @@ func PollOnce(ctx context.Context, s *config.Settings) (map[string]int, error) {
 						}
 					}
 				}
-				n, err := appendNewer(path, ids)
+				n, err := appendNewer(s, alias, ids)
 				if err != nil {
 					return err
 				}
@@ -191,30 +168,42 @@ func groupPollDue() bool {
 	return true
 }
 
-// feedMu — ленты дописывают и события, и сверка: по очереди.
-var feedMu sync.Mutex
-
-// appendNewer дописывает id, если он новее последнего в ленте. Новая лента
-// начинается с текущего сообщения — историю не льём.
-func appendNewer(path string, ids []int) (int, error) {
-	feedMu.Lock()
-	defer feedMu.Unlock()
-	last := LastID(path)
-	var fresh []int
-	for _, id := range ids {
-		if id > last {
-			fresh = append(fresh, id)
-			last = id
-		}
-	}
-	if len(fresh) == 0 {
-		return 0, nil
-	}
-	if err := appendIDs(path, fresh); err != nil {
+// appendNewer дописывает в ленту id новее последнего в ней. Новая лента
+// начинается с текущего сообщения — историю не льём. Проверка и запись —
+// одной транзакцией: ленту дописывают и события, и сверка.
+func appendNewer(s *config.Settings, alias string, ids []int) (int, error) {
+	db, err := stateDB(s)
+	if err != nil {
 		return 0, err
 	}
-	pokeSubs()
-	return len(fresh), nil
+	ctx := context.Background()
+	n := 0
+	err = db.Write(ctx, func(tx *sql.Tx) error {
+		n = 0
+		var last sql.NullInt64
+		if err := tx.QueryRowContext(ctx, "SELECT max(msg_id) FROM feed WHERE chat = ?", alias).Scan(&last); err != nil {
+			return err
+		}
+		top := int(last.Int64)
+		for _, id := range ids {
+			if id <= top {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO feed(chat, msg_id) VALUES(?, ?)", alias, id); err != nil {
+				return err
+			}
+			top = id
+			n++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		pokeSubs()
+	}
+	return n, nil
 }
 
 // ruleMarkedID — id чата из белого списка в формате Bot API (0 — пока неизвестен).
@@ -251,7 +240,7 @@ func FeedOnMessage(loader func() (*config.Settings, error)) tgc.OnMessage {
 			if out {
 				markOutgoing(rule.Alias, msgID)
 			}
-			if _, err := appendNewer(FeedPath(s, rule.Alias), []int{msgID}); err != nil {
+			if _, err := appendNewer(s, rule.Alias, []int{msgID}); err != nil {
 				_ = audit.Log(s.AuditPath(), "feed_write_failed", "chat", rule.Alias, "error", err.Error())
 			}
 		}
@@ -259,8 +248,8 @@ func FeedOnMessage(loader func() (*config.Settings, error)) tgc.OnMessage {
 }
 
 // Watch печатает «alias id» на каждое новое сообщение — для Monitor в Claude
-// Code (там, где tg_subscribe недоступен). Читает только локальные файлы
-// лент, к Telegram не ходит. after > 0 — сразу выдать и то, что пришло после
+// Code (там, где tg_subscribe недоступен). Читает только ленты в базе, к
+// Telegram не ходит. after > 0 — сразу выдать и то, что пришло после
 // этого id (подписку перезапустили, а сообщения за перерыв терять нельзя).
 func Watch(ctx context.Context, s *config.Settings, aliases []string, after int, out io.Writer) error {
 	var rules []config.ChatRule
@@ -282,47 +271,22 @@ func Watch(ctx context.Context, s *config.Settings, aliases []string, after int,
 	seen := map[string]int{}
 	var names []string
 	for _, r := range rules {
-		seen[r.Alias] = LastID(FeedPath(s, r.Alias))
+		seen[r.Alias] = FeedLast(s, r.Alias)
 		if after > 0 {
 			seen[r.Alias] = min(seen[r.Alias], after)
 		}
 		names = append(names, r.Alias)
 	}
 	fmt.Fprintf(out, "слежу за: %s (Ctrl+C — выход)\n", strings.Join(names, ", "))
-	type stamp struct {
-		size int64
-		mod  time.Time
-	}
-	last := map[string]stamp{}
 	for ctx.Err() == nil {
 		for _, alias := range names {
-			path := FeedPath(s, alias)
-			st, err := os.Stat(path)
-			if err != nil {
-				continue
-			}
-			now := stamp{st.Size(), st.ModTime()}
-			if now == last[alias] {
-				continue // лента не менялась — не перечитываем
-			}
-			raw, err := os.ReadFile(path)
-			if err != nil {
-				continue
-			}
-			last[alias] = now
-			best := seen[alias]
-			for _, f := range strings.Fields(string(raw)) {
-				id, err := strconv.Atoi(f)
-				if err != nil || id <= seen[alias] {
-					continue
-				}
+			for _, id := range idsAfter(s, alias, seen[alias]) {
 				if _, err := fmt.Fprintf(out, "%s %d\n", alias, id); err != nil {
 					// читателя нет (сессия агента закрылась) — не висеть сиротой
 					return nil
 				}
-				best = max(best, id)
+				seen[alias] = max(seen[alias], id)
 			}
-			seen[alias] = best
 		}
 		sleepCtx(ctx, 250*time.Millisecond)
 	}

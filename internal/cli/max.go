@@ -58,9 +58,9 @@ func maxSessionPath() string { return core.MaxSessionPath() }
 var semver = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
 // maxWebVersion — версия веб-клиента, которую видело слежение за
-// обновлениями (data/upstream.json); не видело — запасная.
+// обновлениями (состояние upstream в state.db); не видело — запасная.
 func maxWebVersion() string {
-	st, err := upstream.Load(filepath.Join(config.DataPath(), "upstream.json"))
+	st, err := upstream.Load(config.DataPath())
 	if err == nil {
 		if ss := st.Sources[upstream.MaxWeb.ID]; ss != nil && semver.MatchString(ss.Values["app_version"]) {
 			return ss.Values["app_version"]

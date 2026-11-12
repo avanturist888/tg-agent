@@ -15,15 +15,15 @@ package core
 // В чате только для чтения отвечать некому: там каждого подписчика будят обо
 // всём, что подходит под его фильтр, маршрутов нет.
 //
-// Маршруты — data/routes.json (alias → id → цепочка и владелец), без текста.
+// Маршруты — таблица routes в data/state.db (чат, id → цепочка и владелец),
+// без текста.
 // Текст и автора для фильтров служба читает по id и держит только в памяти.
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -159,28 +159,116 @@ const (
 	routesTTL  = 7 * 24 * time.Hour // и не старше
 )
 
-var routeMu sync.Mutex
+func scanRoutes(rows *sql.Rows) (routes, map[routeKey]string, error) {
+	defer rows.Close()
+	rs, raw := routes{}, map[routeKey]string{}
+	for rows.Next() {
+		var (
+			k    routeKey
+			body string
+		)
+		if err := rows.Scan(&k.chat, &k.id, &body); err != nil {
+			return nil, nil, err
+		}
+		r := &route{}
+		if json.Unmarshal([]byte(body), r) != nil {
+			continue
+		}
+		if rs[k.chat] == nil {
+			rs[k.chat] = map[int]*route{}
+		}
+		rs[k.chat][k.id] = r
+		raw[k] = body
+	}
+	return rs, raw, rows.Err()
+}
 
-func routesPath(s *config.Settings) string { return filepath.Join(s.DataDir(), "routes.json") }
+type routeKey struct {
+	chat string
+	id   int
+}
 
+// loadRoutes — все маршруты (не прочитались — пусто).
 func loadRoutes(s *config.Settings) routes {
-	rs := routes{}
-	if raw, err := os.ReadFile(routesPath(s)); err == nil {
-		_ = json.Unmarshal(raw, &rs)
+	db, err := stateDB(s)
+	if err != nil {
+		return routes{}
+	}
+	rows, err := db.Q().QueryContext(context.Background(), "SELECT chat, msg_id, body FROM routes")
+	if err != nil {
+		return routes{}
+	}
+	rs, _, err := scanRoutes(rows)
+	if err != nil {
+		return routes{}
 	}
 	return rs
 }
 
-// editRoutes — прочитать, поменять и записать маршруты под замком.
-func editRoutes(s *config.Settings, fn func(rs routes) bool) error {
-	routeMu.Lock()
-	defer routeMu.Unlock()
-	rs := loadRoutes(s)
-	if !fn(rs) {
+// loadChatRoutes — маршруты одного чата.
+func loadChatRoutes(s *config.Settings, alias string) map[int]*route {
+	db, err := stateDB(s)
+	if err != nil {
 		return nil
 	}
-	prune(rs)
-	return saveSubs(routesPath(s), rs)
+	rows, err := db.Q().QueryContext(context.Background(), "SELECT chat, msg_id, body FROM routes WHERE chat = ?", alias)
+	if err != nil {
+		return nil
+	}
+	rs, _, err := scanRoutes(rows)
+	if err != nil {
+		return nil
+	}
+	return rs[alias]
+}
+
+// editRoutes — прочитать, поменять и записать маршруты одной транзакцией;
+// пишутся только изменившиеся и убранные.
+func editRoutes(s *config.Settings, fn func(rs routes) bool) error {
+	db, err := stateDB(s)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	return db.Write(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, "SELECT chat, msg_id, body FROM routes")
+		if err != nil {
+			return err
+		}
+		rs, raw, err := scanRoutes(rows)
+		if err != nil {
+			return err
+		}
+		if !fn(rs) {
+			return nil
+		}
+		prune(rs)
+		for chat, m := range rs {
+			for id, r := range m {
+				body, err := json.Marshal(r)
+				if err != nil {
+					return err
+				}
+				k := routeKey{chat, id}
+				if raw[k] == string(body) {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx, `INSERT INTO routes(chat, msg_id, at, body) VALUES(?, ?, ?, ?)
+					ON CONFLICT(chat, msg_id) DO UPDATE SET at = excluded.at, body = excluded.body`,
+					chat, id, r.At.Unix(), string(body)); err != nil {
+					return err
+				}
+			}
+		}
+		for k := range raw {
+			if rs[k.chat][k.id] == nil {
+				if _, err := tx.ExecContext(ctx, "DELETE FROM routes WHERE chat = ? AND msg_id = ?", k.chat, k.id); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
 }
 
 // prune — старые маршруты не нужны: решать по ним уже нечего.
@@ -316,9 +404,7 @@ func routeChats(ctx context.Context, s *config.Settings, subs map[string]*subscr
 			byChat[alias] = append(byChat[alias], key)
 		}
 	}
-	routeMu.Lock()
 	rs := loadRoutes(s)
-	routeMu.Unlock()
 	type decision struct {
 		alias string
 		id    int
@@ -339,7 +425,7 @@ func routeChats(ctx context.Context, s *config.Settings, subs map[string]*subscr
 			}
 		}
 		var ids []int
-		for _, id := range idsAfter(FeedPath(s, alias), from) {
+		for _, id := range idsAfter(s, alias, from) {
 			if !isOutgoing(alias, id) && rs[alias][id] == nil {
 				ids = append(ids, id)
 			}
@@ -487,9 +573,7 @@ func Pass(ctx context.Context, s *config.Settings, chat string, messageID int, n
 	if a == nil {
 		return nil, &Bad{Msg: noInbox}
 	}
-	subMu.Lock()
-	subs := loadSubs(subsPath(s))
-	subMu.Unlock()
+	subs := loadSubs(s)
 	me := a.Key()
 	mine := sessionThread(ctx, a.Session)
 	var (

@@ -10,25 +10,21 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
 	"tgagent/internal/bot"
 	"tgagent/internal/chatsfile"
 	"tgagent/internal/config"
-	"tgagent/internal/fsx"
 	"tgagent/internal/inbox"
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
+	"tgagent/internal/store"
 	"tgagent/internal/tgc"
 )
 
@@ -154,7 +150,7 @@ func FolderChats(ctx context.Context, s *config.Settings, folder string) (*omap.
 		return nil, err
 	}
 	pending := map[int64]string{}
-	for _, r := range loadAccess(accessPath(s)) {
+	for _, r := range loadAccess(s) {
 		if r.Status == accessPending {
 			pending[r.Peer] = r.ID
 		}
@@ -215,35 +211,32 @@ type accessRequest struct {
 	Decided  time.Time   `json:"decided,omitzero"`
 }
 
-var accessMu sync.Mutex
+// accessTab — запросы доступа по id.
+var accessTab = store.NewTable[*accessRequest](store.TAccessRequests)
 
-func accessPath(s *config.Settings) string { return filepath.Join(s.DataDir(), "access_requests.json") }
-
-func loadAccess(path string) map[string]*accessRequest {
-	out := map[string]*accessRequest{}
-	if raw, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(raw, &out)
+// loadAccess — все запросы (не прочитались — пусто: запросы только
+// показываются и ищутся, решения по ним — через editAccess).
+func loadAccess(s *config.Settings) map[string]*accessRequest {
+	db, err := stateDB(s)
+	if err != nil {
+		return map[string]*accessRequest{}
 	}
-	return out
+	m, err := accessTab.All(context.Background(), db.Q())
+	if err != nil {
+		logEvent(s, "access_load_failed", "error", err.Error())
+		return map[string]*accessRequest{}
+	}
+	return m
 }
 
-// editAccess — прочитать, поменять и записать запросы под замком.
+// editAccess — прочитать, поменять и записать запросы одной транзакцией
+// (между процессами тоже: запрос может прийти из tg tool-call без службы).
 func editAccess(s *config.Settings, fn func(m map[string]*accessRequest) bool) error {
-	accessMu.Lock()
-	defer accessMu.Unlock()
-	path := accessPath(s)
-	m := loadAccess(path)
-	if !fn(m) {
-		return nil
-	}
-	raw, err := json.MarshalIndent(m, "", "  ")
+	db, err := stateDB(s)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	return fsx.WriteFile(path, raw, 0o600)
+	return accessTab.Edit(context.Background(), db, fn)
 }
 
 func rights(read, send bool) string {
@@ -315,7 +308,7 @@ func RequestAccess(ctx context.Context, s *config.Settings, chatID int64, read, 
 			Set("can_read", existing.Read).Set("can_send", existing.Send), nil
 	}
 	// такой же запрос ещё ждёт кнопки — вторую карточку не шлём
-	for _, r := range loadAccess(accessPath(s)) {
+	for _, r := range loadAccess(s) {
 		if r.Status == accessPending && r.Peer == chatID && (r.Read || !read) && (r.Send || !send) {
 			return out.Set("request_id", r.ID).Set("status", accessPending).Set("next_step",
 				"Такой запрос уже ждёт владельца. Дождись: tg_wait_access(request_id)."), nil
@@ -331,7 +324,13 @@ func RequestAccess(ctx context.Context, s *config.Settings, chatID int64, read, 
 		return nil, fmt.Errorf("карточка в бот не ушла: %w", err)
 	}
 	req.CardID = card
-	if err := editAccess(s, func(m map[string]*accessRequest) bool { m[req.ID] = req; return true }); err != nil {
+	if err := editAccess(s, func(m map[string]*accessRequest) bool {
+		for m[req.ID] != nil { // id случайный: совпадение не должно затереть чужой запрос
+			req.ID = outbox.NewID()
+		}
+		m[req.ID] = req
+		return true
+	}); err != nil {
 		return nil, err
 	}
 	logEvent(s, "access_requested", "request_id", req.ID, "chat_id", chatID, "title", info.Title,
@@ -431,7 +430,7 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 		parts = append(parts, "")
 	}
 	id, verdict := parts[1], parts[2]
-	r := loadAccess(accessPath(s))[id]
+	r := loadAccess(s)[id]
 	if r == nil {
 		bot.AnswerCallback(ctx, s, q.ID, "Запрос не найден.")
 		return
@@ -585,7 +584,7 @@ func WaitAccess(ctx context.Context, s *config.Settings, id string, timeoutSec i
 	if err := onlyLocal(s); err != nil {
 		return nil, err
 	}
-	if loadAccess(accessPath(s))[id] == nil {
+	if loadAccess(s)[id] == nil {
 		return nil, &NotFound{Msg: "Запроса " + id + " нет."}
 	}
 	limit := s.ApprovalTimeoutSec
@@ -594,7 +593,7 @@ func WaitAccess(ctx context.Context, s *config.Settings, id string, timeoutSec i
 	}
 	deadline := time.Now().Add(time.Duration(limit) * time.Second)
 	resolved := func() bool {
-		r := loadAccess(accessPath(s))[id]
+		r := loadAccess(s)[id]
 		return r == nil || r.Status != accessPending
 	}
 	updates := lock.New(s.UpdatesLockPath(), 500*time.Millisecond)
@@ -607,7 +606,7 @@ func WaitAccess(ctx context.Context, s *config.Settings, id string, timeoutSec i
 			sleepCtx(ctx, time.Second)
 		}
 	}
-	r := loadAccess(accessPath(s))[id]
+	r := loadAccess(s)[id]
 	if r == nil {
 		return nil, errors.New("запрос пропал")
 	}

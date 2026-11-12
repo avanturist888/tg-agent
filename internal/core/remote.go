@@ -7,7 +7,7 @@ package core
 // другой машине), а курсор сессии сервер T3 наружу не отдаёт — найти тред по
 // id сессии, как у местного десктопа, нельзя. Поэтому служба сама заводит в
 // окружении тред «TG: <чат>» — один на пару (окружение, чат), — помнит его id
-// в data/t3-threads.json и при новых сообщениях начинает в нём ход с
+// в таблице t3_threads и при новых сообщениях начинает в нём ход с
 // уведомлением (thread.turn.start). Удалили тред на сервере — заведёт новый.
 //
 // Новый ход начинается, только когда прошлый закончился: служба ждёт его
@@ -17,11 +17,8 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -29,8 +26,8 @@ import (
 
 	"tgagent/internal/audit"
 	"tgagent/internal/config"
-	"tgagent/internal/lock"
 	"tgagent/internal/omap"
+	"tgagent/internal/store"
 	"tgagent/internal/t3"
 	"tgagent/internal/tgc"
 )
@@ -65,34 +62,29 @@ type remoteTurn struct {
 
 func remoteKey(env, alias string) string { return strings.ToLower(env) + "/" + alias }
 
-func remotePath(s *config.Settings) string { return filepath.Join(s.DataDir(), "t3-threads.json") }
+var remoteTab = store.NewTable[*remoteSub](store.TT3Threads)
 
-var remoteMu sync.Mutex
-
-func loadRemote(path string) map[string]*remoteSub {
-	subs := map[string]*remoteSub{}
-	if raw, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(raw, &subs)
+// loadRemote — треды шлюза (не прочитались — пусто).
+func loadRemote(s *config.Settings) map[string]*remoteSub {
+	db, err := stateDB(s)
+	if err != nil {
+		return map[string]*remoteSub{}
 	}
-	return subs
+	m, err := remoteTab.All(context.Background(), db.Q())
+	if err != nil {
+		return map[string]*remoteSub{}
+	}
+	return m
 }
 
-// editRemote — прочитать, поменять и записать треды шлюза: в процессе — под
-// мьютексом, между процессами (служба и CLI) — под файловым локом.
+// editRemote — прочитать, поменять и записать треды шлюза одной транзакцией
+// (служба и CLI — разные процессы).
 func editRemote(s *config.Settings, fn func(subs map[string]*remoteSub) bool) error {
-	remoteMu.Lock()
-	defer remoteMu.Unlock()
-	path := remotePath(s)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	db, err := stateDB(s)
+	if err != nil {
 		return err
 	}
-	return lock.With(context.Background(), path, 10*time.Second, func() error {
-		subs := loadRemote(path)
-		if !fn(subs) {
-			return nil
-		}
-		return saveSubs(path, subs)
-	})
+	return remoteTab.Edit(context.Background(), db, fn)
 }
 
 // remoteEnv — клиент окружения по имени из config/t3.toml.
@@ -120,7 +112,7 @@ func SubscribeRemote(ctx context.Context, s *config.Settings, env, chat string, 
 	if err != nil {
 		return nil, err
 	}
-	last := LastID(FeedPath(s, rule.Alias))
+	last := FeedLast(s, rule.Alias)
 	from := last
 	if after > 0 {
 		from = after
@@ -200,9 +192,7 @@ func UnsubscribeRemote(s *config.Settings, env, chat string) (*omap.Map, error) 
 
 // RemoteSubs — треды шлюза и подписки (для CLI).
 func RemoteSubs(s *config.Settings) []*omap.Map {
-	remoteMu.Lock()
-	subs := loadRemote(remotePath(s))
-	remoteMu.Unlock()
+	subs := loadRemote(s)
 	keys := make([]string, 0, len(subs))
 	for k := range subs {
 		keys = append(keys, k)
@@ -249,9 +239,7 @@ func CheckRemote(ctx context.Context, s *config.Settings, env string) (*omap.Map
 		alive[th.ID] = th.ArchivedAt == nil
 	}
 	var threads []*omap.Map
-	remoteMu.Lock()
-	subs := loadRemote(remotePath(s))
-	remoteMu.Unlock()
+	subs := loadRemote(s)
 	for _, sub := range subs {
 		if !strings.EqualFold(sub.Env, e.Name) || sub.Thread == "" {
 			continue
@@ -319,11 +307,9 @@ func wakeRemote(ctx context.Context, s *config.Settings, env string, rule config
 	}
 	key := remoteKey(e.Name, rule.Alias)
 	thread := ""
-	remoteMu.Lock()
-	if sub := loadRemote(remotePath(s))[key]; sub != nil {
+	if sub := loadRemote(s)[key]; sub != nil {
 		thread = sub.Thread
 	}
-	remoteMu.Unlock()
 	w := &woken{env: e, thread: thread}
 	for attempt := 0; ; attempt++ {
 		if w.thread == "" {
@@ -420,9 +406,7 @@ var remoteRun = struct {
 // notifyRemote — разбудить треды шлюза, в чатах которых новое. Ход идёт в
 // фоне; возвращает, через сколько заглянуть снова (0 — не нужно).
 func notifyRemote(ctx context.Context, s *config.Settings) time.Duration {
-	remoteMu.Lock()
-	subs := loadRemote(remotePath(s))
-	remoteMu.Unlock()
+	subs := loadRemote(s)
 	var wait time.Duration
 	later := func(d time.Duration) {
 		if d > 0 && (wait == 0 || d < wait) {
@@ -437,7 +421,7 @@ func notifyRemote(ctx context.Context, s *config.Settings) time.Duration {
 		if !ok || !rule.Read {
 			continue // чат убрали из белого списка
 		}
-		ids := idsAfter(FeedPath(s, sub.Chat), sub.After)
+		ids := idsAfter(s, sub.Chat, sub.After)
 		changes := len(sub.Edited)+len(sub.Deleted) > 0
 		if len(ids) == 0 && !changes {
 			continue

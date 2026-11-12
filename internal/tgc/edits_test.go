@@ -1,7 +1,6 @@
 package tgc
 
 import (
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -45,7 +44,7 @@ func TestEditIsNotReaction(t *testing.T) {
 }
 
 func TestEditsSurviveRestart(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "edit_dates.json")
+	path := t.TempDir()
 	stop := time.Unix(1_800_000_000, 0)
 	first := &editTracker{seen: map[string]int{}}
 	first.open(path)
