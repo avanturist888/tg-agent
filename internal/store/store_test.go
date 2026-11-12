@@ -614,8 +614,10 @@ func TestExportLegacy(t *testing.T) {
 	write(t, filepath.Join(dir, "outbox.json"), `[
 		{"id": "a", "status": "scheduled", "send_at": "2099-01-01T00:00:00+00:00"},
 		{"id": "b", "status": "pending"}, {"id": "c", "status": "pending"},
-		{"id": "d", "status": "pending"}, {"id": "e", "status": "pending"}]`)
+		{"id": "d", "status": "pending"}, {"id": "e", "status": "pending"},
+		{"id": "f", "status": "pending", "reply_to": 9007199254740993}]`)
 	write(t, filepath.Join(dir, "pinned_drafts.json"), `{"a": 5}`)
+	write(t, filepath.Join(dir, "transcripts.json"), `{}`)
 	db, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -626,6 +628,8 @@ func TestExportLegacy(t *testing.T) {
 		"UPDATE drafts SET status = 'approved' WHERE id = 'c'",
 		"UPDATE drafts SET status = 'approved', send_attempts = 1 WHERE id = 'd'",
 		"UPDATE drafts SET status = 'cancelled' WHERE id = 'e'",
+		// закреплена после переноса — в снимке её нет
+		"INSERT INTO pinned_drafts(key, body) VALUES('b', '7')",
 	} {
 		if _, err := db.Q().Exec(q); err != nil {
 			t.Fatal(err)
@@ -636,8 +640,14 @@ func TestExportLegacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(restored, "pinned_drafts.json") {
+	if !slices.Contains(restored, "transcripts.json") || !slices.Contains(restored, "pinned_drafts.json (из базы)") {
 		t.Fatalf("вернулось: %v", restored)
+	}
+	if raw, err := os.ReadFile(filepath.Join(dir, "pinned_drafts.json")); err != nil || !strings.Contains(string(raw), `"b": 7`) {
+		t.Fatalf("закреплённое после переноса не выгружено: %v %s", err, raw)
+	}
+	if raw, err := os.ReadFile(filepath.Join(dir, "outbox.json")); err != nil || !strings.Contains(string(raw), "9007199254740993") {
+		t.Fatalf("большой id искажён: %v", err)
 	}
 	var got []map[string]any
 	raw, err := os.ReadFile(filepath.Join(dir, "outbox.json"))
@@ -669,7 +679,11 @@ func TestExportLegacy(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "outbox.json")); err != nil || db.LegacyBlocked() == "" {
 		t.Fatalf("после отката перенос не ждёт: %v %q", err, db.LegacyBlocked())
 	}
-	// прерванную выгрузку можно повторить: свои файлы она перезапишет
+	// прерванную выгрузку можно повторить: свои файлы она перезапишет —
+	// и тогда, когда процесс умер, не записав размер и время файла
+	if _, err := db.Q().Exec("UPDATE legacy_imports SET size = 0, mtime = 0 WHERE exported != 0"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := ExportLegacy(dir); err != nil {
 		t.Fatalf("повтор выгрузки: %v", err)
 	}

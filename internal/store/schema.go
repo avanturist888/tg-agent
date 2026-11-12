@@ -128,6 +128,9 @@ UPDATE drafts SET send_attempts = 1 WHERE sender_pid IS NOT NULL;`,
 	// 4: файл выгружен из базы для отката (tg rollback, rollback.go): при
 	// следующем переносе он главнее базы — его вела старая сборка
 	`ALTER TABLE legacy_imports ADD COLUMN exported INTEGER NOT NULL DEFAULT 0;`,
+	// 5: хеш выгруженного откатом содержимого — пишется до самого файла:
+	// повтор прерванной выгрузки узнаёт свой файл по нему
+	`ALTER TABLE legacy_imports ADD COLUMN export_hash TEXT NOT NULL DEFAULT '';`,
 }
 
 // Version — версия схемы, которую знает эта сборка.

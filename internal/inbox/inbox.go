@@ -60,6 +60,12 @@ func (a Addr) MarshalJSON() ([]byte, error) {
 	return json.Marshal(addrJSON{Session: a.Session, Socket: a.Socket, Token: tok, Kind: a.Kind})
 }
 
+// PlainJSON — Addr с открытым токеном: так его читает сборка до шифрования
+// (выгрузка для отката, store.ExportLegacy).
+func (a Addr) PlainJSON() ([]byte, error) {
+	return json.Marshal(addrJSON{Session: a.Session, Socket: a.Socket, Token: a.Token, Kind: a.Kind})
+}
+
 // UnmarshalJSON принимает и зашифрованный токен, и открытый (запись до
 // шифрования, прослойка старой сборки).
 func (a *Addr) UnmarshalJSON(b []byte) error {

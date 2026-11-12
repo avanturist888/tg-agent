@@ -60,6 +60,15 @@ type Legacy struct {
 	// после которого его вела старая сборка: файл новее базы и главнее её.
 	// Нет — и после отката как Import.
 	Replace func(ctx context.Context, tx *sql.Tx, path string) (int, error)
+	// Откат (tg rollback, rollback.go): как отдать файл старой сборке.
+	// Export (ExportDir — для каталога) собирает его из базы: она новее
+	// отложенного снимка. Пусто (nil) — в базе нечего отдавать, файла не
+	// будет. Snapshot — вернуть отложенный снимок: только для кэшей, чей
+	// устаревший снимок ничем не грозит. Одно из них обязательно
+	// (TestLegacyRollbackDeclared в core: там зарегистрированы все).
+	Export    func(ctx context.Context, tx *sql.Tx, dir string) ([]byte, error)
+	ExportDir func(ctx context.Context, tx *sql.Tx, dir string) (map[string][]byte, error)
+	Snapshot  bool
 	// ErrCorrupt (обёрнутая) — файл испорчен: его откладывают как .broken.
 	// ErrRetry — перенести пока нельзя (не записался секрет, старая сборка
 	// ещё отправляет черновик): файл остаётся на месте, попытка — скоро снова.
@@ -122,6 +131,10 @@ func RegisterLegacy(l Legacy) {
 	defer legacyMu.Unlock()
 	legacy = append(legacy, l)
 }
+
+// LegacyFiles — все старые файлы, которые знает сборка (и зарегистрированные
+// другими пакетами).
+func LegacyFiles() []Legacy { return legacyList() }
 
 func legacyList() []Legacy {
 	legacyMu.Lock()
@@ -422,17 +435,23 @@ func insertKV(ctx context.Context, tx *sql.Tx, key string, raw json.RawMessage) 
 
 // kvFile — файл целиком становится одним значением kv.
 func kvFile(file, key string) Legacy {
-	return Legacy{File: file, Import: func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+	imp := func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 		var raw json.RawMessage
 		if ok, err := readJSON(path, &raw); !ok {
 			return 0, err
 		}
 		return 1, insertKV(ctx, tx, key, raw)
-	}}
+	}
+	return Legacy{File: file, Import: imp, Replace: replacing(imp, nil, []string{key}), Export: exportKV(key)}
 }
 
 func docFile(file, table string) Legacy {
-	return Legacy{File: file, Import: docImport(table)}
+	return docLegacy(file, table, false)
+}
+
+func docLegacy(file, table string, locked bool) Legacy {
+	imp := docImport(table)
+	return Legacy{File: file, Locked: locked, Import: imp, Replace: replacing(imp, []string{table}, nil), Export: exportDocs(table, nil)}
 }
 
 func docImport(table string) func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
@@ -444,9 +463,11 @@ func docImport(table string) func(ctx context.Context, tx *sql.Tx, path string) 
 // TypedDocs — перенос map[ключ]V через тип V (его MarshalJSON): для
 // записей, которые на диске должны лежать иначе, чем в старом файле
 // (например, с зашифрованным токеном). Регистрирует пакет, знающий V.
-func TypedDocs[V any](file, table string, locked bool) Legacy {
+// plain — тело записи в том виде, в каком его читает старая сборка (для
+// отката): например, с открытым токеном вместо зашифрованного.
+func TypedDocs[V any](file, table string, locked bool, plain func(json.RawMessage) (json.RawMessage, error)) Legacy {
 	tab := NewTable[V](table)
-	return Legacy{File: file, Locked: locked, Import: func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+	imp := func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 		var m map[string]V
 		if ok, err := readJSON(path, &m); !ok {
 			return 0, err
@@ -457,7 +478,8 @@ func TypedDocs[V any](file, table string, locked bool) Legacy {
 			}
 		}
 		return len(m), nil
-	}}
+	}
+	return Legacy{File: file, Locked: locked, Import: imp, Replace: replacing(imp, []string{table}, nil), Export: exportDocs(table, plain)}
 }
 
 // liveSenders — черновики, которые старая сборка держит в отправке прямо
@@ -481,13 +503,18 @@ func liveSenders(dir string) string {
 	return strings.Join(ids, ", ")
 }
 
-// replacing — Replace для файла, который целиком описывает свои таблицы:
-// очистить их и перенести файл.
-func replacing(imp func(context.Context, *sql.Tx, string) (int, error), tables ...string) func(context.Context, *sql.Tx, string) (int, error) {
+// replacing — Replace для файла, который целиком описывает свои таблицы и
+// значения kv: очистить их и перенести файл.
+func replacing(imp func(context.Context, *sql.Tx, string) (int, error), tables, kvKeys []string) func(context.Context, *sql.Tx, string) (int, error) {
 	return func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 		for _, t := range tables {
 			// имена таблиц — из кода
 			if _, err := tx.ExecContext(ctx, "DELETE FROM "+t); err != nil {
+				return 0, err
+			}
+		}
+		for _, k := range kvKeys {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM kv WHERE key = ?", k); err != nil {
 				return 0, err
 			}
 		}
@@ -504,27 +531,37 @@ func unixOf(s string) int64 {
 }
 
 var builtinLegacy = []Legacy{
-	{File: "outbox.json", Locked: true, Import: importOutbox, Replace: replaceOutbox},
-	{File: "feeds", Dir: true, Import: importFeeds},
-	{File: "transcripts.json", Locked: true, Import: importTranscripts},
-	{File: "peers.json", Locked: true, Import: importPeers},
-	{File: "edit_dates.json", Import: importEditDates},
-	{File: "updates_state.json", Import: importUpdates},
-	{File: "routes.json", Import: importRoutes},
-	{File: "chat_sets.json", Import: importSets, Replace: replacing(importSets, "chat_sets", "chat_set_aliases", "chat_set_blocked")},
-	{File: "agent_folders.json", Locked: true, Import: importAgentFolders, Replace: replacing(importAgentFolders, "agent_folders")},
+	{File: "outbox.json", Locked: true, Import: importOutbox, Replace: replaceOutbox, Export: exportOutbox},
+	// ленты: устаревшие сочли бы новым всё, что пришло после переноса, —
+	// подписки разбудили бы агентов на уже отвеченное
+	{File: "feeds", Dir: true, Import: importFeeds, Replace: replacing(importFeeds, []string{"feed"}, nil), ExportDir: exportFeeds},
+	{File: "transcripts.json", Locked: true, Import: importTranscripts, Snapshot: true}, // кэш расшифровок
+	{File: "peers.json", Locked: true, Import: importPeers, Snapshot: true},             // кэш access_hash
+	{File: "edit_dates.json", Import: importEditDates, Export: exportEditDates,
+		Replace: replacing(importEditDates, []string{"edit_dates"}, []string{KeyEditsAlive})},
+	// отметка обновлений: устаревшая — getDifference заново принёс бы всё
+	// с переноса
+	{File: "updates_state.json", Import: importUpdates, Export: exportUpdates,
+		Replace: replacing(importUpdates, []string{"update_channels"}, []string{KeyUpdatesState})},
+	{File: "routes.json", Import: importRoutes, Export: exportRoutes, Replace: replacing(importRoutes, []string{"routes"}, nil)},
+	{File: "chat_sets.json", Import: importSets, Export: exportSets,
+		Replace: replacing(importSets, []string{"chat_sets", "chat_set_aliases", "chat_set_blocked"}, []string{KeySetsUpdated})},
+	{File: "agent_folders.json", Locked: true, Import: importAgentFolders, Export: exportAgentFolders,
+		Replace: replacing(importAgentFolders, []string{"agent_folders"}, nil)},
 	docFile("bot_ops.json", TBotOps),
 	docFile("pinned_drafts.json", TPinnedDrafts),
-	{File: "t3-threads.json", Locked: true, Import: docImport(TT3Threads)},
+	docLegacy("t3-threads.json", TT3Threads, true),
 	docFile("upstream_cards.json", TUpstreamCards),
-	{File: "account_notes.json", Locked: true, Import: importNotes, Replace: replacing(importNotes, TAccountNotes)},
-	{File: "upstream.json", Import: importUpstream},
+	{File: "account_notes.json", Locked: true, Import: importNotes, Export: exportNotes,
+		Replace: replacing(importNotes, []string{TAccountNotes}, nil)},
+	{File: "upstream.json", Import: importUpstream, Export: exportUpstream, Replace: replacing(importUpstream, []string{"upstream_sources"}, nil)},
 	kvFile("bot_offset.json", KeyBotOffset),
 	kvFile("upstream_thread.json", KeyUpstreamThread),
 	kvFile("account.json", KeyAccount),
 	// локи отправки до переезда: захват теперь в drafts. Живых здесь уже
 	// нет — пока они были, importOutbox откладывал перенос очереди
-	{File: "sending", Dir: true, Import: func(ctx context.Context, tx *sql.Tx, dir string) (int, error) {
+	// при откате — снимок: мёртвые локи старая сборка снимет сама
+	{File: "sending", Dir: true, Snapshot: true, Import: func(ctx context.Context, tx *sql.Tx, dir string) (int, error) {
 		if who := liveSenders(dir); who != "" {
 			return 0, fmt.Errorf("%w: старая сборка ещё отправляет черновик %s", ErrRetry, who)
 		}
