@@ -14,6 +14,7 @@ import (
 	"tgagent/internal/config"
 	"tgagent/internal/outbox"
 	"tgagent/internal/tgc"
+	"tgagent/internal/store"
 	"tgagent/internal/wincred"
 )
 
@@ -242,5 +243,34 @@ func TestDraftBotOpChecks(t *testing.T) {
 	ro := &config.Settings{Chats: map[string]config.ChatRule{"bf": {Alias: "bf", Peer: "@BotFather", Read: true}}, ChatOrder: []string{"bf"}}
 	if _, err := botFatherRule(ro); err == nil {
 		t.Error("BotFather без отправки принят")
+	}
+}
+
+// Пустой bot_tokens.json при повторном переносе (после tg rollback) —
+// испорченный: сведения о ботах в базе остаются.
+func TestVaultReimportEmptyKeepsBots(t *testing.T) {
+	botTestEnv(t)
+	dir := config.DataPath()
+	legacy := filepath.Join(dir, "bot_tokens.json")
+	os.WriteFile(legacy, []byte(`{"old_bot":{"username":"@old_bot","bot_id":"1","token":"`+liveTok+`"}}`), 0o600)
+	if _, ok := VaultToken("@old_bot"); !ok {
+		t.Fatal("не перенесён")
+	}
+	if _, err := store.ExportLegacy(dir); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(legacy, nil, 0o600)
+	if err := store.ClearRollback(dir); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := VaultToken("@old_bot"); !ok {
+		t.Fatal("сведения о боте стёрты пустым файлом")
 	}
 }

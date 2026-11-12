@@ -383,12 +383,7 @@ func init() {
 	// откат: сведения о ботах — из базы (токены старая сборка с
 	// диспетчером берёт из него же), повторный перенос — файл главнее
 	base := store.Legacy{File: "bot_tokens.json", Import: importVault}
-	base.Replace = func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM "+store.TBots); err != nil {
-			return 0, err
-		}
-		return importVault(ctx, tx, path)
-	}
+	base.Replace = store.Replacing(importVault, []string{store.TBots}, nil)
 	base.Export = store.ExportDocs(store.TBots)
 	store.RegisterLegacy(base)
 }

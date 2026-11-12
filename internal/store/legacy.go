@@ -444,7 +444,7 @@ func kvFile(file, key string) Legacy {
 		}
 		return 1, insertKV(ctx, tx, key, raw)
 	}
-	return Legacy{File: file, Import: imp, Replace: replacing(imp, nil, []string{key}), Export: exportKV(key)}
+	return Legacy{File: file, Import: imp, Replace: Replacing(imp, nil, []string{key}), Export: exportKV(key)}
 }
 
 func docFile(file, table string) Legacy {
@@ -453,7 +453,7 @@ func docFile(file, table string) Legacy {
 
 func docLegacy(file, table string, locked bool) Legacy {
 	imp := docImport(table)
-	return Legacy{File: file, Locked: locked, Import: imp, Replace: replacing(imp, []string{table}, nil), Export: exportDocs(table, nil)}
+	return Legacy{File: file, Locked: locked, Import: imp, Replace: Replacing(imp, []string{table}, nil), Export: exportDocs(table, nil)}
 }
 
 func docImport(table string) func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
@@ -481,7 +481,7 @@ func TypedDocs[V any](file, table string, locked bool, plain func(json.RawMessag
 		}
 		return len(m), nil
 	}
-	return Legacy{File: file, Locked: locked, Import: imp, Replace: replacing(imp, []string{table}, nil), Export: exportDocs(table, plain)}
+	return Legacy{File: file, Locked: locked, Import: imp, Replace: Replacing(imp, []string{table}, nil), Export: exportDocs(table, plain)}
 }
 
 // liveSenders — черновики, которые старая сборка держит в отправке прямо
@@ -505,9 +505,10 @@ func liveSenders(dir string) string {
 	return strings.Join(ids, ", ")
 }
 
-// replacing — Replace для файла, который целиком описывает свои таблицы и
-// значения kv: очистить их и перенести файл.
-func replacing(imp func(context.Context, *sql.Tx, string) (int, error), tables, kvKeys []string) func(context.Context, *sql.Tx, string) (int, error) {
+// Replacing — Replace для файла, который целиком описывает свои таблицы и
+// значения kv: очистить их и перенести файл (imp). Пустой файл — испорченный, а не «пустой набор»: таблиц не
+// очищает. Свой Replace в другом пакете — через него же.
+func Replacing(imp func(context.Context, *sql.Tx, string) (int, error), tables, kvKeys []string) func(context.Context, *sql.Tx, string) (int, error) {
 	return func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 		// пустой файл — не «пустой набор» (его выгрузка пишет как {} или []):
 		// очистить по нему таблицы значило бы потерять их
@@ -547,27 +548,27 @@ var builtinLegacy = []Legacy{
 	{File: "outbox.json", Locked: true, Import: importOutbox, Replace: replaceOutbox, Export: exportOutbox},
 	// ленты: устаревшие сочли бы новым всё, что пришло после переноса, —
 	// подписки разбудили бы агентов на уже отвеченное
-	{File: "feeds", Dir: true, Import: importFeeds, Replace: replacing(importFeeds, []string{"feed"}, nil), ExportDir: exportFeeds},
+	{File: "feeds", Dir: true, Import: importFeeds, Replace: Replacing(importFeeds, []string{"feed"}, nil), ExportDir: exportFeeds},
 	{File: "transcripts.json", Locked: true, Import: importTranscripts, Snapshot: true}, // кэш расшифровок
 	{File: "peers.json", Locked: true, Import: importPeers, Snapshot: true},             // кэш access_hash
 	{File: "edit_dates.json", Import: importEditDates, Export: exportEditDates,
-		Replace: replacing(importEditDates, []string{"edit_dates"}, []string{KeyEditsAlive})},
+		Replace: Replacing(importEditDates, []string{"edit_dates"}, []string{KeyEditsAlive})},
 	// отметка обновлений: устаревшая — getDifference заново принёс бы всё
 	// с переноса
 	{File: "updates_state.json", Import: importUpdates, Export: exportUpdates,
-		Replace: replacing(importUpdates, []string{"update_channels"}, []string{KeyUpdatesState})},
-	{File: "routes.json", Import: importRoutes, Export: exportRoutes, Replace: replacing(importRoutes, []string{"routes"}, nil)},
+		Replace: Replacing(importUpdates, []string{"update_channels"}, []string{KeyUpdatesState})},
+	{File: "routes.json", Import: importRoutes, Export: exportRoutes, Replace: Replacing(importRoutes, []string{"routes"}, nil)},
 	{File: "chat_sets.json", Import: importSets, Export: exportSets,
-		Replace: replacing(importSets, []string{"chat_sets", "chat_set_aliases", "chat_set_blocked"}, []string{KeySetsUpdated})},
+		Replace: Replacing(importSets, []string{"chat_sets", "chat_set_aliases", "chat_set_blocked"}, []string{KeySetsUpdated})},
 	{File: "agent_folders.json", Locked: true, Import: importAgentFolders, Export: exportAgentFolders,
-		Replace: replacing(importAgentFolders, []string{"agent_folders"}, nil)},
+		Replace: Replacing(importAgentFolders, []string{"agent_folders"}, nil)},
 	docFile("bot_ops.json", TBotOps),
 	docFile("pinned_drafts.json", TPinnedDrafts),
 	docLegacy("t3-threads.json", TT3Threads, true),
 	docFile("upstream_cards.json", TUpstreamCards),
 	{File: "account_notes.json", Locked: true, Import: importNotes, Export: exportNotes,
-		Replace: replacing(importNotes, []string{TAccountNotes}, nil)},
-	{File: "upstream.json", Import: importUpstream, Export: exportUpstream, Replace: replacing(importUpstream, []string{"upstream_sources"}, nil)},
+		Replace: Replacing(importNotes, []string{TAccountNotes}, nil)},
+	{File: "upstream.json", Import: importUpstream, Export: exportUpstream, Replace: Replacing(importUpstream, []string{"upstream_sources"}, nil)},
 	kvFile("bot_offset.json", KeyBotOffset),
 	kvFile("upstream_thread.json", KeyUpstreamThread),
 	kvFile("account.json", KeyAccount),

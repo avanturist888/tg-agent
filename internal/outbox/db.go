@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -211,14 +212,20 @@ func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
 		}
 		// старые решённые — за пределами keep новейших
 		// кроме тех, чей итог ещё не показан в карточке (CardDue, ждущий
-		// итог в card_states): без черновика уборка его уже не покажет
-		_, err := tx.ExecContext(ctx, `DELETE FROM drafts WHERE status IN (?, ?, ?) AND sender_pid IS NULL AND seq <=
+		// итог в card_states), и тех, у кого есть квитанция ушедшего
+		// (sent-unsaved): без черновика уборка их уже не покажет и не допишет
+		unsaved, err := unsavedIDs(o.Dir)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM drafts WHERE status IN (?, ?, ?) AND sender_pid IS NULL AND seq <=
 			(SELECT seq FROM drafts ORDER BY seq DESC LIMIT 1 OFFSET ?)
 			AND coalesce(json_extract(body, '$.card_due'), 0) = 0
 			AND NOT EXISTS (SELECT 1 FROM `+store.TCardStates+` c WHERE c.key = drafts.id
 				AND coalesce(json_extract(c.body, '$.shown'), 0) = 0
 				AND coalesce(json_extract(c.body, '$.status'), '') != ''
-				AND json_extract(c.body, '$.status') NOT LIKE '⏳%')`, Sent, Cancelled, Expired, keep)
+				AND json_extract(c.body, '$.status') NOT LIKE '⏳%')
+			AND id NOT IN (SELECT value FROM json_each(?))`, Sent, Cancelled, Expired, keep, unsaved)
 		return err
 	})
 	if err != nil {
@@ -516,6 +523,22 @@ func (c *Claim) Release() {
 	if err != nil {
 		_ = audit.Log(auditPath(c.o.Dir), "send_release_failed", "draft_id", c.ID, "error", err.Error())
 	}
+}
+
+// unsavedIDs — черновики с квитанцией ушедшего (data/sent-unsaved/<id>),
+// JSON-массивом для json_each. Каталог не прочитался — ошибка: удалить
+// вслепую значило бы потерять отметку отправки.
+func unsavedIDs(dir string) (string, error) {
+	ids := []string{}
+	entries, err := os.ReadDir(filepath.Join(dir, store.UnsavedDir))
+	if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	for _, e := range entries {
+		ids = append(ids, e.Name())
+	}
+	raw, err := json.Marshal(ids)
+	return string(raw), err
 }
 
 func auditPath(dir string) string { return dir + string(os.PathSeparator) + "audit.jsonl" }

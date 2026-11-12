@@ -1370,6 +1370,9 @@ func finishUnsaved(ctx context.Context, s *config.Settings) {
 		d, err := box.Get(id)
 		var nf *outbox.NotFound
 		if errors.As(err, &nf) {
+			// уборка очереди такие не выбрасывает — черновика нет, только
+			// если его убрал перенос файла старой сборки: дописать некуда
+			_ = audit.Log(s.AuditPath(), "sent_unsaved_orphan", "draft_id", id, "message_id", v.MessageID)
 			_ = os.Remove(unsavedPath(s, id))
 			continue
 		}

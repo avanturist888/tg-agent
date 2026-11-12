@@ -239,3 +239,35 @@ func TestPruneKeepsUnshownCards(t *testing.T) {
 		t.Fatal("показанный итог не убран — проверка ничего не проверяет")
 	}
 }
+
+// Уборка не выбрасывает черновик с квитанцией ушедшего (sent-unsaved): без
+// него служба не допишет отметку отправки.
+func TestPruneKeepsUnsavedReceipt(t *testing.T) {
+	dir := t.TempDir()
+	o := New(dir)
+	d, err := o.Create(CreateOpts{Chat: "c", Text: "ушло", TTLMin: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.Cancel(d.ID, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, store.UnsavedDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, store.UnsavedDir, d.ID), []byte(`{"message_id": 5}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range keep + 5 {
+		x, err := o.Create(CreateOpts{Chat: "c", Text: "x", TTLMin: 60})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := o.Cancel(x.ID, "t"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := o.Get(d.ID); err != nil {
+		t.Fatalf("черновик с квитанцией выброшен: %v", err)
+	}
+}
