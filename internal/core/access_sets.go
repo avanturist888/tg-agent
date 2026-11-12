@@ -173,29 +173,32 @@ func maxFolderSample(ctx context.Context, s *config.Settings, r *accessRequest, 
 }
 
 func tgFolderSample(ctx context.Context, s *config.Settings, r *accessRequest, folder string) error {
-	return tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "request_access"}, func(ctx context.Context, c *tgc.Conn) error {
-		folders, err := c.Folders(ctx)
-		if err != nil {
-			return err
-		}
-		f, ok := findTGFolder(folders, folder, "")
-		if !ok {
-			f, ok = findTGFolder(folders, "", folder)
-		}
-		if !ok {
-			var names []string
-			for _, f := range folders {
-				names = append(names, fmt.Sprintf("%d «%s»", f.ID, f.Title))
+	return watchFolders(ctx, s, func(see func([]tgc.Folder) *agentBook) error {
+		return tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "request_access"}, func(ctx context.Context, c *tgc.Conn) error {
+			folders, err := c.Folders(ctx)
+			if err != nil {
+				return err
 			}
-			return &Bad{Msg: fmt.Sprintf("Папки «%s» нет. Есть: %s.", folder, strings.Join(names, ", "))}
-		}
-		r.Folder, r.Title = fmt.Sprint(f.ID), f.Title
-		page, err := c.Dialogs(ctx)
-		if err != nil {
-			return err
-		}
-		sample(r, c.FolderRows(page, f))
-		return nil
+			see(folders)
+			f, ok := findTGFolder(folders, folder, "")
+			if !ok {
+				f, ok = findTGFolder(folders, "", folder)
+			}
+			if !ok {
+				var names []string
+				for _, f := range folders {
+					names = append(names, fmt.Sprintf("%d «%s»", f.ID, f.Title))
+				}
+				return &Bad{Msg: fmt.Sprintf("Папки «%s» нет. Есть: %s.", folder, strings.Join(names, ", "))}
+			}
+			r.Folder, r.Title = fmt.Sprint(f.ID), f.Title
+			page, err := c.Dialogs(ctx)
+			if err != nil {
+				return err
+			}
+			sample(r, c.FolderRows(page, f))
+			return nil
+		})
 	})
 }
 
