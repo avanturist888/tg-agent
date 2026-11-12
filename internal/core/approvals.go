@@ -189,6 +189,13 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 			result = omap.New().Set("sent", true).Set("message_id", *d.MessageID)
 		}
 	}
+	if result == nil && errors.Is(ctx.Err(), context.Canceled) {
+		// оборвали снаружи (служба останавливается), а не сорвалась отправка:
+		// черновик остаётся одобренным без ошибки — его дошлёт следующая
+		// досылка (recoverApproved), а не похоронит отметка SendError
+		_ = audit.Log(s.AuditPath(), "send_interrupted", "draft_id", draftID, "by", by, "error", errMsg)
+		return ""
+	}
 	if result == nil {
 		if errMsg == "" {
 			errMsg = "неизвестная ошибка"
@@ -656,11 +663,24 @@ func recoverApproved(ctx context.Context, s *config.Settings, cutoff time.Time, 
 		if !approvedBefore(d, cutoff) {
 			continue
 		}
+		if ctx.Err() != nil {
+			return // служба останавливается: остальные — следующему проходу
+		}
 		_ = audit.Log(s.AuditPath(), "recover_interrupted", "draft_id", d.ID, "chat", d.Chat, "why", why)
-		summary := deliver(ctx, s, d.ID, by+" ("+why+")")
-		card(ctx, s, d.BotMessageID, d, summary)
+		// у каждого черновика свой срок: долгий сбой одного не съедает время
+		// остальных (тогда они получили бы ошибку без попытки отправить)
+		dctx, cancel := context.WithTimeout(ctx, recoverBudget)
+		summary := deliver(dctx, s, d.ID, by+" ("+why+")")
+		cancel()
+		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute) // итог в карточку — и после остановки
+		card(cctx, s, d.BotMessageID, d, summary)
+		ccancel()
 	}
 }
+
+// recoverBudget — на досылку одного черновика: три попытки с паузами по 15 с
+// и сама отправка (файлы могут грузиться долго).
+const recoverBudget = 5 * time.Minute
 
 // processStarted — когда запущен этот процесс: черновики, одобренные позже,
 // не «прерваны прошлой службой».

@@ -101,9 +101,10 @@ func maybeSweep(ctx context.Context, s *config.Settings, last *time.Time) {
 	*last = time.Now()
 	go func() {
 		defer sweeping.Store(false)
+		// досылка — со сроком на каждый черновик и до остановки службы
+		recoverApproved(ctx, s, time.Now().Add(-recoverOrphansAfter), "дослано: одобривший процесс не отправил")
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 		defer cancel()
-		recoverApproved(cctx, s, time.Now().Add(-recoverOrphansAfter), "дослано: одобривший процесс не отправил")
 		if s.BotReady() {
 			sweepPins(cctx, s)
 			publishOrphanAccess(cctx, s)

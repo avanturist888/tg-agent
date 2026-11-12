@@ -21,12 +21,24 @@ import (
 func cmdCutover(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("cutover", flag.ContinueOnError)
 	wait := fs.Duration("wait", time.Minute, "сколько ждать, пока процессы прежних сборок закончат сами")
+	revoke := fs.Bool("revoke", false, "только снять отметки (build.ps1 — до замены exe)")
 	if _, err := parse(fs, args); err != nil {
 		return 2
 	}
 	var dirs []string
 	for _, acct := range config.Accounts() {
 		dirs = append(dirs, filepath.Join(config.HomeOf(acct), "data"))
+	}
+	if *revoke {
+		// новая сборка вот-вот появится в bin, а процессы прежней ещё живы:
+		// разрешение прошлого обновления не должно пустить перенос раньше,
+		// чем этот cutover их дождётся
+		for _, d := range dirs {
+			if err := store.RevokeCutover(d); err != nil {
+				return fail(fmt.Errorf("%s: отметка обновления не снялась: %w", d, err))
+			}
+		}
+		return 0
 	}
 	c := cutover{bin: filepath.Join(config.Root, "bin"), dirs: dirs, wait: *wait, out: os.Stdout,
 		list: procs.List, terminate: procs.Terminate, sleep: sleepCtx}

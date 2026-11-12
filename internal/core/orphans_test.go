@@ -97,3 +97,34 @@ func TestRecoverOrphanApproved(t *testing.T) {
 		t.Fatalf("повторная досылка сорвавшегося: %s", raw)
 	}
 }
+
+// Досылку оборвала остановка службы — это не сбой отправки: черновик
+// остаётся одобренным без ошибки, его дошлёт следующий проход.
+func TestRecoverCancelledNotFailed(t *testing.T) {
+	s := watchEnv(t)
+	s.SendPolicy = "bot_approval"
+	box := outbox.New(s.DataDir())
+	d, err := box.Create(outbox.CreateOpts{Chat: "closed-chat", Text: "раз", TTLMin: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = box.Approve(d.ID, "auto_send"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := deliver(ctx, s, d.ID, "test"); got != "" {
+		t.Fatalf("итог при обрыве: %q", got)
+	}
+	if got, _ := box.Get(d.ID); got.SendError != nil || got.Status != outbox.Approved {
+		t.Fatalf("обрыв записан ошибкой: %+v", got)
+	}
+	if raw, _ := os.ReadFile(s.AuditPath()); !strings.Contains(string(raw), "send_interrupted") {
+		t.Fatal("в аудите нет обрыва")
+	}
+	// остановка службы — проход не берёт следующие черновики
+	recoverApproved(ctx, s, time.Now().Add(time.Hour), "test")
+	if raw, _ := os.ReadFile(s.AuditPath()); strings.Contains(string(raw), "recover_interrupted") {
+		t.Fatal("досылка пошла после остановки")
+	}
+}

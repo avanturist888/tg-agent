@@ -451,6 +451,28 @@ func TestLegacyWaitsCutover(t *testing.T) {
 	if strings.Count(string(audit), "legacy_import_waiting") != 1 {
 		t.Fatalf("audit: %s", audit)
 	}
+	// всё перенесено — отметка снята: старый файл, вернувшийся потом (откат),
+	// снова ждёт нового tg cutover
+	if _, err := os.Stat(filepath.Join(dir, CutoverFile)); !os.IsNotExist(err) {
+		t.Fatal("отметка пережила перенос")
+	}
+	write(t, filepath.Join(dir, "upstream_cards.json"), `{"s2": {"n": 2}}`)
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, db, "SELECT count(*) FROM upstream_cards"); n != 1 || db.LegacyBlocked() == "" {
+		t.Fatalf("вернувшийся файл перенесён без нового cutover: строк %d", n)
+	}
+	// снятие отметки до замены exe (build.ps1)
+	if err := MarkCutover(dir, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RevokeCutover(dir); err != nil || RevokeCutover(dir) != nil {
+		t.Fatalf("RevokeCutover: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, CutoverFile)); !os.IsNotExist(err) {
+		t.Fatal("отметка не снята")
+	}
 }
 
 // Заметки к аккаунту в снова появившемся файле сливаются по id, а не

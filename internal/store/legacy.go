@@ -132,6 +132,7 @@ func (db *DB) ImportLegacy() error {
 	if len(present) == 0 {
 		db.pending.Store(false)
 		db.setBlocked("")
+		consumeCutover(db.Dir)
 		return nil // переносить нечего — лок не нужен
 	}
 	if RequireCutover {
@@ -161,6 +162,26 @@ func (db *DB) ImportLegacy() error {
 		return nil
 	}
 	db.pending.Store(pending)
+	if err == nil && len(LegacyPresent(db.Dir)) == 0 {
+		consumeCutover(db.Dir)
+	}
+	return err
+}
+
+// consumeCutover — всё перенесено: отметка своё отслужила. Она разрешала
+// перенос только того, что лежало при этом обновлении: старые файлы,
+// вернувшиеся потом (откат на старую сборку), снова ждут tg cutover.
+func consumeCutover(dir string) {
+	_ = os.Remove(filepath.Join(dir, CutoverFile))
+}
+
+// RevokeCutover — снять отметку (build.ps1 — до замены exe: пока службы
+// не остановлены и прежние процессы не дождались, переносить нельзя).
+func RevokeCutover(dir string) error {
+	err := os.Remove(filepath.Join(dir, CutoverFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	return err
 }
 
