@@ -64,6 +64,19 @@ type Message struct {
 type Store struct {
 	db *sql.DB
 	mu sync.Mutex
+	// owed — отложенное, которое уже застало своё сообщение, применить не
+	// вышло (ошибка базы): следующая запись попробует снова (settle)
+	owed bool
+	// unsaved — изменения, которые не удалось даже положить в pending:
+	// держатся в памяти, пока settle их не запишет
+	unsaved []pendingChange
+}
+
+type pendingChange struct {
+	chat                      int64
+	waID, kind, sender, value string
+	raw                       []byte
+	at                        time.Time
 }
 
 const schema = `
@@ -138,7 +151,9 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("wac: база сообщений %s: %w", path, err)
 	}
-	return &Store{db: db}, nil
+	st := &Store{db: db}
+	st.settleAll(context.Background()) // прошлый процесс мог не успеть
+	return st, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -229,13 +244,15 @@ func (s *Store) merge(ctx context.Context, other, into int64) error {
 			q    string
 			args []any
 		}{
-			// правка новее — с той строки
-			{`UPDATE messages SET text = o.text, text_lc = o.text_lc, raw = o.raw, edited = o.edited
-				FROM (SELECT text, text_lc, raw, edited FROM messages WHERE id = ?) o WHERE messages.id = ? AND o.edited > messages.edited`,
-				[]any{d.drop, d.keep}},
-			// удалено в любой из строк — удалено
-			{`UPDATE messages SET deleted = 1, text = '', text_lc = '', raw = NULL WHERE id = ? AND (SELECT deleted FROM messages WHERE id = ?) = 1`,
+			// удалено в любой из строк — удалено (и правка его не вернёт)
+			{`UPDATE messages SET deleted = 1, text = '', text_lc = '', raw = NULL
+				WHERE id = ? AND (deleted = 1 OR (SELECT deleted FROM messages WHERE id = ?) = 1)`,
 				[]any{d.keep, d.drop}},
+			// правка новее — с той строки, если сообщение не удалено
+			{`UPDATE messages SET text = o.text, text_lc = o.text_lc, raw = o.raw, edited = o.edited
+				FROM (SELECT text, text_lc, raw, edited FROM messages WHERE id = ?) o
+				WHERE messages.id = ? AND messages.deleted = 0 AND o.edited > messages.edited`,
+				[]any{d.drop, d.keep}},
 			// реакции — на остающуюся, по автору новейшая (снятые тоже)
 			{`INSERT INTO reactions(msg, sender, emoji, ts) SELECT ?, sender, emoji, ts FROM reactions WHERE msg = ? AND true
 				ON CONFLICT(msg, sender) DO UPDATE SET emoji = excluded.emoji, ts = excluded.ts WHERE excluded.ts >= reactions.ts`,
@@ -271,22 +288,85 @@ func (s *Store) merge(ctx context.Context, other, into int64) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// отложенное, чьё сообщение было во втором чате, теперь застаёт его
-	var ready []string
-	prow, err := s.db.QueryContext(ctx, `SELECT DISTINCT p.wa_id FROM pending p JOIN messages m ON m.chat = p.chat AND m.wa_id = p.wa_id WHERE p.chat = ?`, into)
-	if err == nil {
-		for prow.Next() {
-			var w string
-			if prow.Scan(&w) == nil {
-				ready = append(ready, w)
-			}
+	// отложенное, чьё сообщение было во втором чате, теперь застаёт его;
+	// не вышло — повторит следующая запись (owed), прервали — открытие базы
+	s.settleAll(ctx)
+	return nil
+}
+
+// settleAll — применить всё готовое отложенное; не вышло — запомнить долг.
+func (s *Store) settleAll(ctx context.Context) {
+	// в pending — только начало очереди до первой неудачи: иначе более
+	// позднее изменение применилось бы раньше застрявшего
+	n := 0
+	for _, c := range s.unsaved {
+		chat, err := s.resolve(ctx, c.chat) // чат мог слиться, пока изменение ждало
+		if err == nil {
+			c.chat = chat
+			err = s.insertPending(ctx, c)
 		}
-		prow.Close()
+		if err != nil {
+			break
+		}
+		n++
 	}
-	for _, w := range ready {
-		s.applyPending(ctx, into, w)
+	s.unsaved = s.unsaved[n:]
+	if len(s.unsaved) == 0 {
+		s.unsaved = nil
+	}
+	s.owed = s.drainReady(ctx) != nil || len(s.unsaved) > 0
+}
+
+// settle — вернуть долг прошлой неудачной попытки, если он есть.
+func (s *Store) settle(ctx context.Context) {
+	if s.owed {
+		s.settleAll(ctx)
+	}
+}
+
+// drainReady — применить всё отложенное, чьё сообщение уже есть.
+func (s *Store) drainReady(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT p.chat, p.wa_id FROM pending p JOIN messages m ON m.chat = p.chat AND m.wa_id = p.wa_id`)
+	if err != nil {
+		return err
+	}
+	type key struct {
+		chat int64
+		wa   string
+	}
+	var ready []key
+	for rows.Next() {
+		var k key
+		if err := rows.Scan(&k.chat, &k.wa); err != nil {
+			rows.Close()
+			return err
+		}
+		ready = append(ready, k)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err // обход оборвался — долг не снимать
+	}
+	for _, k := range ready {
+		if err := s.applyPending(ctx, k.chat, k.wa); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// resolve — как Resolve, но ошибка базы — ошибка, а не «не слит».
+func (s *Store) resolve(ctx context.Context, id int64) (int64, error) {
+	var into int64
+	switch err := s.db.QueryRowContext(ctx, `SELECT into_id FROM merged WHERE old = ?`, id).Scan(&into); {
+	case err == nil:
+		return into, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return id, nil
+	default:
+		return 0, err
+	}
 }
 
 // Resolve — рабочий номер чата: слитый ведёт на тот, с которым слит.
@@ -303,11 +383,15 @@ func (s *Store) SetChatName(ctx context.Context, chat int64, name string) {
 	if strings.TrimSpace(name) == "" {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, _ = s.db.ExecContext(ctx, `UPDATE chats SET name = ? WHERE id = ?`, name, s.Resolve(ctx, chat))
 }
 
 // SetUnread — непрочитанные чата (из истории при входе, 0 — прочитал владелец).
 func (s *Store) SetUnread(ctx context.Context, chat int64, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, _ = s.db.ExecContext(ctx, `UPDATE chats SET unread = ? WHERE id = ?`, n, s.Resolve(ctx, chat))
 }
 
@@ -363,6 +447,7 @@ func (s *Store) Chats(ctx context.Context) ([]Chat, error) {
 func (s *Store) Put(ctx context.Context, m *Message) (int64, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.settle(ctx)
 	m.Chat = s.Resolve(ctx, m.Chat) // номер мог слиться, пока его несли сюда
 	res, err := s.db.ExecContext(ctx, `INSERT INTO messages(chat, wa_id, sender, from_me, ts, text, text_lc, kind, raw, reply_to, push_name, forward, live)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat, wa_id) DO NOTHING`,
@@ -375,7 +460,9 @@ func (s *Store) Put(ctx context.Context, m *Message) (int64, bool, error) {
 		var id int64
 		err := s.db.QueryRowContext(ctx, `SELECT id FROM messages WHERE chat = ? AND wa_id = ?`, m.Chat, m.WAID).Scan(&id)
 		m.ID = id
-		s.applyPending(ctx, m.Chat, m.WAID)
+		if s.applyPending(ctx, m.Chat, m.WAID) != nil {
+			s.owed = true
+		}
 		return id, false, err
 	}
 	id, err := res.LastInsertId()
@@ -392,28 +479,46 @@ func (s *Store) Put(ctx context.Context, m *Message) (int64, bool, error) {
 	default:
 		_, err = s.db.ExecContext(ctx, `UPDATE chats SET last_ts = max(last_ts, ?) WHERE id = ?`, m.Time.UnixMilli(), m.Chat)
 	}
-	s.applyPending(ctx, m.Chat, m.WAID)
+	if s.applyPending(ctx, m.Chat, m.WAID) != nil {
+		s.owed = true
+	}
 	return id, true, err
 }
 
-func (s *Store) msgID(ctx context.Context, chat int64, waID string) int64 {
+// msgID — номер сообщения; 0 и nil — его ещё нет.
+func (s *Store) msgID(ctx context.Context, chat int64, waID string) (int64, error) {
 	var id int64
-	_ = s.db.QueryRowContext(ctx, `SELECT id FROM messages WHERE chat = ? AND wa_id = ?`, chat, waID).Scan(&id)
-	return id
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM messages WHERE chat = ? AND wa_id = ?`, chat, waID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return id, err
 }
 
-func (s *Store) defer_(ctx context.Context, chat int64, waID, kind, sender, value string, raw []byte, at time.Time) {
-	_, _ = s.db.ExecContext(ctx, `INSERT INTO pending(chat, wa_id, kind, sender, value, raw, ts) VALUES(?, ?, ?, ?, ?, ?, ?)`,
-		chat, waID, kind, sender, value, raw, at.UnixMilli())
+// defer_ — положить изменение в pending; не вышло — в память до settle.
+func (s *Store) defer_(ctx context.Context, c pendingChange) {
+	if s.insertPending(ctx, c) != nil {
+		s.unsaved = append(s.unsaved, c)
+		s.owed = true
+	}
 }
 
-// applyPending — отложенные изменения сообщения, которое только что появилось.
-func (s *Store) applyPending(ctx context.Context, chat int64, waID string) {
-	rows, err := s.db.QueryContext(ctx, `SELECT kind, sender, value, raw, ts FROM pending WHERE chat = ? AND wa_id = ? ORDER BY ts`, chat, waID)
+func (s *Store) insertPending(ctx context.Context, c pendingChange) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO pending(chat, wa_id, kind, sender, value, raw, ts) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+		c.chat, c.waID, c.kind, c.sender, c.value, c.raw, c.at.UnixMilli())
+	return err
+}
+
+// applyPending — отложенные изменения сообщения, которое только что
+// появилось. Строка отложенного удаляется только после того, как изменение
+// записано: прервали посередине — остаток применит следующий раз.
+func (s *Store) applyPending(ctx context.Context, chat int64, waID string) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT rowid, kind, sender, value, raw, ts FROM pending WHERE chat = ? AND wa_id = ? ORDER BY ts, rowid`, chat, waID)
 	if err != nil {
-		return
+		return err
 	}
 	type change struct {
+		rowid               int64
 		kind, sender, value string
 		raw                 []byte
 		ts                  int64
@@ -421,88 +526,151 @@ func (s *Store) applyPending(ctx context.Context, chat int64, waID string) {
 	var list []change
 	for rows.Next() {
 		var c change
-		if rows.Scan(&c.kind, &c.sender, &c.value, &c.raw, &c.ts) == nil {
-			list = append(list, c)
+		if err := rows.Scan(&c.rowid, &c.kind, &c.sender, &c.value, &c.raw, &c.ts); err != nil {
+			rows.Close()
+			return err
 		}
+		list = append(list, c)
 	}
+	err = rows.Err()
 	rows.Close()
-	if len(list) == 0 {
-		return
+	if err != nil || len(list) == 0 {
+		return err
 	}
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM pending WHERE chat = ? AND wa_id = ?`, chat, waID)
+	var id int64
+	switch err := s.db.QueryRowContext(ctx, `SELECT id FROM messages WHERE chat = ? AND wa_id = ?`, chat, waID).Scan(&id); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil // сообщения нет — ждать его
+	case err != nil:
+		return err
+	}
 	for _, c := range list {
-		at := time.UnixMilli(c.ts)
-		switch c.kind {
-		case "edit":
-			s.edit(ctx, chat, waID, c.value, c.raw, at)
-		case "delete":
-			s.delete(ctx, chat, waID, at)
-		case "react":
-			s.react(ctx, chat, waID, c.sender, c.value, at)
+		// изменение и снятие его из pending — одной транзакцией: иначе
+		// повтор применил бы его снова поверх более позднего
+		err := func() error {
+			tx, err := s.db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			pc := pendingChange{kind: c.kind, sender: c.sender, value: c.value, raw: c.raw, at: time.UnixMilli(c.ts)}
+			if err := applyChange(ctx, tx, id, pc); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM pending WHERE rowid = ?`, c.rowid); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}()
+		if err != nil {
+			return fmt.Errorf("wac: отложенное изменение %s: %w", c.kind, err)
 		}
 	}
+	return nil
+}
+
+func applyChange(ctx context.Context, db execer, id int64, c pendingChange) error {
+	switch c.kind {
+	case "edit":
+		return applyEdit(ctx, db, id, c.value, c.raw, c.at.UnixMilli())
+	case "delete":
+		return applyDelete(ctx, db, id)
+	case "react":
+		return applyReact(ctx, db, id, c.sender, c.value, c.at.UnixMilli())
+	}
+	return fmt.Errorf("wac: неизвестное изменение %q", c.kind)
+}
+
+// execer — база или транзакция.
+type execer interface {
+	ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error)
+}
+
+func applyEdit(ctx context.Context, db execer, id int64, text string, raw []byte, ts int64) error {
+	var err error
+	if raw != nil {
+		_, err = db.ExecContext(ctx, `UPDATE messages SET text = ?, text_lc = ?, raw = ?, edited = ? WHERE id = ? AND edited <= ? AND deleted = 0`,
+			text, strings.ToLower(text), raw, ts, id, ts)
+	} else {
+		_, err = db.ExecContext(ctx, `UPDATE messages SET text = ?, text_lc = ?, edited = ? WHERE id = ? AND edited <= ? AND deleted = 0`,
+			text, strings.ToLower(text), ts, id, ts)
+	}
+	return err
+}
+
+func applyDelete(ctx context.Context, db execer, id int64) error {
+	_, err := db.ExecContext(ctx, `UPDATE messages SET deleted = 1, text = '', text_lc = '', raw = NULL WHERE id = ?`, id)
+	return err
+}
+
+func applyReact(ctx context.Context, db execer, id int64, sender, emoji string, ts int64) error {
+	_, err := db.ExecContext(ctx, `INSERT INTO reactions(msg, sender, emoji, ts) VALUES(?, ?, ?, ?)
+		ON CONFLICT(msg, sender) DO UPDATE SET emoji = excluded.emoji, ts = excluded.ts WHERE excluded.ts >= reactions.ts`,
+		id, sender, emoji, ts)
+	return err
 }
 
 // Edit — новый текст сообщения; номер сообщения (0 — его ещё нет: правка
 // отложена до него). Правка старше уже применённой не применяется.
 func (s *Store) Edit(ctx context.Context, chat int64, waID, text string, raw []byte, at time.Time) int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.edit(ctx, s.Resolve(ctx, chat), waID, text, raw, at)
-}
-
-func (s *Store) edit(ctx context.Context, chat int64, waID, text string, raw []byte, at time.Time) int64 {
-	id := s.msgID(ctx, chat, waID)
-	if id == 0 {
-		s.defer_(ctx, chat, waID, "edit", "", text, raw, at)
-		return 0
-	}
-	if raw != nil {
-		_, _ = s.db.ExecContext(ctx, `UPDATE messages SET text = ?, text_lc = ?, raw = ?, edited = ? WHERE id = ? AND edited <= ? AND deleted = 0`,
-			text, strings.ToLower(text), raw, at.UnixMilli(), id, at.UnixMilli())
-	} else {
-		_, _ = s.db.ExecContext(ctx, `UPDATE messages SET text = ?, text_lc = ?, edited = ? WHERE id = ? AND edited <= ? AND deleted = 0`,
-			text, strings.ToLower(text), at.UnixMilli(), id, at.UnixMilli())
-	}
-	return id
+	return s.change(ctx, pendingChange{chat: chat, waID: waID, kind: "edit", value: text, raw: raw, at: at})
 }
 
 // Delete — сообщение удалено у всех; номер (0 — его ещё нет: удаление
 // отложено, и пришедшее позже сообщение сразу будет удалённым).
 func (s *Store) Delete(ctx context.Context, chat int64, waID string, at time.Time) int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.delete(ctx, s.Resolve(ctx, chat), waID, at)
-}
-
-func (s *Store) delete(ctx context.Context, chat int64, waID string, at time.Time) int64 {
-	id := s.msgID(ctx, chat, waID)
-	if id == 0 {
-		s.defer_(ctx, chat, waID, "delete", "", "", nil, at)
-		return 0
-	}
-	_, _ = s.db.ExecContext(ctx, `UPDATE messages SET deleted = 1, text = '', text_lc = '', raw = NULL WHERE id = ?`, id)
-	return id
+	return s.change(ctx, pendingChange{chat: chat, waID: waID, kind: "delete", at: at})
 }
 
 // React — реакция автора на сообщение (пустая — снял); номер сообщения
 // (0 — его ещё нет: отложено). Реакция старше известной не применяется;
 // снятая хранится пустой со временем — иначе старая история вернула бы её.
 func (s *Store) React(ctx context.Context, chat int64, waID, sender, emoji string, at time.Time) int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.react(ctx, s.Resolve(ctx, chat), waID, sender, emoji, at)
+	return s.change(ctx, pendingChange{chat: chat, waID: waID, kind: "react", sender: sender, value: emoji, at: at})
 }
 
-func (s *Store) react(ctx context.Context, chat int64, waID, sender, emoji string, at time.Time) int64 {
-	id := s.msgID(ctx, chat, waID)
-	if id == 0 {
-		s.defer_(ctx, chat, waID, "react", sender, emoji, nil, at)
+// change — применить изменение сообщения. Нет сообщения — в pending до
+// него. Ошибка базы — тоже в pending (или в память) с долгом: повторит
+// следующая запись. Есть невозвращённый долг — изменение идёт через
+// pending, чтобы порядок с застрявшими (по времени, потом по приходу) не
+// нарушился. Контекст без отмены: истёкший контекст вызова не должен
+// потерять изменение.
+func (s *Store) change(ctx context.Context, c pendingChange) int64 {
+	ctx = context.WithoutCancel(ctx)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.settle(ctx) // застрявшие — раньше этого
+	if len(s.unsaved) > 0 {
+		s.unsaved = append(s.unsaved, c) // в базу всё ещё не пишется — в очередь за ними
 		return 0
 	}
-	_, _ = s.db.ExecContext(ctx, `INSERT INTO reactions(msg, sender, emoji, ts) VALUES(?, ?, ?, ?)
-		ON CONFLICT(msg, sender) DO UPDATE SET emoji = excluded.emoji, ts = excluded.ts WHERE excluded.ts >= reactions.ts`,
-		id, sender, emoji, at.UnixMilli())
+	chat, err := s.resolve(ctx, c.chat)
+	if err != nil {
+		s.unsaved = append(s.unsaved, c) // settle разрешит чат снова
+		s.owed = true
+		return 0
+	}
+	c.chat = chat
+	id, err := s.msgID(ctx, chat, c.waID)
+	switch {
+	case err != nil:
+		s.defer_(ctx, c)
+		s.owed = true
+		return 0
+	case id == 0:
+		s.defer_(ctx, c)
+		return 0
+	case s.owed:
+		s.defer_(ctx, c)
+		if s.applyPending(ctx, chat, c.waID) != nil {
+			s.owed = true
+		}
+		return id
+	}
+	if applyChange(ctx, s.db, id, c) != nil {
+		s.defer_(ctx, c)
+		s.owed = true
+	}
 	return id
 }
 
