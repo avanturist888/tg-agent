@@ -289,3 +289,17 @@ func TestCancelRefusedWhileSending(t *testing.T) {
 		t.Fatalf("отмена после отпуска: %v", err)
 	}
 }
+
+// Карточка привязалась, когда черновик уже ушёл (слали её дольше окна
+// автоотправки): итог ждёт показа.
+func TestAttachCardAfterSent(t *testing.T) {
+	o := New(t.TempDir())
+	d := approvedDraft(t, o)
+	if _, err := o.MarkSent(d.ID, 1, time.Now().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := o.AttachCard(d.ID, 55)
+	if err != nil || !got.CardDue {
+		t.Fatalf("итог не ждёт показа: %v %v", err, got != nil && got.CardDue)
+	}
+}

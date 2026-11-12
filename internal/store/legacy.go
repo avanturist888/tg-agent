@@ -190,7 +190,9 @@ func (db *DB) ImportLegacy() error {
 		db.pending.Store(true)
 		return nil
 	}
-	db.pending.Store(pending)
+	// сбой — файл остался неперенесённым: состояние в базе неполно, как и
+	// при отложенном (решения владельца по нему разбирать рано)
+	db.pending.Store(pending || err != nil)
 	if err == nil && len(LegacyPresent(db.Dir)) == 0 {
 		consumeCutover(db.Dir)
 	}

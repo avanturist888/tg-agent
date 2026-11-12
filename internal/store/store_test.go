@@ -939,3 +939,34 @@ func TestExportRerunDiedBeforeWrite(t *testing.T) {
 		t.Fatal("прежний хеш не снят после записи файла")
 	}
 }
+
+// Сбой переноса (не испорченный файл, а ошибка чтения) — перенос не
+// закончен: LegacyPending, решения владельца разбирать рано.
+func TestLegacyFailureKeepsPending(t *testing.T) {
+	dir := t.TempDir()
+	db := func() *DB {
+		t.Cleanup(closeAll)
+		db, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}()
+	// файл, перенос которого срывается (не испорченный — ошибка чтения)
+	write(t, filepath.Join(dir, failingLegacy), "{}")
+	if err := db.ImportLegacy(); err == nil {
+		t.Fatal("сбой переноса не дошёл")
+	}
+	if !db.LegacyPending() {
+		t.Fatal("после сбоя переноса — не pending")
+	}
+}
+
+// failingLegacy — старый файл только для тестов: его перенос — сбой чтения.
+const failingLegacy = "test-failing-legacy.json"
+
+func init() {
+	RegisterLegacy(Legacy{File: failingLegacy, Import: func(context.Context, *sql.Tx, string) (int, error) {
+		return 0, errors.New("диск не отвечает")
+	}})
+}

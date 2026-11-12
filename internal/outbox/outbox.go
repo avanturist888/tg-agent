@@ -410,9 +410,16 @@ func (o *Outbox) Cancel(id, by string) (*Draft, error) {
 	})
 }
 
+// AttachCard — номер карточки черновика. Пришёл, когда статус уже
+// окончательный (карточку слали дольше окна автоотправки, черновик успел
+// уйти или протухнуть), — итог ждёт показа (CardDue): тот, кто менял
+// статус, карточки ещё не знал.
 func (o *Outbox) AttachCard(id string, messageID int64) (*Draft, error) {
 	return o.Update(id, func(d *Draft) error {
 		d.BotMessageID = &messageID
+		if (d.Status == Sent || d.Status == Cancelled || d.Status == Expired) && !d.CardDue {
+			d.dueCard(time.Now())
+		}
 		return nil
 	})
 }
