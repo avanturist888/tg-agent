@@ -44,14 +44,14 @@ func TestRecoverSkipsOwnApproved(t *testing.T) {
 func TestDeliverOnce(t *testing.T) {
 	s := watchEnv(t)
 	ctx := context.Background()
-	c := claimDelivery(s, "x")
-	if c == nil {
-		t.Fatal("первый захват")
+	c, err := claimDelivery(s, "x")
+	if c == nil || err != nil {
+		t.Fatalf("первый захват: %v", err)
 	}
-	if claimDelivery(s, "x") != nil {
-		t.Fatal("второй захват при идущей отправке")
+	if c2, err := claimDelivery(s, "x"); c2 != nil || err != nil {
+		t.Fatalf("второй захват при идущей отправке: %v", err)
 	}
-	if got := deliverWith(ctx, s, "x", "test", false); got != "" {
+	if got := deliver(ctx, s, "x", "test"); got != "" {
 		t.Fatalf("второй путь отправил: %q", got)
 	}
 	var d *Denied
@@ -59,17 +59,38 @@ func TestDeliverOnce(t *testing.T) {
 		t.Fatalf("tg_send_draft при идущей отправке: %v", err)
 	}
 	c.release()
-	if c = claimDelivery(s, "x"); c == nil {
+	if c, _ = claimDelivery(s, "x"); c == nil {
 		t.Fatal("после конца отправки")
 	}
 	c.release()
 }
 
-// Черновик отправляет другой процесс (его лок-файл): этот не отправляет, а
-// проигравший путь с ожиданием получает итог победителя.
+// Черновик держит другой процесс (его лок-файл): этот не отправляет и
+// карточку не трогает — итог пишет тот, кто отправляет.
 func TestDeliverOtherProcess(t *testing.T) {
 	s := watchEnv(t)
 	ctx := context.Background()
+	path := deliveryLockPath(s, "y")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	other := lock.New(path, 0)
+	if err := other.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer other.Release()
+	if c, err := claimDelivery(s, "y"); c != nil || err != nil {
+		t.Fatalf("захват при чужом лок-файле: %v", err)
+	}
+	if got := deliver(ctx, s, "y", "test"); got != "" {
+		t.Fatalf("второй процесс отправил: %q", got)
+	}
+}
+
+// Лок завести нельзя — не отправлять (иначе другой процесс мог бы отправить
+// тот же черновик), а показать сбой.
+func TestDeliverNoLockNoSend(t *testing.T) {
+	s := watchEnv(t)
 	box := outbox.New(s.OutboxPath())
 	dr, err := box.Create(outbox.CreateOpts{Chat: "test", Text: "раз", TTLMin: 60})
 	if err != nil {
@@ -78,23 +99,32 @@ func TestDeliverOtherProcess(t *testing.T) {
 	if _, err := box.Approve(dr.ID, "test"); err != nil {
 		t.Fatal(err)
 	}
-	path := deliveryLockPath(s, dr.ID)
+	// на месте каталога локов — файл
+	if err := os.WriteFile(filepath.Join(s.DataDir(), "sending"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := deliver(context.Background(), s, dr.ID, "test"); !strings.Contains(got, "Не отправлено") {
+		t.Fatalf("итог: %q", got)
+	}
+	if d, _ := box.Get(dr.ID); d.SendError == nil || d.Status != outbox.Approved {
+		t.Fatalf("черновик: %+v", d)
+	}
+}
+
+// Лок умершего процесса (упал посреди отправки) не мешает досылке взять
+// черновик: снимается при первой попытке, берётся со следующей.
+func TestClaimAfterDeadOwner(t *testing.T) {
+	s := watchEnv(t)
+	path := deliveryLockPath(s, "z")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	other := lock.New(path, 0) // «другой процесс» держит черновик
-	if err := other.Acquire(ctx); err != nil {
+	if err := os.WriteFile(path+".lock", []byte(`{"pid":999999,"ts":1}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if claimDelivery(s, dr.ID) != nil {
-		t.Fatal("захват при чужом лок-файле")
+	c, err := claimDelivery(s, "z")
+	if c == nil || err != nil {
+		t.Fatalf("лок умершего процесса не снят: %v", err)
 	}
-	go func() {
-		time.Sleep(700 * time.Millisecond)
-		_, _ = box.MarkSent(dr.ID, 777, "2026-11-12T13:00:00+00:00")
-		other.Release()
-	}()
-	if got := deliver(ctx, s, dr.ID, "test"); !strings.Contains(got, "Отправлено") || !strings.Contains(got, "777") {
-		t.Fatalf("итог победителя: %q", got)
-	}
+	c.release()
 }

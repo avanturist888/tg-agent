@@ -1047,12 +1047,17 @@ func WaitApproval(ctx context.Context, s *config.Settings, draftID string, timeo
 // (кнопка, tg approve, автоотправка). Единственная точка, где сообщение
 // реально уходит в Telegram.
 func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string) (*omap.Map, error) {
-	claim := claimDelivery(s, draftID)
-	if claim == nil {
+	claim, err := claimDelivery(s, draftID)
+	if err != nil {
+		err = fmt.Errorf("не удалось взять черновик в отправку: %w", err)
+	} else if claim == nil {
 		return nil, denied("Черновик %s уже отправляется — второй раз не отправляю. Итог — tg_wait_approval(draft_id).", draftID)
 	}
-	defer claim.release()
-	result, err := deliverClaimed(ctx, s, draftID, by)
+	var result *omap.Map
+	if err == nil {
+		defer claim.release()
+		result, err = deliverClaimed(ctx, s, draftID, by)
+	}
 	var dn *Denied
 	if err != nil && !errors.As(err, &dn) {
 		// как у deliver: сбой виден в tg_wait_approval (send_failed) и в

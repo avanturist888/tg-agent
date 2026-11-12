@@ -128,28 +128,27 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 // deliver — отправить одобренный черновик и вернуть строку итога для карточки.
 // Человек уже нажал «Отправить» (или окно отмены закрылось): временные сбои
 // переживаем сами, прежде чем сдаваться и звать агента.
+//
+// Черновик, который уже отправляет другой путь (этот или другой процесс),
+// не отправляется второй раз: deliver сразу возвращает "" и карточку не
+// трогает — итог в неё пишет тот, кто отправляет (deliver — через своего
+// вызывающего, DeliverApproved — сам). Ждать его не нужно: ожидание держало
+// бы разбор кнопок и следующие черновики.
 func deliver(ctx context.Context, s *config.Settings, draftID, by string) string {
-	return deliverWith(ctx, s, draftID, by, true)
-}
-
-// deliverWith — deliver; wait=false — черновик, который уже отправляют,
-// пропустить сразу (итог в карточку напишет тот путь), а не ждать: так
-// досылка при старте и SendDue не держат кнопки и следующие черновики.
-func deliverWith(ctx context.Context, s *config.Settings, draftID, by string, wait bool) string {
-	claim := claimDelivery(s, draftID)
+	box := outbox.New(s.OutboxPath())
+	claim, err := claimDelivery(s, draftID)
+	if err != nil {
+		// без захвата отправлять нельзя: другой процесс мог бы отправить тот же
+		// черновик; сбой виден, повтор — tg_send_draft
+		msg := "не удалось взять черновик в отправку: " + err.Error()
+		_, _ = box.MarkSendError(draftID, msg)
+		return "⚠️ **Не отправлено** — " + bot.MDEscape(msg)
+	}
 	if claim == nil {
-		// его уже отправляет другой путь (этот или другой процесс): второй
-		// отправки не будет; итог — тот, что вышел у него
 		_ = audit.Log(s.AuditPath(), "send_already_running", "draft_id", draftID, "by", by)
-		if !wait {
-			return ""
-		}
-		waitDelivery(ctx, s, draftID)
-		d, _ := outbox.New(s.OutboxPath()).Get(draftID)
-		return outcomeSummary(s, d)
+		return ""
 	}
 	defer claim.release()
-	box := outbox.New(s.OutboxPath())
 	var (
 		result *omap.Map
 		errMsg string
@@ -385,7 +384,7 @@ func SendDue(ctx context.Context, s *config.Settings) {
 	}
 	for _, d := range due {
 		_ = audit.Log(s.AuditPath(), "approve", "draft_id", d.ID, "chat", d.Chat, "by", "auto_send")
-		summary := deliverWith(ctx, s, d.ID, "auto_send", false)
+		summary := deliver(ctx, s, d.ID, "auto_send")
 		// карточку — после отправки, а в службе ещё и в стороне: подвисший
 		// Bot API не должен задерживать ни это сообщение, ни следующие.
 		// Короткоживущий send-due обновляет её сам — иначе не успеет до выхода.
@@ -629,7 +628,7 @@ func RecoverInterrupted(ctx context.Context, s *config.Settings) {
 			continue
 		}
 		_ = audit.Log(s.AuditPath(), "recover_interrupted", "draft_id", d.ID, "chat", d.Chat)
-		summary := deliverWith(ctx, s, d.ID, by+" (дослано после перезапуска службы)", false)
+		summary := deliver(ctx, s, d.ID, by+" (дослано после перезапуска службы)")
 		card(ctx, s, d.BotMessageID, d, summary)
 	}
 }
@@ -655,8 +654,8 @@ func approvedBefore(d *outbox.Draft, t time.Time) bool {
 // перезапуска, tg_send_draft, tgw send-due без службы) без захвата отправили
 // бы черновик дважды — 12.11.2026 так и вышло. Захват — лок-файл на черновик
 // (data/sending/<id>.lock): его видят и другие процессы, а лок умершего
-// процесса снимается сам (pid владельца). delivering — тот же захват внутри
-// процесса, если лок-файл завести не вышло.
+// процесса снимается сам (pid владельца). delivering — тот же захват между
+// путями внутри процесса (дешевле и без диска).
 var delivering sync.Map
 
 func deliveryLockPath(s *config.Settings, id string) string {
@@ -676,55 +675,34 @@ func (d *delivery) release() {
 	delivering.Delete(d.id)
 }
 
-// claimDelivery — взять черновик в отправку; nil — его уже отправляют
-// (этот или другой процесс).
-func claimDelivery(s *config.Settings, id string) *delivery {
+// claimWait — сколько ждать лок-файл черновика: лок умершего процесса
+// снимается при первой попытке, а взять его можно со следующей (каждые
+// 250 мс) — с нулевым ожиданием такой черновик остался бы неотправленным.
+const claimWait = time.Second
+
+// claimDelivery — взять черновик в отправку. (nil, nil) — его уже
+// отправляют (этот или другой процесс); ошибка — захват не вышел (каталог
+// или файл лока), отправлять тогда нельзя.
+func claimDelivery(s *config.Settings, id string) (*delivery, error) {
 	if _, busy := delivering.LoadOrStore(id, struct{}{}); busy {
-		return nil
+		return nil, nil
 	}
-	d := &delivery{id: id}
 	path := deliveryLockPath(s, id)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		delivering.Delete(id)
 		_ = audit.Log(s.AuditPath(), "send_lock_failed", "draft_id", id, "error", err.Error())
-		return d // хотя бы захват внутри процесса
+		return nil, err
 	}
-	f := lock.New(path, 0)
+	f := lock.New(path, claimWait)
 	if err := f.Acquire(context.Background()); err != nil {
+		delivering.Delete(id)
 		if lock.IsBusy(err) {
-			delivering.Delete(id)
-			return nil
+			return nil, nil
 		}
 		_ = audit.Log(s.AuditPath(), "send_lock_failed", "draft_id", id, "error", err.Error())
-		return d
+		return nil, err
 	}
-	d.file = f
-	return d
-}
-
-// waitDelivery — дождаться, пока черновик отпустит тот, кто его отправляет
-// (дольше всего — ожидание сессии и повторы, ~6 мин).
-func waitDelivery(ctx context.Context, s *config.Settings, id string) {
-	deadline := time.Now().Add(7 * time.Minute)
-	for time.Now().Before(deadline) && ctx.Err() == nil {
-		_, inProc := delivering.Load(id)
-		if !inProc && !lock.Held(deliveryLockPath(s, id)) {
-			return
-		}
-		sleepCtx(ctx, 500*time.Millisecond)
-	}
-}
-
-// outcomeSummary — итог для карточки по состоянию черновика ("" — неясно).
-func outcomeSummary(s *config.Settings, d *outbox.Draft) string {
-	switch {
-	case d == nil:
-		return ""
-	case d.Status == outbox.Sent && d.MessageID != nil:
-		return sentSummary(s, d, *d.MessageID)
-	case d.SendError != nil:
-		return "⚠️ **Не отправлено** — " + bot.MDEscape(*d.SendError)
-	}
-	return ""
+	return &delivery{id: id, file: f}, nil
 }
 
 func sentSummary(s *config.Settings, d *outbox.Draft, mid any) string {
@@ -804,6 +782,9 @@ func ApproveAndSend(ctx context.Context, s *config.Settings, draftID, by string)
 	card(ctx, s, d.BotMessageID, d, "⏳ **Отправляю…**")
 	summary := deliver(ctx, s, draftID, by)
 	card(ctx, s, d.BotMessageID, d, summary)
+	if summary == "" { // отправляет другой путь — итог в карточку напишет он
+		summary = "⏳ **Уже отправляется** — итог появится в карточке"
+	}
 	return summary, nil
 }
 
