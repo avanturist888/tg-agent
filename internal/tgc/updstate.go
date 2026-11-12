@@ -34,6 +34,17 @@ type updState struct {
 	mu    sync.Mutex
 	dirty bool
 	data  updStateFile
+	// peers — запасной источник access_hash каналов (data/peers.json): канал,
+	// известный только из списка диалогов, иначе стоил бы менеджеру лишнего
+	// getDifference на первом же своём событии
+	peers *PeerCache
+}
+
+// usePeers — подключить кэш пиров текущего соединения.
+func (u *updState) usePeers(p *PeerCache) {
+	u.mu.Lock()
+	u.peers = p
+	u.mu.Unlock()
 }
 
 type updStateFile struct {
@@ -203,11 +214,17 @@ func (u *updState) SetChannelAccessHash(_ context.Context, userID, channelID, ac
 func (u *updState) GetChannelAccessHash(_ context.Context, userID, channelID int64) (int64, bool, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.data.User != userID {
-		return 0, false, nil
+	if u.data.User == userID {
+		if h, ok := u.data.Hashes[chKey(channelID)]; ok {
+			return h, true, nil
+		}
 	}
-	h, ok := u.data.Hashes[chKey(channelID)]
-	return h, ok, nil
+	if p := u.peers; p != nil && p.SelfID() == userID {
+		if h, ok := p.channel(channelID); ok {
+			return h, true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 var (

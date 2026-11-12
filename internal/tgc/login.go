@@ -55,10 +55,11 @@ func Login(ctx context.Context, s *config.Settings, p Prompter) (*tg.User, error
 	return me, err
 }
 
-// Logout — отозвать сессию на стороне Telegram.
+// Logout — отозвать сессию на стороне Telegram: на всех DC, куда вход был
+// перенесён (файлы), как Telegram Desktop, и стереть её с диска.
 func Logout(ctx context.Context, s *config.Settings) error {
 	return Run(ctx, s, Opts{NoAuth: true}, func(ctx context.Context, c *Conn) error {
-		_, err := c.API.AuthLogOut(ctx)
+		_, err := c.Client.LogOut(ctx)
 		return err
 	})
 }

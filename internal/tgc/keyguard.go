@@ -65,6 +65,16 @@ func (g *guardedStorage) store(data []byte) error {
 }
 
 func (g *guardedStorage) StoreSession(ctx context.Context, data []byte) error {
+	if len(data) == 0 {
+		// пустую сессию пишет только выход (Client.LogOut): вход отозван,
+		// ключ больше не нужен — со следующего запуска с чистого листа
+		_ = os.Remove(g.lossPath())
+		if err := os.Remove(g.file.Path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		_ = audit.Log(g.s.AuditPath(), "session_wiped")
+		return nil
+	}
 	old, err := g.file.LoadSession(ctx)
 	if err != nil || len(old) == 0 {
 		return g.store(data)

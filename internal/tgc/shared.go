@@ -260,6 +260,7 @@ func Serve(ctx context.Context, s *config.Settings, ev Events, onReady func(ctx 
 func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage, upd *updState, ev Events,
 	onReady func(ctx context.Context, c *Conn), onNoLogin func(ctx context.Context)) error {
 	c := &Conn{Settings: s, hub: newUpdateHub(), Peers: LoadPeers(s.PeersPath())}
+	upd.usePeers(c.Peers)
 	d := tg.NewUpdateDispatcher()
 	message := func(handler OnMessage, e tg.Entities, m tg.MessageClass) func(ctx context.Context) {
 		return func(ctx context.Context) {
@@ -556,9 +557,9 @@ func ServiceLogout(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := c.API.AuthLogOut(ctx); err != nil {
-		return err
-	}
+	// LogOut выходит на всех DC и стирает сессию даже при ошибке запроса:
+	// служба в любом случае начинает с чистого листа
+	_, err = c.Client.LogOut(ctx)
 	shared.mu.Lock()
 	shared.authorized = false
 	shared.reset = true
@@ -569,7 +570,7 @@ func ServiceLogout(ctx context.Context) error {
 	if cancel != nil {
 		cancel()
 	}
-	return nil
+	return err
 }
 
 // ServiceAuthorized — есть ли вход (для статуса службы).

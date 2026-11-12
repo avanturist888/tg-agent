@@ -96,3 +96,24 @@ func TestGuardLoginReplaces(t *testing.T) {
 		t.Fatal("вход не записал новый ключ")
 	}
 }
+
+// Выход (Client.LogOut) стирает сессию пустой записью — это не подмена ключа.
+func TestGuardLogoutWipes(t *testing.T) {
+	s := guardEnv(t)
+	ctx := context.Background()
+	rejected := 0
+	g := newGuardedStorage(s, false, func() { rejected++ })
+	if err := g.StoreSession(ctx, sessionJSON("AAAAAAAAAAA=")); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.StoreSession(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(s.SessionPath); !os.IsNotExist(err) || rejected != 0 {
+		t.Fatalf("сессия не стёрта: %v, rejected=%d", err, rejected)
+	}
+	// новый вход после выхода пишется свободно
+	if err := g.StoreSession(ctx, sessionJSON("BBBBBBBBBBB=")); err != nil {
+		t.Fatal(err)
+	}
+}
