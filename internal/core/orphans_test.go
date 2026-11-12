@@ -14,6 +14,7 @@ import (
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
+	"tgagent/internal/store"
 )
 
 // Процесс записал запрос доступа и умер, не отправив карточку: запрос не
@@ -787,5 +788,43 @@ func TestCardDueShown(t *testing.T) {
 	showDueCards(ctx, s)
 	if len(shown) != 1 {
 		t.Fatalf("показано повторно: %q", shown)
+	}
+}
+
+// Номер версии не выдался (база занята) — итог по старому снимку всё равно
+// сверяется со свежим черновиком и «Отправлено» не затирает.
+func TestCardNoVersionStaleNotShown(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	if _, err := box.MarkSendError(d.ID, "сбой"); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := box.Get(d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shown []string
+	old := finishCard
+	finishCard = func(_ context.Context, _ *config.Settings, _ int64, _ *outbox.Draft, _, status, _ string) bool {
+		shown = append(shown, status)
+		return true
+	}
+	oldVer := cardVersion
+	cardVersion = func(context.Context, *store.DB, string) (int64, error) { return 0, errors.New("database is locked") }
+	t.Cleanup(func() { finishCard, cardVersion = old, oldVer })
+	if _, err := box.MarkSent(d.ID, 7, "2026-11-12T10:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	cardID := int64(55)
+	showCard(context.Background(), s, snap, cardID, "⚠️ **Не отправлено** — сбой")
+	if len(shown) != 0 {
+		t.Fatalf("без номера версии показан устаревший итог: %q", shown)
+	}
+	// а правдивый показывается и без номера
+	fresh, _ := box.Get(d.ID)
+	showCard(context.Background(), s, fresh, cardID, sentSummary(s, fresh, 7))
+	if len(shown) != 1 || !strings.HasPrefix(shown[0], "✅") {
+		t.Fatalf("правдивый итог без номера: %q", shown)
 	}
 }

@@ -155,15 +155,20 @@ func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID i
 	db, err := stateDB(s)
 	var ver int64
 	if err == nil {
-		ver, err = nextCardVersion(ctx, db, d.ID)
+		ver, err = cardVersion(ctx, db, d.ID)
 	}
 	if err != nil {
-		// без базы порядок не проверить и в очередь не поставить — показать
-		// хотя бы этот итог: иначе карточка так и висела бы на «Отправляю…»
+		// без номера порядок не проверить и в очередь не поставить — показать
+		// этот итог, только если он правда о свежем черновике (иначе старый
+		// снимок затёр бы, например, «Отправлено» другого процесса). Не
+		// проверить и это — не показывать: «Отправлено» покажет уборка по
+		// CardDue, сбои — старт службы (refreshFailedCards)
 		_ = audit.Log(s.AuditPath(), "card_version_failed", "draft_id", d.ID, "error", err.Error())
 		if unlock, ok := lockCard(ctx, s, d.ID); ok {
 			defer unlock()
-			finishCard(ctx, s, cardID, d, title(s, d), status, d.Note)
+			if fits, known := freshFits(s, d.ID, status); fits && known {
+				finishCard(ctx, s, cardID, d, title(s, d), status, d.Note)
+			}
 		}
 		return
 	}
@@ -173,7 +178,8 @@ func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID i
 		// номера, так что итог, собранный по старому снимку, либо уже видит
 		// новое состояние и отвергается, либо старше номером того, кто его
 		// создал
-		if stillTrue(s, d.ID, status) {
+		// (не прочитался черновик — тоже в очередь: уборка сверит его сама)
+		if fits, known := freshFits(s, d.ID, status); fits || !known {
 			rememberCard(ctx, s, db, d.ID, cardID, status, ver, false)
 		}
 		return
@@ -182,7 +188,14 @@ func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID i
 	if cur, ok, err := cardStates.Get(ctx, db.Q(), d.ID); err == nil && ok && cur.Ver > ver {
 		return // уже принят итог новее — этот устарел, пока ждал
 	}
-	if !stillTrue(s, d.ID, status) {
+	fits, known := freshFits(s, d.ID, status)
+	if !known {
+		// не сверить — не показывать вслепую, а ждать: уборка (retryCard)
+		// сверит итог с черновиком и покажет, если он ещё правда
+		rememberCard(ctx, s, db, d.ID, cardID, status, ver, false)
+		return
+	}
+	if !fits {
 		_ = audit.Log(s.AuditPath(), "card_stale", "draft_id", d.ID)
 		return
 	}
@@ -230,15 +243,19 @@ func showDueCards(ctx context.Context, s *config.Settings) {
 	}
 }
 
-// stillTrue — итог status всё ещё правда о черновике id (по базе). Черновика
-// нет — показывать некуда; базу не прочесть — не мешать показу.
-func stillTrue(s *config.Settings, id, status string) bool {
+// freshFits — итог status всё ещё правда о черновике id (по базе): fits.
+// known — удалось ли это узнать (черновика нет — узнали: показывать некуда;
+// базу не прочесть — не узнали, и показывать вслепую нельзя).
+func freshFits(s *config.Settings, id, status string) (fits, known bool) {
 	d, err := outbox.New(s.DataDir()).Get(id)
 	var nf *outbox.NotFound
 	if errors.As(err, &nf) {
-		return false
+		return false, true // черновика нет — итог не о чем показывать
 	}
-	return err != nil || outcomeFits(s, status, d)
+	if err != nil {
+		return false, false
+	}
+	return outcomeFits(s, status, d), true
 }
 
 // outcomeFits — подходит ли итог status (по его значку) к состоянию
@@ -332,6 +349,8 @@ func editCardState(ctx context.Context, db *store.DB, id string, fn func(cur car
 }
 
 // nextCardVersion — номер для нового итога карточки черновика id.
+var cardVersion = nextCardVersion // тесты подменяют
+
 func nextCardVersion(ctx context.Context, db *store.DB, id string) (int64, error) {
 	var v int64
 	err := editCardState(ctx, db, id, func(cur cardState, ok bool) (cardState, bool) {
