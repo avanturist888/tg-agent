@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"tgagent/internal/lock"
 )
@@ -545,5 +546,29 @@ func TestLegacyDeadSendLockIsAttempt(t *testing.T) {
 	}
 	if a, b := count(t, db, "SELECT send_attempts FROM drafts WHERE id = 'a'"), count(t, db, "SELECT send_attempts FROM drafts WHERE id = 'b'"); a != 1 || b != 0 {
 		t.Fatalf("попытки: a %d, b %d", a, b)
+	}
+}
+
+// Лок отправки без владельца (упал между созданием файла и записью pid),
+// давний: перенос не ждёт его вечно, а черновик переносится попыткой.
+func TestLegacyMalformedSendLock(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "approved", "expires_at": "2099-01-01T00:00:00Z"}]`)
+	lockFile := filepath.Join(dir, "sending", "a.lock")
+	write(t, lockFile, "")
+	old := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(lockFile, old, old); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, db, "SELECT send_attempts FROM drafts WHERE id = 'a'"); n != 1 || db.LegacyPending() {
+		t.Fatalf("попыток %d, pending %v", n, db.LegacyPending())
 	}
 }

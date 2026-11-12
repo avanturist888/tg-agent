@@ -107,6 +107,7 @@ func maybeSweep(ctx context.Context, s *config.Settings, last *time.Time) {
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 		defer cancel()
 		if s.BotReady() {
+			retryCards(cctx, s) // итоги, которые Bot API не принял
 			sweepPins(cctx, s)
 			publishOrphanAccess(cctx, s)
 		}

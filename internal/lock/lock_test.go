@@ -42,3 +42,29 @@ func TestOrphanAndDeadOwner(t *testing.T) {
 		t.Fatalf("лок с переиспользованным pid не снят: %v", err)
 	}
 }
+
+// Peek не снимает лок и не считает вечно живым файл без владельца: упал
+// между созданием и записью — по возрасту, как breakIfStale.
+func TestPeekMalformed(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "x")
+	if present, _ := Peek(p); present {
+		t.Fatal("нет файла — а Peek видит")
+	}
+	if err := os.WriteFile(p+".lock", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if present, alive := Peek(p); !present || !alive {
+		t.Fatal("свежий пустой лок — его как раз пишут")
+	}
+	old := time.Now().Add(-2 * StaleAfter)
+	if err := os.Chtimes(p+".lock", old, old); err != nil {
+		t.Fatal(err)
+	}
+	if present, alive := Peek(p); !present || alive {
+		t.Fatalf("старый пустой лок: present %v alive %v", present, alive)
+	}
+	if _, err := os.Stat(p + ".lock"); err != nil {
+		t.Fatal("Peek снял лок")
+	}
+}

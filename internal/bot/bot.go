@@ -559,7 +559,8 @@ func SendDraftCard(ctx context.Context, s *config.Settings, d *outbox.Draft, tit
 // FinishCard переписывает карточку итогом и снимает кнопки, чтобы не нажали
 // дважды. Каждая неудача идёт в журнал: молчаливый проглот однажды уже
 // оставил кнопки висеть под обработанным черновиком.
-func FinishCard(ctx context.Context, s *config.Settings, messageID int64, d *outbox.Draft, title, status, note string) {
+// Возвращает, показан ли итог (уже такой — тоже показан).
+func FinishCard(ctx context.Context, s *config.Settings, messageID int64, d *outbox.Draft, title, status, note string) bool {
 	base := func() map[string]any {
 		return map[string]any{"chat_id": s.ApprovalChatID, "message_id": messageID}
 	}
@@ -574,14 +575,15 @@ func FinishCard(ctx context.Context, s *config.Settings, messageID int64, d *out
 		payload map[string]any
 	}{{"rich", rich}, {"html", plain}} {
 		err := Call(ctx, s, "editMessageText", a.payload, nil)
-		if err == nil {
-			return
+		if err == nil || strings.Contains(err.Error(), "message is not modified") {
+			return true
 		}
 		_ = audit.Log(s.AuditPath(), "card_edit_failed", "message_id", messageID, "kind", a.kind, "error", err.Error())
 	}
 	if err := Call(ctx, s, "editMessageReplyMarkup", base(), nil); err != nil {
 		_ = audit.Log(s.AuditPath(), "card_strip_failed", "message_id", messageID, "error", err.Error())
 	}
+	return false
 }
 
 // AnswerCallback — всплывашка после нажатия; не критична.

@@ -124,8 +124,10 @@ func (c *Conn) SendMessage(ctx context.Context, t Target, text string, reply *in
 			if err == nil {
 				return result(id, date, "rich_markdown"), nil
 			}
-			if _, ok := tgerr.As(err); !ok {
-				return nil, err // сеть, отмена — не повод слать второй раз
+			if !Rejected(err) {
+				// сеть, отмена, ошибка сервера, «уже отправлено» — сообщение
+				// могло уйти: второй раз другим видом не шлём
+				return nil, err
 			}
 			reason = RPCErrorText(err)
 		} else {

@@ -75,9 +75,19 @@ func (c *Conn) EditMessage(ctx context.Context, t Target, id int, text, format s
 	return result("plain"), nil
 }
 
-// Rejected — Telegram ответил на запрос ошибкой RPC: запрос разобран и
-// отклонён, а не потерян по дороге (отправка — точно не состоялась).
+// Rejected — Telegram разобрал запрос и отказал его выполнять: сообщения
+// точно нет. Только явные отказы: неверный запрос (400), нет прав (401,
+// 403), не принят (406), подождать (420 FLOOD_WAIT). RANDOM_ID_DUPLICATE —
+// тоже 400, но значит «такое уже отправлено»; ошибки сервера (500…) и всё
+// незнакомое ничего не обещают — это не отказ.
 func Rejected(err error) bool {
-	_, ok := tgerr.As(err)
-	return ok
+	e, ok := tgerr.As(err)
+	if !ok || e.Type == "RANDOM_ID_DUPLICATE" {
+		return false
+	}
+	switch e.Code {
+	case 400, 401, 403, 406, 420:
+		return true
+	}
+	return false
 }

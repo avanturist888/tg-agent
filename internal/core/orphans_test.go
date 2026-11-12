@@ -336,3 +336,30 @@ func TestMarkSentDurably(t *testing.T) {
 		t.Fatalf("отметка не дописана: %+v", got)
 	}
 }
+
+// Итог не показался в карточке (Bot API не отвечал) — он запомнен, и уборка
+// показывает его, когда Bot API ответит, без перезапуска службы.
+func TestCardRetried(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	cardID := int64(55)
+	up := false
+	var shown []string
+	old := finishCard
+	finishCard = func(_ context.Context, _ *config.Settings, id int64, _ *outbox.Draft, _, status, _ string) bool {
+		if up {
+			shown = append(shown, status)
+		}
+		return up
+	}
+	t.Cleanup(func() { finishCard = old })
+	card(context.Background(), s, &cardID, d, "⚠️ **Не отправлено** — сбой")
+	retryCards(context.Background(), s) // Bot API всё ещё молчит
+	up = true
+	retryCards(context.Background(), s)
+	retryCards(context.Background(), s)
+	if len(shown) != 1 || !strings.Contains(shown[0], "Не отправлено") {
+		t.Fatalf("показано: %q", shown)
+	}
+}

@@ -197,7 +197,10 @@ func Peek(path string) (present, alive bool) {
 	}
 	var m meta
 	if json.Unmarshal(raw, &m) != nil || m.PID == 0 {
-		return true, true
+		// владельца не записали: его как раз пишут — или процесс упал между
+		// созданием файла и записью (тогда, как у breakIfStale, по возрасту)
+		st, err := os.Stat(path + ".lock")
+		return true, err != nil || time.Since(st.ModTime()) <= StaleAfter
 	}
 	return true, pidAlive(m.PID, m.TS)
 }

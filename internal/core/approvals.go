@@ -128,8 +128,68 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 	defer cancel()
 	if cardID != nil && *cardID != 0 {
-		bot.FinishCard(ctx, s, *cardID, d, title(s, d), status, d.Note)
+		shown := finishCard(ctx, s, *cardID, d, title(s, d), status, d.Note)
+		rememberCard(s, d.ID, *cardID, status, shown)
 		unpinDraftCard(ctx, s, d.ID) // решено — внимание владельца больше не нужно
+	}
+}
+
+var finishCard = bot.FinishCard // тесты подменяют
+
+// pendingCard — итог, который не удалось показать в карточке.
+type pendingCard struct {
+	Card   int64     `json:"card"`
+	Status string    `json:"status"`
+	At     time.Time `json:"at"`
+}
+
+var pendingCardsTab = store.NewTable[pendingCard](store.TPendingCards)
+
+// rememberCard — показан итог — забыть прежний несостоявшийся; не показан —
+// запомнить (последний итог черновика главнее): retryCards покажет, когда
+// Bot API ответит, — иначе карточка так и висела бы на «Отправляю…».
+func rememberCard(s *config.Settings, draftID string, cardID int64, status string, shown bool) {
+	db, err := stateDB(s)
+	if err != nil {
+		return
+	}
+	ctx := context.Background()
+	if shown {
+		err = pendingCardsTab.Delete(ctx, db.Q(), draftID)
+	} else {
+		err = pendingCardsTab.Put(ctx, db.Q(), draftID, pendingCard{Card: cardID, Status: status, At: time.Now()})
+	}
+	if err != nil {
+		_ = audit.Log(s.AuditPath(), "card_pending_failed", "draft_id", draftID, "error", err.Error())
+	}
+}
+
+// retryCards — уборка службы: показать итоги, которые не показались.
+func retryCards(ctx context.Context, s *config.Settings) {
+	db, err := stateDB(s)
+	if err != nil {
+		return
+	}
+	pending, err := pendingCardsTab.All(ctx, db.Q())
+	if err != nil {
+		return
+	}
+	box := outbox.New(s.DataDir())
+	for id, p := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		d, err := box.Get(id)
+		var nf *outbox.NotFound
+		switch {
+		case errors.As(err, &nf):
+			_ = pendingCardsTab.Delete(ctx, db.Q(), id) // черновика нет — и карточку держать незачем
+		case err == nil:
+			if finishCard(ctx, s, p.Card, d, title(s, d), p.Status, d.Note) {
+				_ = pendingCardsTab.Delete(ctx, db.Q(), id)
+				_ = audit.Log(s.AuditPath(), "card_recovered", "draft_id", id, "message_id", p.Card)
+			}
+		}
 	}
 }
 
