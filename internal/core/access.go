@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"os"
 	"strconv"
 	"strings"
@@ -221,6 +222,9 @@ type accessRequest struct {
 	// только недоведённое
 	Result    string `json:"result,omitempty"`
 	CardShown bool   `json:"card_shown,omitempty"`
+	// CardLost — карточку отправляли, но её номер неизвестен (Bot API не
+	// ответил — она могла и уйти): итог тогда — отдельным сообщением
+	CardLost  bool   `json:"card_lost,omitempty"`
 	AgentTold bool   `json:"agent_told,omitempty"`
 	Told      bool   `json:"told,omitempty"`
 }
@@ -440,6 +444,7 @@ func publishAccess(ctx context.Context, s *config.Settings, req *accessRequest, 
 		_ = editAccess(s, func(m map[string]*accessRequest) bool {
 			if r := m[req.ID]; r != nil && r.CardID == 0 && r.PubPID == req.PubPID {
 				r.PubPID, r.PubSince = 0, 0 // сирота: карточку пришлёт уборка
+				r.CardLost = true
 				return true
 			}
 			return false
@@ -463,7 +468,7 @@ func recordAccessCard(s *config.Settings, req *accessRequest, card int64) error 
 	req.CardID, req.PubPID, req.PubSince = card, 0, 0
 	return editAccess(s, func(m map[string]*accessRequest) bool {
 		if r := m[req.ID]; r != nil {
-			r.CardID, r.PubPID, r.PubSince = card, 0, 0
+			r.CardID, r.PubPID, r.PubSince, r.CardLost = card, 0, 0, false
 			if r.Status != accessPending && r.Result != "" {
 				r.CardShown, r.Told = false, false
 			}
@@ -508,6 +513,7 @@ func adoptOrphan(ctx context.Context, s *config.Settings, id string) (bool, erro
 		_ = editAccess(s, func(m map[string]*accessRequest) bool {
 			if r := m[id]; r != nil && r.CardID == 0 {
 				r.PubPID, r.PubSince = 0, 0
+				r.CardLost = true
 				return true
 			}
 			return false
@@ -547,7 +553,16 @@ func postAccessCard(ctx context.Context, s *config.Settings, r *accessRequest, e
 // карточку шлёт живой процесс — не показан: она вот-вот появится.
 var finishAccessCard = func(ctx context.Context, s *config.Settings, r *accessRequest, status string) bool {
 	if r.CardID == 0 {
-		return r.PubPID == 0 || !lock.PIDAlive(r.PubPID, r.PubSince)
+		if r.PubPID != 0 && lock.PIDAlive(r.PubPID, r.PubSince) {
+			return false
+		}
+		if r.CardLost {
+			// карточка могла уйти, а её номера нет — итог отдельным
+			// сообщением, иначе владелец его не увидит
+			return sayErr(ctx, s, "Запрос доступа к «"+html.EscapeString(r.Title)+"»: "+
+				html.EscapeString(stripMD(status))) == nil
+		}
+		return true
 	}
 	err := bot.Call(ctx, s, "editMessageText", map[string]any{
 		"chat_id": s.ApprovalChatID, "message_id": r.CardID,
@@ -631,12 +646,24 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 	}
 	r.Decided = time.Now()
 	r.Result = status
+	// решение — в свежую строку: пока разбирали нажатие, публикация могла
+	// записать номер карточки (recordAccessCard), и прежний снимок его бы
+	// затёр. Номера нет, а нажатие пришло с карточки, — он из нажатия
+	// (ответ Bot API на отправку мог потеряться)
 	if err := saveAccessDecision(s, func(m map[string]*accessRequest) bool {
-		if cur := m[id]; cur != nil && cur.Status == accessPending {
-			m[id] = r
-			return true
+		cur := m[id]
+		if cur == nil || cur.Status != accessPending {
+			return false
 		}
-		return false
+		cur.Status, cur.Outcome, cur.Alias = r.Status, r.Outcome, r.Alias
+		cur.CanRead, cur.CanSend, cur.CanAuto = r.CanRead, r.CanSend, r.CanAuto
+		cur.Decided, cur.Result = r.Decided, r.Result
+		if cur.CardID == 0 && q.Message != nil {
+			cur.CardID, cur.CardLost = q.Message.MessageID, false
+		}
+		cp := *cur
+		r = &cp
+		return true
 	}); err != nil {
 		logEvent(s, "access_save_failed", "request_id", id, "error", err.Error())
 		return retryable{err}
@@ -927,4 +954,21 @@ func uniqueAlias(s *config.Settings, base string) string {
 		alias = fmt.Sprintf("%s-%d", base, i)
 	}
 	return alias
+}
+
+// stripMD — итог карточки (markdown) простым текстом: без выделения и
+// экранирования.
+func stripMD(s string) string {
+	s = strings.NewReplacer("**", "", "`", "").Replace(s)
+	var b strings.Builder
+	esc := false
+	for _, r := range s {
+		if r == '\\' && !esc {
+			esc = true
+			continue
+		}
+		esc = false
+		b.WriteRune(r)
+	}
+	return b.String()
 }

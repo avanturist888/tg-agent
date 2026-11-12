@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -263,5 +264,48 @@ func TestAccessCardRecordedAfterDecision(t *testing.T) {
 	}
 	if got := loadAccess(s)["y"]; got.CardShown || got.Told || !got.AgentTold || got.CardID != 77 {
 		t.Fatalf("после привязки карточки: %+v", got)
+	}
+}
+
+// Номер карточки записался, пока разбирали нажатие, — решение его не
+// затирает (пишется в свежую строку).
+func TestAccessDecisionKeepsCardID(t *testing.T) {
+	s := watchEnv(t)
+	s.ApprovalChatID = 1
+	if err := editAccess(s, func(m map[string]*accessRequest) bool {
+		m["z"] = &accessRequest{ID: "z", Peer: 5, Status: accessPending, PubPID: 999999, Created: time.Now()}
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	old := saveAccessDecision
+	saveAccessDecision = func(s *config.Settings, fn func(map[string]*accessRequest) bool) error {
+		if err := recordAccessCard(s, &accessRequest{ID: "z"}, 77); err != nil { // публикация — между чтением и записью
+			return err
+		}
+		return editAccess(s, fn)
+	}
+	t.Cleanup(func() { saveAccessDecision = old })
+	q := &bot.CallbackQuery{ID: "q", Data: "a:z:no"}
+	q.From.ID = 1
+	if err := HandleCallback(context.Background(), s, q); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadAccess(s)["z"]; got.Status != accessDenied || got.CardID != 77 {
+		t.Fatalf("после решения: %+v", got)
+	}
+}
+
+// Номер карточки неизвестен (ответ Bot API потерялся) — итог владельцу
+// отдельным сообщением, а не «показан» молча.
+func TestAccessCardLostSaid(t *testing.T) {
+	s := watchEnv(t)
+	var said []string
+	old := sayErr
+	sayErr = func(_ context.Context, _ *config.Settings, text string) error { said = append(said, text); return nil }
+	t.Cleanup(func() { sayErr = old })
+	r := &accessRequest{ID: "l", Title: "Чат", Status: accessDenied, CardLost: true, Result: "✋ **Отказано** — белый список не менялся."}
+	if !finishAccessCard(context.Background(), s, r, r.Result) || len(said) != 1 || strings.Contains(said[0], "**") {
+		t.Fatalf("сказано: %q", said)
 	}
 }

@@ -31,6 +31,14 @@ const keep = 200
 
 func (o *Outbox) db() (*store.DB, error) { return store.Open(o.Dir) }
 
+// ErrLegacyPending — перенос старых файлов ещё не закончен (ждёт tg cutover,
+// лока, повтора или сорвался): очередь в базе неполна или устарела —
+// черновик из неё мог уже уйти или быть отменён старой сборкой. Отправлять
+// нельзя, пока перенос не ляжет.
+var ErrLegacyPending = errors.New("состояние ещё переносится из старых файлов — отправлю, когда перенос закончится")
+
+func legacyWaits(db *store.DB) bool { return db.LegacyBlocked() != "" || db.LegacyPending() }
+
 func decode(body string) (*Draft, error) {
 	d := &Draft{}
 	if err := json.Unmarshal([]byte(body), d); err != nil {
@@ -367,6 +375,9 @@ func (o *Outbox) ClaimDue(now time.Time) ([]*Draft, error) {
 	if err != nil {
 		return nil, err
 	}
+	if legacyWaits(db) {
+		return nil, nil // автоотправка — после переноса (ErrLegacyPending)
+	}
 	ctx := context.Background()
 	var due []*Draft
 	err = db.Write(ctx, func(tx *sql.Tx) error {
@@ -500,6 +511,9 @@ func (o *Outbox) ClaimSend(id string) (*Claim, *Draft, error) {
 		// после выгрузки она бы не увидела и отправила снова
 		if store.RolledBack(o.Dir) {
 			return ErrRolledBack
+		}
+		if legacyWaits(db) {
+			return ErrLegacyPending
 		}
 		now := time.Now()
 		if err := expire(ctx, tx, now); err != nil {

@@ -303,3 +303,29 @@ func TestAttachCardAfterSent(t *testing.T) {
 		t.Fatalf("итог не ждёт показа: %v %v", err, got != nil && got.CardDue)
 	}
 }
+
+// Пока перенос старых файлов не закончен, ничего не берётся в отправку:
+// черновик из базы мог уже уйти или быть отменён старой сборкой.
+func TestClaimWaitsLegacy(t *testing.T) {
+	dir := t.TempDir()
+	o := New(dir)
+	d := approvedDraft(t, o)
+	store.RequireCutover = true
+	t.Cleanup(func() { store.RequireCutover = false })
+	if err := os.WriteFile(filepath.Join(dir, "outbox.json"), []byte(`[]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if c, _, err := o.ClaimSend(d.ID); c != nil || !errors.Is(err, ErrLegacyPending) {
+		t.Fatalf("захват при ждущем переносе: %v %v", c, err)
+	}
+	if due, err := o.ClaimDue(time.Now().Add(time.Hour)); err != nil || len(due) != 0 {
+		t.Fatalf("автоотправка при ждущем переносе: %v %v", due, err)
+	}
+}

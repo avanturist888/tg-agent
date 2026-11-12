@@ -584,6 +584,10 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 	case errors.Is(err, outbox.ErrSending):
 		_ = audit.Log(s.AuditPath(), "send_already_running", "draft_id", draftID, "by", by)
 		return ""
+	case errors.Is(err, outbox.ErrLegacyPending):
+		// одобренное дошлёт уборка (recoverApproved), когда перенос ляжет
+		_ = audit.Log(s.AuditPath(), "send_waits_legacy", "draft_id", draftID, "by", by)
+		return ""
 	case err != nil:
 		// без захвата отправлять нельзя: другой процесс мог бы отправить тот же
 		// черновик; сбой виден, повтор — tg_send_draft
