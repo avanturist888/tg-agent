@@ -192,3 +192,65 @@ func TestRecoverSkipsFreshFailure(t *testing.T) {
 		t.Fatalf("отправки: %v", sends)
 	}
 }
+
+// Автоотправка взяла пачку одобренных; пока она шла, досылка частично
+// отправила один и записала отказ. Дойдя до него, автоотправка (как и
+// кнопка) его не трогает: сбой проверяется при захвате у любого пути.
+func TestDeliverSkipsRecordedFailure(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	if _, err := box.MarkSendError(d.ID, "часть сообщения ушла"); err != nil {
+		t.Fatal(err)
+	}
+	called := 0
+	old := sendClaimed
+	sendClaimed = func(context.Context, *config.Settings, string, string) (*omap.Map, error) {
+		called++
+		return omap.New().Set("message_id", 1), nil
+	}
+	t.Cleanup(func() { sendClaimed = old })
+	if got := deliver(context.Background(), s, d.ID, "auto_send"); got != "" || called != 0 {
+		t.Fatalf("отправлен черновик с записанным сбоем: %q, вызовов %d", got, called)
+	}
+}
+
+// Сообщение ушло, а отметка «отправлено» не записалась: второй раз его не
+// отправить (и из другого процесса — отметка в файле), а уборка службы
+// дописывает её, как только база примет.
+func TestMarkSentDurably(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	db, err := stateDB(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Q().Exec(`CREATE TRIGGER no_sent BEFORE UPDATE ON drafts WHEN NEW.status = 'sent'
+		BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END`); err != nil {
+		t.Fatal(err)
+	}
+	was := markSentRetry
+	markSentRetry.quick = time.Millisecond
+	t.Cleanup(func() { markSentRetry = was })
+	markSentDurably(s, box, d.ID, 77)
+	if mid, ok := unsavedSent(s, d.ID); !ok || mid != 77 {
+		t.Fatal("ушедшее без отметки не запомнено")
+	}
+	var dn *Denied
+	if _, err := deliverClaimed(context.Background(), s, d.ID, "test"); !errors.As(err, &dn) {
+		t.Fatalf("повторная отправка не отказана: %v", err)
+	}
+	finishUnsaved(s) // база всё ещё не принимает — файл остаётся
+	if _, ok := unsavedSent(s, d.ID); !ok {
+		t.Fatal("отметка потеряна, пока база не принимает")
+	}
+	if _, err := db.Q().Exec(`DROP TRIGGER no_sent`); err != nil {
+		t.Fatal(err)
+	}
+	finishUnsaved(s)
+	got, _ := box.Get(d.ID)
+	if _, ok := unsavedSent(s, d.ID); ok || got.Status != outbox.Sent || got.MessageID == nil || *got.MessageID != 77 {
+		t.Fatalf("отметка не дописана: %+v", got)
+	}
+}

@@ -129,6 +129,8 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 	}
 }
 
+var sendClaimed = deliverClaimed // тесты подменяют
+
 // deliver — отправить одобренный черновик и вернуть строку итога для карточки.
 // Человек уже нажал «Отправить» (или окно отмены закрылось): временные сбои
 // переживаем сами, прежде чем сдаваться и звать агента.
@@ -141,18 +143,14 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 //
 // Черновик, который уже не approved (его успели отправить, отменить, он
 // протух), не отправляется: итог — по его статусу.
-var sendClaimed = deliverClaimed // тесты подменяют
-
+//
+// Черновик, у которого уже записан сбой, сам по себе не отправляется
+// (кнопка, автоотправка, досылка): сбой мог случиться после того, как часть
+// ушла. Проверка — по черновику, прочитанному вместе с захватом, а не по
+// списку, с которого вызывающий начинал: пока он шёл, другой путь мог
+// отправить часть и записать отказ. Повтор после сбоя — только явный
+// (tg_send_draft → DeliverApproved).
 func deliver(ctx context.Context, s *config.Settings, draftID, by string) string {
-	return deliverAs(ctx, s, draftID, by, false)
-}
-
-// deliverAs — deliver; recovery — это досылка (recoverApproved): черновик,
-// у которого уже записан сбой, она не трогает. Проверка — по черновику,
-// прочитанному вместе с захватом, а не по списку, с которого досылка
-// начинала: пока она шла, другой путь мог отправить часть и записать отказ.
-// Повтор после сбоя — только явный (tg_send_draft).
-func deliverAs(ctx context.Context, s *config.Settings, draftID, by string, recovery bool) string {
 	box := outbox.New(s.DataDir())
 	claim, cur, err := box.ClaimSend(draftID)
 	switch {
@@ -170,8 +168,8 @@ func deliverAs(ctx context.Context, s *config.Settings, draftID, by string, reco
 		return finalSummary(s, cur)
 	}
 	defer claim.Release()
-	if recovery && cur.SendError != nil {
-		_ = audit.Log(s.AuditPath(), "recover_skipped_failed", "draft_id", draftID, "error", *cur.SendError)
+	if cur.SendError != nil {
+		_ = audit.Log(s.AuditPath(), "send_skipped_failed", "draft_id", draftID, "by", by, "error", *cur.SendError)
 		return ""
 	}
 	var (
@@ -689,7 +687,7 @@ func recoverApproved(ctx context.Context, s *config.Settings, cutoff time.Time, 
 		// у каждого черновика свой срок: долгий сбой одного не съедает время
 		// остальных (тогда они получили бы ошибку без попытки отправить)
 		dctx, cancel := context.WithTimeout(ctx, recoverBudget)
-		summary := deliverAs(dctx, s, d.ID, by+" ("+why+")", true)
+		summary := deliver(dctx, s, d.ID, by+" ("+why+")")
 		cancel()
 		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute) // итог в карточку — и после остановки
 		card(cctx, s, d.BotMessageID, d, summary)

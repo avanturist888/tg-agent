@@ -6,8 +6,10 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -18,6 +20,7 @@ import (
 	"tgagent/internal/audit"
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
+	"tgagent/internal/fsx"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
 	"tgagent/internal/stt"
@@ -1109,6 +1112,9 @@ func deliverClaimed(ctx context.Context, s *config.Settings, draftID, by string)
 	if d.Status != outbox.Approved {
 		return nil, denied("Черновик %s в статусе '%s', отправить нельзя.", draftID, d.Status)
 	}
+	if mid, ok := unsavedSent(s, draftID); ok {
+		return nil, denied("Черновик %s уже отправлен (message_id %d), отметка в базу ещё не записалась — второй раз не отправляю.", draftID, mid)
+	}
 	result := omap.New()
 	if n := netOf(s); n != nil {
 		result, err = n.deliver(ctx, s, rule, d)
@@ -1218,16 +1224,113 @@ func partialWhat(text bool, files int) string {
 	return strings.Join(parts, ", ")
 }
 
+// Ушло, а отметка «отправлено» в базу не записалась (база занята или
+// сбоит): в базе черновик ещё approved, и досылка отправила бы его снова.
+// Поэтому — файл data/sent-unsaved/<id> с message_id, мимо базы: пока он
+// есть, черновик не отправить никому (deliverClaimed, любой процесс), а
+// отметку дописывает сначала тот, кто отправил, потом уборка службы
+// (finishUnsaved), — и тогда файл снимается.
+
+// markSentRetry — паузы между попытками записать отметку (тесты сокращают).
+var markSentRetry = struct{ quick time.Duration }{time.Second}
+
+func unsavedPath(s *config.Settings, draftID string) string {
+	return filepath.Join(s.DataDir(), "sent-unsaved", draftID)
+}
+
+// markSentDurably — MarkSent с несколькими быстрыми повторами; не легло —
+// файл-отметка (её доделает уборка службы).
+func markSentDurably(s *config.Settings, box *outbox.Outbox, draftID string, msgID int64) {
+	at := audit.Now()
+	for i := 0; i <= 3; i++ {
+		if i > 0 {
+			time.Sleep(time.Duration(i) * markSentRetry.quick)
+		}
+		_, err := box.MarkSent(draftID, msgID, at)
+		if err == nil {
+			if i > 0 {
+				_ = os.Remove(unsavedPath(s, draftID))
+			}
+			return
+		}
+		_ = audit.Log(s.AuditPath(), "mark_sent_failed", "draft_id", draftID, "message_id", msgID, "attempt", i+1, "error", err.Error())
+		if i == 0 {
+			if werr := writeUnsaved(s, draftID, msgID, at); werr != nil {
+				_ = audit.Log(s.AuditPath(), "mark_sent_failed", "draft_id", draftID, "what", "sent-unsaved", "error", werr.Error())
+			}
+		}
+	}
+}
+
+func writeUnsaved(s *config.Settings, draftID string, msgID int64, at string) error {
+	p := unsavedPath(s, draftID)
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	raw, _ := json.Marshal(map[string]any{"message_id": msgID, "at": at})
+	return fsx.WriteFile(p, raw, 0o600)
+}
+
+// unsavedSent — черновик ушёл, а отметка ещё не записалась.
+func unsavedSent(s *config.Settings, draftID string) (int64, bool) {
+	raw, err := os.ReadFile(unsavedPath(s, draftID))
+	if err != nil {
+		return 0, !errors.Is(err, os.ErrNotExist) // не прочитать — считаем, что ушло: не задвоить
+	}
+	var v struct {
+		MessageID int64 `json:"message_id"`
+	}
+	_ = json.Unmarshal(raw, &v)
+	return v.MessageID, true
+}
+
+// finishUnsaved — уборка службы: дописать отметки, которые не легли.
+func finishUnsaved(s *config.Settings) {
+	entries, err := os.ReadDir(filepath.Join(s.DataDir(), "sent-unsaved"))
+	if err != nil {
+		return
+	}
+	box := outbox.New(s.DataDir())
+	for _, e := range entries {
+		id := e.Name()
+		raw, err := os.ReadFile(unsavedPath(s, id))
+		if err != nil {
+			continue
+		}
+		var v struct {
+			MessageID int64  `json:"message_id"`
+			At        string `json:"at"`
+		}
+		if json.Unmarshal(raw, &v) != nil {
+			continue
+		}
+		d, err := box.Get(id)
+		var nf *outbox.NotFound
+		if errors.As(err, &nf) {
+			_ = os.Remove(unsavedPath(s, id))
+			continue
+		}
+		if err == nil && d.Status == outbox.Approved {
+			if _, err = box.MarkSent(id, v.MessageID, v.At); err != nil {
+				continue
+			}
+			_ = audit.Log(s.AuditPath(), "mark_sent_recovered", "draft_id", id, "message_id", v.MessageID)
+		}
+		if err == nil {
+			_ = os.Remove(unsavedPath(s, id))
+		}
+	}
+}
+
 // finishDelivery — сообщение ушло: отметить черновик, убрать копии файлов,
 // записать в аудит.
 func finishDelivery(s *config.Settings, rule config.ChatRule, d *outbox.Draft, draftID, by string, result *omap.Map) (*omap.Map, error) {
 	box := outbox.New(s.DataDir())
 	mid, _ := result.Get("message_id")
 	msgID := toInt64(mid)
-	if _, err := box.MarkSent(draftID, msgID, audit.Now()); err != nil {
-		// сообщение уже ушло — ошибку записи статуса не выдаём за провал отправки
-		_ = audit.Log(s.AuditPath(), "mark_sent_failed", "draft_id", draftID, "error", err.Error())
-	}
+	// сообщение уже ушло — ошибку записи статуса не выдаём за провал
+	// отправки, но и отправить его снова не даём
+	markSentDurably(s, box, draftID, msgID)
 	attach.Drop(s, draftID)
 	names := make([]string, len(d.Files))
 	for i, f := range d.Files {
