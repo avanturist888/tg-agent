@@ -11,3 +11,10 @@
   — каждый чат. Агенту из контейнера — нет. Архив для них уже есть
   (`tg_archive_chat`, право `manage_folders`). Ответить life (тред
   381a5e72-ccba-4bb8-bcad-af1f70979fbf), когда будет готово.
+- Убрать слой перехода на state.db: `store/legacy.go`, `store/rollback.go`,
+  `cli/cutover.go`, `cli/rollback.go`, `internal/procs`, шаги cutover в
+  `scripts/build.ps1`, миграционные куски в `core/bots.go` и
+  `core/state.go`. Условие — все установки переехали: у владельца
+  (профили main, work, max, whatsapp) и у Рамазана `tg doctor` показывает,
+  что старых файлов нет, и неделю не нужен откат. Схему базы
+  (`store/schema.go`) не трогать.
