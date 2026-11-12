@@ -172,10 +172,24 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 		_ = audit.Log(s.AuditPath(), "send_skipped_failed", "draft_id", draftID, "by", by, "error", *cur.SendError)
 		return ""
 	}
+	if claim.Retry {
+		if _, sent := unsavedSent(s, draftID); sent {
+			return "" // ушло, отметку допишет уборка (finishUnsaved)
+		}
+		// прошлая попытка прервалась без итога (процесс умер, не записалась
+		// ошибка или отметка): сообщение могло уйти частью или целиком —
+		// повторять вслепую нельзя, решает человек или агент
+		msg := "прошлая попытка отправки прервалась без итога — сообщение могло уйти частью или целиком. " +
+			"Проверь чат; повторить — tg_send_draft"
+		_ = audit.Log(s.AuditPath(), "send_uncertain", "draft_id", draftID, "by", by)
+		if _, err := box.MarkSendError(draftID, msg); err != nil {
+			_ = audit.Log(s.AuditPath(), "mark_error_failed", "draft_id", draftID, "error", err.Error())
+		}
+		return "⚠️ **Не отправлено автоматически** — " + bot.MDEscape(msg)
+	}
 	var (
 		result *omap.Map
 		errMsg string
-		denied bool // отказ окончательный — в том числе «часть уже ушла»
 	)
 	for attempt := 1; attempt <= 3; attempt++ {
 		r, err := sendClaimed(ctx, s, draftID, by)
@@ -186,7 +200,6 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 		errMsg = fmt.Sprintf("%s: %v", errName(err), err)
 		var d *Denied
 		if errors.As(err, &d) { // запрет (чат закрыт, статус не тот, часть ушла) — повтор не поможет
-			denied = true
 			break
 		}
 		_ = audit.Log(s.AuditPath(), "send_failed", "draft_id", draftID, "attempt", attempt, "error", err.Error())
@@ -203,15 +216,6 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 		if d, err := box.Get(draftID); err == nil && d.Status == outbox.Sent && d.MessageID != nil {
 			result = omap.New().Set("sent", true).Set("message_id", *d.MessageID)
 		}
-	}
-	if result == nil && !denied && errors.Is(ctx.Err(), context.Canceled) {
-		// оборвали снаружи (служба останавливается), а не сорвалась отправка:
-		// черновик остаётся одобренным без ошибки — его дошлёт следующая
-		// досылка (recoverApproved), а не похоронит отметка SendError.
-		// Окончательный отказ (Denied) так не прячем: его дают и тогда, когда
-		// часть сообщения уже ушла (WhatsApp, MAX) — повтор её задвоил бы
-		_ = audit.Log(s.AuditPath(), "send_interrupted", "draft_id", draftID, "by", by, "error", errMsg)
-		return ""
 	}
 	if result == nil {
 		if errMsg == "" {
@@ -646,8 +650,10 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 }
 
 // RecoverInterrupted досылает то, что одобрили кнопкой (или автоотправкой),
-// но прошлая служба не успела отправить — её убили между нажатием и
-// отправкой. В режимах без бота статус approved законно ждёт агента или CLI.
+// но прошлая служба не успела взять в отправку — её убили между нажатием и
+// захватом. Убили уже посреди отправки — deliver не повторит, а отметит
+// сбоем «могло уйти» (Claim.Retry). В режимах без бота статус approved
+// законно ждёт агента или CLI.
 func RecoverInterrupted(ctx context.Context, s *config.Settings) {
 	recoverApproved(ctx, s, processStarted, "дослано после перезапуска службы")
 }

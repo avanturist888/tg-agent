@@ -114,6 +114,10 @@ CREATE TABLE chat_set_blocked (
 	PRIMARY KEY (set_key, chat_id)
 ) WITHOUT ROWID;
 `,
+	// 2: сколько раз черновик брали в отправку (outbox.ClaimSend) — пишется
+	// до первого байта в сеть. Была попытка, а итога нет — могло уйти:
+	// автоматически такой черновик больше не отправляется.
+	`ALTER TABLE drafts ADD COLUMN send_attempts INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // Version — версия схемы, которую знает эта сборка.

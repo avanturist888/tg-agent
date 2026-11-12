@@ -398,6 +398,10 @@ type Claim struct {
 	ID    string
 	pid   int
 	since float64
+	// Retry — черновик уже брали в отправку раньше, а итога (отправлен,
+	// записанный сбой) нет: прошлая попытка прервалась и могла дойти частью
+	// или целиком. Отметка попытки пишется в том же захвате, до отправки.
+	Retry bool
 }
 
 // pidAlive — жив ли процесс (подменяют тесты).
@@ -426,12 +430,13 @@ func (o *Outbox) ClaimSend(id string) (*Claim, *Draft, error) {
 			return err
 		}
 		var (
-			body  string
-			pid   sql.NullInt64
-			since sql.NullFloat64
+			body     string
+			pid      sql.NullInt64
+			since    sql.NullFloat64
+			attempts int
 		)
-		err := tx.QueryRowContext(ctx, "SELECT body, sender_pid, sender_since FROM drafts WHERE id = ?", id).
-			Scan(&body, &pid, &since)
+		err := tx.QueryRowContext(ctx, "SELECT body, sender_pid, sender_since, send_attempts FROM drafts WHERE id = ?", id).
+			Scan(&body, &pid, &since, &attempts)
 		if errors.Is(err, sql.ErrNoRows) {
 			return &NotFound{ID: id}
 		}
@@ -450,10 +455,11 @@ func (o *Outbox) ClaimSend(id string) (*Claim, *Draft, error) {
 			return nil
 		}
 		at := float64(now.UnixNano()) / 1e9
-		if _, err := tx.ExecContext(ctx, "UPDATE drafts SET sender_pid = ?, sender_since = ? WHERE id = ?", me, at, id); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE drafts SET sender_pid = ?, sender_since = ?, send_attempts = send_attempts + 1 WHERE id = ?",
+			me, at, id); err != nil {
 			return err
 		}
-		claim = &Claim{o: o, ID: id, pid: me, since: at}
+		claim = &Claim{o: o, ID: id, pid: me, since: at, Retry: attempts > 0 && d.SendError == nil}
 		return nil
 	})
 	if err != nil {

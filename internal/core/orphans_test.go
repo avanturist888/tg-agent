@@ -99,9 +99,10 @@ func TestRecoverOrphanApproved(t *testing.T) {
 	}
 }
 
-// Досылку оборвала остановка службы — это не сбой отправки: черновик
-// остаётся одобренным без ошибки, его дошлёт следующий проход.
-func TestRecoverCancelledNotFailed(t *testing.T) {
+// Досылку оборвала остановка службы посреди попытки: ушло ли — неизвестно,
+// поэтому это сбой, а не «дошлём потом»; остановленная досылка следующие
+// черновики не берёт.
+func TestRecoverCancelledIsFailure(t *testing.T) {
 	s := watchEnv(t)
 	s.SendPolicy = "bot_approval"
 	box := outbox.New(s.DataDir())
@@ -114,19 +115,45 @@ func TestRecoverCancelledNotFailed(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if got := deliver(ctx, s, d.ID, "test"); got != "" {
-		t.Fatalf("итог при обрыве: %q", got)
-	}
-	if got, _ := box.Get(d.ID); got.SendError != nil || got.Status != outbox.Approved {
-		t.Fatalf("обрыв записан ошибкой: %+v", got)
-	}
-	if raw, _ := os.ReadFile(s.AuditPath()); !strings.Contains(string(raw), "send_interrupted") {
-		t.Fatal("в аудите нет обрыва")
-	}
-	// остановка службы — проход не берёт следующие черновики
 	recoverApproved(ctx, s, time.Now().Add(time.Hour), "test")
 	if raw, _ := os.ReadFile(s.AuditPath()); strings.Contains(string(raw), "recover_interrupted") {
 		t.Fatal("досылка пошла после остановки")
+	}
+	if got := deliver(ctx, s, d.ID, "test"); !strings.Contains(got, "Не отправлено") {
+		t.Fatalf("итог при обрыве: %q", got)
+	}
+	if got, _ := box.Get(d.ID); got.SendError == nil {
+		t.Fatalf("обрыв не записан: %+v", got)
+	}
+}
+
+// Попытка была (захват записан), а итога нет — процесс умер посреди
+// отправки или не смог записать ни отметку, ни ошибку. Сам такой черновик
+// больше не отправляется: сбой «могло уйти» — решает человек или агент.
+func TestDeliverAfterUnfinishedAttempt(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	c, _, err := box.ClaimSend(d.ID)
+	if err != nil || c == nil {
+		t.Fatalf("захват: %v", err)
+	}
+	if c.Retry {
+		t.Fatal("первая попытка помечена повтором")
+	}
+	c.Release() // итога нет
+	called := 0
+	old := sendClaimed
+	sendClaimed = func(context.Context, *config.Settings, string, string) (*omap.Map, error) {
+		called++
+		return omap.New().Set("message_id", 1), nil
+	}
+	t.Cleanup(func() { sendClaimed = old })
+	if got := deliver(context.Background(), s, d.ID, "auto_send"); !strings.Contains(got, "могло уйти") || called != 0 {
+		t.Fatalf("итог %q, отправок %d", got, called)
+	}
+	if got, _ := box.Get(d.ID); got.SendError == nil || got.Status != outbox.Approved {
+		t.Fatalf("черновик: %+v", got)
 	}
 }
 
@@ -220,6 +247,9 @@ func TestDeliverSkipsRecordedFailure(t *testing.T) {
 // дописывает её, как только база примет.
 func TestMarkSentDurably(t *testing.T) {
 	s := watchEnv(t)
+	rule := s.Chats["test"]
+	rule.Send = true // иначе deliverClaimed откажет раньше, чем дойдёт до отметки
+	s.Chats["test"] = rule
 	box := outbox.New(s.DataDir())
 	d := approved(t, box, "test")
 	db, err := stateDB(s)
@@ -238,8 +268,8 @@ func TestMarkSentDurably(t *testing.T) {
 		t.Fatal("ушедшее без отметки не запомнено")
 	}
 	var dn *Denied
-	if _, err := deliverClaimed(context.Background(), s, d.ID, "test"); !errors.As(err, &dn) {
-		t.Fatalf("повторная отправка не отказана: %v", err)
+	if _, err := deliverClaimed(context.Background(), s, d.ID, "test"); !errors.As(err, &dn) || !strings.Contains(err.Error(), "отметка в базу") {
+		t.Fatalf("повторная отправка не отказана отметкой: %v", err)
 	}
 	finishUnsaved(s) // база всё ещё не принимает — файл остаётся
 	if _, ok := unsavedSent(s, d.ID); !ok {
