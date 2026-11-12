@@ -19,7 +19,11 @@ const updatesUsage = `tg updates — карточки обновлений MAX �
                                     снять кнопку и закрепление, дописать вывод
   tg updates escalate <источник> <что решить>
                                     нужно решение владельца: закрепить
-                                    карточку со звуком и дописать, что решить`
+                                    карточку со звуком и дописать, что решить
+  tg updates thread [here|<id треда>|new]
+                                    какой тред будит разбор: here — тред,
+                                    из которого вызвано (T3CODE_THREAD_ID),
+                                    new — каждый раз новый (как было)`
 
 func cmdUpdates(ctx context.Context, args []string) int {
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
@@ -64,6 +68,28 @@ func cmdUpdates(ctx context.Context, args []string) int {
 			return fail(err)
 		}
 		fmt.Printf("Закреплена для владельца: %s\n", c.Title)
+		return 0
+	case args[0] == "thread" && len(args) <= 2:
+		if len(args) == 2 {
+			id := args[1]
+			switch id {
+			case "here":
+				if id = os.Getenv("T3CODE_THREAD_ID"); id == "" {
+					return fail(fmt.Errorf("T3CODE_THREAD_ID не задан: вызовите из треда T3 или укажите id"))
+				}
+			case "new":
+				id = ""
+			}
+			if err := core.SetUpstreamThread(id); err != nil {
+				return fail(err)
+			}
+		}
+		if t := core.ReadUpstreamThread(); t != nil {
+			fmt.Printf("Разбор обновлений будит тред %s (назначен %s); не дошло — новый тред.\n",
+				t.Thread, t.Set.Local().Format("02.01.2006 15:04"))
+		} else {
+			fmt.Println("Разбор обновлений каждый раз заводит новый тред.")
+		}
 		return 0
 	case args[0] == "-h" || args[0] == "--help" || args[0] == "help":
 		fmt.Println(updatesUsage)

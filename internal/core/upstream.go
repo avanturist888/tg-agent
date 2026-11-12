@@ -4,7 +4,8 @@ package core
 // (internal/upstream): служба основного профиля раз в час проверяет веб-клиент
 // MAX, каталог сборок Android-клиента, PyMax и релизы gotd. Изменение сначала разбирает агент, а не владелец
 // (он не передатчик): карточка уходит в бот без звука и закрепления, а агент
-// проекта просыпается в новом треде (через Нестора) — проверяет, чинит сам и
+// проекта просыпается в назначенном треде (tg updates thread) или в новом
+// (через Нестора) — проверяет, чинит сам и
 // снимает карточку (tg updates ack) или зовёт владельца (tg updates escalate:
 // закрепить со звуком). Агента не разбудить — карточка сразу владельцу,
 // закреплённая, пока он не нажмёт «Разобрано» (u:ack). Новая карточка
@@ -494,10 +495,87 @@ func EscalateUpstream(ctx context.Context, s *config.Settings, source, note stri
 	return nil, &Bad{Msg: "у источника " + source + " нет открытой карточки (tg updates — какие есть)"}
 }
 
-// wakeProjectAgent — разбудить агента этого проекта в новом треде через
-// Нестора (почта между агентами машины). Нет Нестора — ошибка: карточка
+// UpstreamThread — тред, который будит слежение за обновлениями
+// (tg updates thread): владелец хочет разборы в одном треде агента
+// проекта, а не новый тред на каждое изменение (12.11.2026).
+type UpstreamThread struct {
+	Thread string    `json:"thread"`
+	Set    time.Time `json:"set"`
+}
+
+func upstreamThreadPath() string { return filepath.Join(config.DataPath(), "upstream_thread.json") }
+
+// ReadUpstreamThread — назначенный тред; nil — каждый раз новый.
+func ReadUpstreamThread() *UpstreamThread {
+	raw, err := os.ReadFile(upstreamThreadPath())
+	if err != nil {
+		return nil
+	}
+	var t UpstreamThread
+	if json.Unmarshal(raw, &t) != nil || strings.TrimSpace(t.Thread) == "" {
+		return nil
+	}
+	return &t
+}
+
+// SetUpstreamThread — назначить тред ("" — снова новый тред на каждое изменение).
+func SetUpstreamThread(thread string) error {
+	thread = strings.TrimSpace(thread)
+	if thread == "" {
+		err := os.Remove(upstreamThreadPath())
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	raw, _ := json.MarshalIndent(UpstreamThread{Thread: thread, Set: time.Now()}, "", "  ")
+	if err := os.MkdirAll(config.DataPath(), 0o700); err != nil {
+		return err
+	}
+	return fsx.WriteFile(upstreamThreadPath(), raw, 0o600)
+}
+
+var nestorSend = func(ctx context.Context, exe, text string, args ...string) error {
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, exe, args...)
+	cmd.Stdin = strings.NewReader(text)
+	// пишет служба, а не тред: с T3CODE_THREAD_ID (запуск из треда) Нестор
+	// не шлёт в «свой собственный тред» — назначенный тред не разбудить
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(strings.ToUpper(kv), "T3CODE_THREAD_ID=") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	hideWindow(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, truncRunes(strings.TrimSpace(string(out)), 300))
+	}
+	return nil
+}
+
+// wakeProjectAgent — разбудить агента этого проекта через Нестора (почта
+// между агентами машины): в назначенном треде (tg updates thread), а без
+// него или если туда не дошло — в новом. Нет Нестора — ошибка: карточка
 // тогда идёт владельцу.
-func wakeProjectAgent(ctx context.Context, _ *config.Settings, title, text string) error {
+func wakeProjectAgent(ctx context.Context, s *config.Settings, title, text string) error {
+	exe := nestorExe()
+	if exe == "" {
+		return errors.New("Нестор не найден (TG_NESTOR, PATH, ~/nestor/bin)")
+	}
+	if t := ReadUpstreamThread(); t != nil {
+		err := nestorSend(ctx, exe, "«"+title+"»\n\n"+text, "send", t.Thread, "-")
+		if err == nil {
+			return nil
+		}
+		if s != nil {
+			logEvent(s, "upstream_wake_thread_failed", "thread", t.Thread, "error", err.Error())
+		}
+	}
+	return nestorSend(ctx, exe, text, "send", config.Root, "-", "--new", "--title", title)
+}
+
+func nestorExe() string {
 	exe := os.Getenv("TG_NESTOR")
 	if exe == "" {
 		exe, _ = exec.LookPath("nestor")
@@ -509,18 +587,7 @@ func wakeProjectAgent(ctx context.Context, _ *config.Settings, title, text strin
 			}
 		}
 	}
-	if exe == "" {
-		return errors.New("Нестор не найден (TG_NESTOR, PATH, ~/nestor/bin)")
-	}
-	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, exe, "send", config.Root, "-", "--new", "--title", title)
-	cmd.Stdin = strings.NewReader(text)
-	hideWindow(cmd)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%w: %s", err, truncRunes(strings.TrimSpace(string(out)), 300))
-	}
-	return nil
+	return exe
 }
 
 func fileExists(p string) bool {
