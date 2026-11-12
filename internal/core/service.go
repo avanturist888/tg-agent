@@ -6,6 +6,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -1046,11 +1047,26 @@ func WaitApproval(ctx context.Context, s *config.Settings, draftID string, timeo
 // (кнопка, tg approve, автоотправка). Единственная точка, где сообщение
 // реально уходит в Telegram.
 func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string) (*omap.Map, error) {
-	if !claimDelivery(draftID) {
+	claim := claimDelivery(s, draftID)
+	if claim == nil {
 		return nil, denied("Черновик %s уже отправляется — второй раз не отправляю. Итог — tg_wait_approval(draft_id).", draftID)
 	}
-	defer releaseDelivery(draftID)
-	return deliverClaimed(ctx, s, draftID, by)
+	defer claim.release()
+	result, err := deliverClaimed(ctx, s, draftID, by)
+	var dn *Denied
+	if err != nil && !errors.As(err, &dn) {
+		// как у deliver: сбой виден в tg_wait_approval (send_failed) и в
+		// карточке, а не висит «Отправляю…»
+		box := outbox.New(s.OutboxPath())
+		if d, gerr := box.Get(draftID); gerr == nil && d.Status == outbox.Sent {
+			return nil, err // ушло, сорвалось уже после — ошибку не ставим
+		}
+		msg := fmt.Sprintf("%s: %v", errName(err), err)
+		if d, merr := box.MarkSendError(draftID, msg); merr == nil {
+			card(ctx, s, d.BotMessageID, d, "⚠️ **Не отправлено** — "+bot.MDEscape(msg))
+		}
+	}
+	return result, err
 }
 
 // deliverClaimed — DeliverApproved для черновика, уже взятого в отправку

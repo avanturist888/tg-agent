@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"tgagent/internal/lock"
 	"tgagent/internal/outbox"
 )
 
@@ -41,22 +43,58 @@ func TestRecoverSkipsOwnApproved(t *testing.T) {
 
 func TestDeliverOnce(t *testing.T) {
 	s := watchEnv(t)
-	if !claimDelivery("x") {
+	ctx := context.Background()
+	c := claimDelivery(s, "x")
+	if c == nil {
 		t.Fatal("первый захват")
 	}
-	if claimDelivery("x") {
+	if claimDelivery(s, "x") != nil {
 		t.Fatal("второй захват при идущей отправке")
 	}
-	if got := deliver(context.Background(), s, "x", "test"); got != "" {
+	if got := deliverWith(ctx, s, "x", "test", false); got != "" {
 		t.Fatalf("второй путь отправил: %q", got)
 	}
 	var d *Denied
-	if _, err := DeliverApproved(context.Background(), s, "x", "test"); err == nil || !errors.As(err, &d) {
+	if _, err := DeliverApproved(ctx, s, "x", "test"); err == nil || !errors.As(err, &d) {
 		t.Fatalf("tg_send_draft при идущей отправке: %v", err)
 	}
-	releaseDelivery("x")
-	if !claimDelivery("x") {
+	c.release()
+	if c = claimDelivery(s, "x"); c == nil {
 		t.Fatal("после конца отправки")
 	}
-	releaseDelivery("x")
+	c.release()
+}
+
+// Черновик отправляет другой процесс (его лок-файл): этот не отправляет, а
+// проигравший путь с ожиданием получает итог победителя.
+func TestDeliverOtherProcess(t *testing.T) {
+	s := watchEnv(t)
+	ctx := context.Background()
+	box := outbox.New(s.OutboxPath())
+	dr, err := box.Create(outbox.CreateOpts{Chat: "test", Text: "раз", TTLMin: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := box.Approve(dr.ID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	path := deliveryLockPath(s, dr.ID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	other := lock.New(path, 0) // «другой процесс» держит черновик
+	if err := other.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if claimDelivery(s, dr.ID) != nil {
+		t.Fatal("захват при чужом лок-файле")
+	}
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		_, _ = box.MarkSent(dr.ID, 777, "2026-11-12T13:00:00+00:00")
+		other.Release()
+	}()
+	if got := deliver(ctx, s, dr.ID, "test"); !strings.Contains(got, "Отправлено") || !strings.Contains(got, "777") {
+		t.Fatalf("итог победителя: %q", got)
+	}
 }

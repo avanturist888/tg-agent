@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -128,13 +129,26 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 // Человек уже нажал «Отправить» (или окно отмены закрылось): временные сбои
 // переживаем сами, прежде чем сдаваться и звать агента.
 func deliver(ctx context.Context, s *config.Settings, draftID, by string) string {
-	if !claimDelivery(draftID) {
-		// его уже отправляет другой путь этого процесса: итог в карточку
-		// напишет он, второй отправки не будет
+	return deliverWith(ctx, s, draftID, by, true)
+}
+
+// deliverWith — deliver; wait=false — черновик, который уже отправляют,
+// пропустить сразу (итог в карточку напишет тот путь), а не ждать: так
+// досылка при старте и SendDue не держат кнопки и следующие черновики.
+func deliverWith(ctx context.Context, s *config.Settings, draftID, by string, wait bool) string {
+	claim := claimDelivery(s, draftID)
+	if claim == nil {
+		// его уже отправляет другой путь (этот или другой процесс): второй
+		// отправки не будет; итог — тот, что вышел у него
 		_ = audit.Log(s.AuditPath(), "send_already_running", "draft_id", draftID, "by", by)
-		return ""
+		if !wait {
+			return ""
+		}
+		waitDelivery(ctx, s, draftID)
+		d, _ := outbox.New(s.OutboxPath()).Get(draftID)
+		return outcomeSummary(s, d)
 	}
-	defer releaseDelivery(draftID)
+	defer claim.release()
 	box := outbox.New(s.OutboxPath())
 	var (
 		result *omap.Map
@@ -175,17 +189,11 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 		}
 		return "⚠️ **Не отправлено** — " + bot.MDEscape(errMsg)
 	}
-	d, _ := box.Get(draftID)
-	t := d.Chat
-	if d != nil {
-		t = title(s, d)
-	}
 	mid, _ := result.Get("message_id")
-	done := "Отправлено"
-	if d != nil && d.EditOf != 0 {
-		done = "Исправлено"
+	if d, err := box.Get(draftID); err == nil {
+		return sentSummary(s, d, mid)
 	}
-	return fmt.Sprintf("✅ **%s** в «%s» в %s (id %v)", done, bot.MDEscape(t), time.Now().Format("15:04"), mid)
+	return fmt.Sprintf("✅ **Отправлено** в %s (id %v)", time.Now().Format("15:04"), mid)
 }
 
 func errName(err error) string {
@@ -377,7 +385,7 @@ func SendDue(ctx context.Context, s *config.Settings) {
 	}
 	for _, d := range due {
 		_ = audit.Log(s.AuditPath(), "approve", "draft_id", d.ID, "chat", d.Chat, "by", "auto_send")
-		summary := deliver(ctx, s, d.ID, "auto_send")
+		summary := deliverWith(ctx, s, d.ID, "auto_send", false)
 		// карточку — после отправки, а в службе ещё и в стороне: подвисший
 		// Bot API не должен задерживать ни это сообщение, ни следующие.
 		// Короткоживущий send-due обновляет её сам — иначе не успеет до выхода.
@@ -621,7 +629,7 @@ func RecoverInterrupted(ctx context.Context, s *config.Settings) {
 			continue
 		}
 		_ = audit.Log(s.AuditPath(), "recover_interrupted", "draft_id", d.ID, "chat", d.Chat)
-		summary := deliver(ctx, s, d.ID, by+" (дослано после перезапуска службы)")
+		summary := deliverWith(ctx, s, d.ID, by+" (дослано после перезапуска службы)", false)
 		card(ctx, s, d.BotMessageID, d, summary)
 	}
 }
@@ -642,19 +650,90 @@ func approvedBefore(d *outbox.Draft, t time.Time) bool {
 	return err != nil || !at.After(t.Truncate(time.Second))
 }
 
-// delivering — черновики, которые этот процесс сейчас отправляет. Отправку
-// ведёт служба (кнопка, автоотправка, досылка после перезапуска,
-// tg_send_draft — всё в ней), и два пути не должны отправить один черновик
-// дважды: статус approved до конца отправки не меняется.
+// Захват черновика в отправку. Статус approved до конца отправки не
+// меняется, поэтому два пути (кнопка, автоотправка, досылка после
+// перезапуска, tg_send_draft, tgw send-due без службы) без захвата отправили
+// бы черновик дважды — 12.11.2026 так и вышло. Захват — лок-файл на черновик
+// (data/sending/<id>.lock): его видят и другие процессы, а лок умершего
+// процесса снимается сам (pid владельца). delivering — тот же захват внутри
+// процесса, если лок-файл завести не вышло.
 var delivering sync.Map
 
-// claimDelivery — взять черновик в отправку; false — его уже отправляют.
-func claimDelivery(id string) bool {
-	_, busy := delivering.LoadOrStore(id, struct{}{})
-	return !busy
+func deliveryLockPath(s *config.Settings, id string) string {
+	return filepath.Join(s.DataDir(), "sending", id)
 }
 
-func releaseDelivery(id string) { delivering.Delete(id) }
+// delivery — взятый в отправку черновик; release — отпустить.
+type delivery struct {
+	id   string
+	file *lock.File
+}
+
+func (d *delivery) release() {
+	if d.file != nil {
+		d.file.Release()
+	}
+	delivering.Delete(d.id)
+}
+
+// claimDelivery — взять черновик в отправку; nil — его уже отправляют
+// (этот или другой процесс).
+func claimDelivery(s *config.Settings, id string) *delivery {
+	if _, busy := delivering.LoadOrStore(id, struct{}{}); busy {
+		return nil
+	}
+	d := &delivery{id: id}
+	path := deliveryLockPath(s, id)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		_ = audit.Log(s.AuditPath(), "send_lock_failed", "draft_id", id, "error", err.Error())
+		return d // хотя бы захват внутри процесса
+	}
+	f := lock.New(path, 0)
+	if err := f.Acquire(context.Background()); err != nil {
+		if lock.IsBusy(err) {
+			delivering.Delete(id)
+			return nil
+		}
+		_ = audit.Log(s.AuditPath(), "send_lock_failed", "draft_id", id, "error", err.Error())
+		return d
+	}
+	d.file = f
+	return d
+}
+
+// waitDelivery — дождаться, пока черновик отпустит тот, кто его отправляет
+// (дольше всего — ожидание сессии и повторы, ~6 мин).
+func waitDelivery(ctx context.Context, s *config.Settings, id string) {
+	deadline := time.Now().Add(7 * time.Minute)
+	for time.Now().Before(deadline) && ctx.Err() == nil {
+		_, inProc := delivering.Load(id)
+		if !inProc && !lock.Held(deliveryLockPath(s, id)) {
+			return
+		}
+		sleepCtx(ctx, 500*time.Millisecond)
+	}
+}
+
+// outcomeSummary — итог для карточки по состоянию черновика ("" — неясно).
+func outcomeSummary(s *config.Settings, d *outbox.Draft) string {
+	switch {
+	case d == nil:
+		return ""
+	case d.Status == outbox.Sent && d.MessageID != nil:
+		return sentSummary(s, d, *d.MessageID)
+	case d.SendError != nil:
+		return "⚠️ **Не отправлено** — " + bot.MDEscape(*d.SendError)
+	}
+	return ""
+}
+
+func sentSummary(s *config.Settings, d *outbox.Draft, mid any) string {
+	done := "Отправлено"
+	if d.EditOf != 0 {
+		done = "Исправлено"
+	}
+	return fmt.Sprintf("✅ **%s** в «%s» в %s (id %v)", done, bot.MDEscape(title(s, d)), time.Now().Format("15:04"), mid)
+}
 
 // RunButtons — постоянный слушатель кнопок бота (часть службы): нажатие
 // срабатывает, даже если агент ушёл; заодно досылает автоотправку в срок.
