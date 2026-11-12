@@ -141,6 +141,8 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 //
 // Черновик, который уже не approved (его успели отправить, отменить, он
 // протух), не отправляется: итог — по его статусу.
+var sendClaimed = deliverClaimed // тесты подменяют
+
 func deliver(ctx context.Context, s *config.Settings, draftID, by string) string {
 	box := outbox.New(s.DataDir())
 	claim, cur, err := box.ClaimSend(draftID)
@@ -162,16 +164,18 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 	var (
 		result *omap.Map
 		errMsg string
+		denied bool // отказ окончательный — в том числе «часть уже ушла»
 	)
 	for attempt := 1; attempt <= 3; attempt++ {
-		r, err := deliverClaimed(ctx, s, draftID, by)
+		r, err := sendClaimed(ctx, s, draftID, by)
 		if err == nil {
 			result = r
 			break
 		}
 		errMsg = fmt.Sprintf("%s: %v", errName(err), err)
 		var d *Denied
-		if errors.As(err, &d) { // запрет (чат закрыт, статус не тот) — повтор не поможет
+		if errors.As(err, &d) { // запрет (чат закрыт, статус не тот, часть ушла) — повтор не поможет
+			denied = true
 			break
 		}
 		_ = audit.Log(s.AuditPath(), "send_failed", "draft_id", draftID, "attempt", attempt, "error", err.Error())
@@ -189,10 +193,12 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 			result = omap.New().Set("sent", true).Set("message_id", *d.MessageID)
 		}
 	}
-	if result == nil && errors.Is(ctx.Err(), context.Canceled) {
+	if result == nil && !denied && errors.Is(ctx.Err(), context.Canceled) {
 		// оборвали снаружи (служба останавливается), а не сорвалась отправка:
 		// черновик остаётся одобренным без ошибки — его дошлёт следующая
-		// досылка (recoverApproved), а не похоронит отметка SendError
+		// досылка (recoverApproved), а не похоронит отметка SendError.
+		// Окончательный отказ (Denied) так не прячем: его дают и тогда, когда
+		// часть сообщения уже ушла (WhatsApp, MAX) — повтор её задвоил бы
 		_ = audit.Log(s.AuditPath(), "send_interrupted", "draft_id", draftID, "by", by, "error", errMsg)
 		return ""
 	}

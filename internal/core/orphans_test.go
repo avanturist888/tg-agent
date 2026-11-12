@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"tgagent/internal/config"
+	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
 )
 
@@ -126,5 +127,27 @@ func TestRecoverCancelledNotFailed(t *testing.T) {
 	recoverApproved(ctx, s, time.Now().Add(time.Hour), "test")
 	if raw, _ := os.ReadFile(s.AuditPath()); strings.Contains(string(raw), "recover_interrupted") {
 		t.Fatal("досылка пошла после остановки")
+	}
+}
+
+// Часть сообщения ушла, и тут служба останавливается: отказ Denied
+// («часть ушла») главнее обрыва — черновик помечен ошибкой, досылка его не
+// повторит (иначе ушедшая часть задвоилась бы).
+func TestRecoverCancelledAfterPartial(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	old := sendClaimed
+	sendClaimed = func(context.Context, *config.Settings, string, string) (*omap.Map, error) {
+		cancel() // остановка службы посреди отправки
+		return nil, &Denied{Msg: "часть сообщения ушла (1 из 2 файлов)"}
+	}
+	t.Cleanup(func() { sendClaimed = old })
+	if got := deliver(ctx, s, d.ID, "test"); !strings.Contains(got, "Не отправлено") {
+		t.Fatalf("итог: %q", got)
+	}
+	if got, _ := box.Get(d.ID); got.SendError == nil {
+		t.Fatalf("частичная отправка не записана: %+v", got)
 	}
 }
