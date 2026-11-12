@@ -131,6 +131,10 @@ UPDATE drafts SET send_attempts = 1 WHERE sender_pid IS NOT NULL;`,
 	// 5: хеш выгруженного откатом содержимого — пишется до самого файла:
 	// повтор прерванной выгрузки узнаёт свой файл по нему
 	`ALTER TABLE legacy_imports ADD COLUMN export_hash TEXT NOT NULL DEFAULT '';`,
+	// 6: хеш выгрузки, что лежит на диске, пока новая (повтор) её не
+	// заменила: умри повтор между записью нового хеша и файла — следующий
+	// узнает свой прежний файл по нему
+	`ALTER TABLE legacy_imports ADD COLUMN prev_export_hash TEXT NOT NULL DEFAULT '';`,
 }
 
 // Version — версия схемы, которую знает эта сборка.

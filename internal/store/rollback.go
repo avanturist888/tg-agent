@@ -133,14 +133,17 @@ func ExportLegacy(dir string) ([]string, error) {
 	}
 	ctx := context.Background()
 	list := legacyList()
+	onDisk := map[string]string{} // файл → хеш своей выгрузки, что на диске
 	for _, l := range list {
 		if l.Export == nil && l.ExportDir == nil {
 			continue
 		}
 		p := filepath.Join(dir, filepath.FromSlash(l.File))
-		if !ownExport(ctx, db, l, p) {
+		have, ok := ownExport(ctx, db, l, p)
+		if !ok {
 			return nil, fmt.Errorf("%s уже лежит, и выгружала его не эта выгрузка (ещё не перенесён или его вела старая сборка) — поверх него нельзя", p)
 		}
+		onDisk[l.File] = have
 	}
 	if err := RevokeCutover(dir); err != nil {
 		return nil, err
@@ -184,9 +187,10 @@ func ExportLegacy(dir string) ([]string, error) {
 				continue // в базе нечего отдавать
 			}
 			e.seal()
-			if _, err := tx.ExecContext(ctx, `INSERT INTO legacy_imports(file, imported, size, mtime, rows, exported, export_hash) VALUES(?, ?, 0, 0, 0, 1, ?)
-				ON CONFLICT(file) DO UPDATE SET exported = 1, export_hash = excluded.export_hash`,
-				l.File, time.Now().Unix(), e.hash); err != nil {
+			// прежний свой файл на диске (повтор) узнаётся и до замены
+			if _, err := tx.ExecContext(ctx, `INSERT INTO legacy_imports(file, imported, size, mtime, rows, exported, export_hash, prev_export_hash) VALUES(?, ?, 0, 0, 0, 1, ?, ?)
+				ON CONFLICT(file) DO UPDATE SET exported = 1, export_hash = excluded.export_hash, prev_export_hash = excluded.prev_export_hash`,
+				l.File, time.Now().Unix(), e.hash, onDisk[l.File]); err != nil {
 				return err
 			}
 			exps = append(exps, e)
@@ -205,7 +209,7 @@ func ExportLegacy(dir string) ([]string, error) {
 		// размер и время — чтобы перенос узнал нетронутый файл и не вливал его
 		size, mtime, err := stampOf(p, e.l.Dir)
 		if err == nil {
-			_, err = db.Q().ExecContext(ctx, "UPDATE legacy_imports SET size = ?, mtime = ? WHERE file = ?", size, mtime, e.l.File)
+			_, err = db.Q().ExecContext(ctx, "UPDATE legacy_imports SET size = ?, mtime = ?, prev_export_hash = '' WHERE file = ?", size, mtime, e.l.File)
 		}
 		if err != nil {
 			return done, fmt.Errorf("%s: %w", e.l.File, err)
@@ -272,38 +276,39 @@ func (e *export) write(p string) error {
 
 // ownExport — файла (каталога) нет или его выгрузила выгрузка, и он не
 // тронут после: содержимое совпадает с записанным намерением.
-func ownExport(ctx context.Context, db *DB, l Legacy, path string) bool {
+func ownExport(ctx context.Context, db *DB, l Legacy, path string) (string, bool) {
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return true
+		return "", true
 	}
 	var exp int64
-	var want string
-	if err := db.Q().QueryRowContext(ctx, "SELECT exported, export_hash FROM legacy_imports WHERE file = ?", l.File).Scan(&exp, &want); err != nil || exp == 0 {
-		return false
+	var want, prev string
+	if err := db.Q().QueryRowContext(ctx, "SELECT exported, export_hash, prev_export_hash FROM legacy_imports WHERE file = ?", l.File).Scan(&exp, &want, &prev); err != nil || exp == 0 {
+		return "", false
 	}
 	e := &export{l: l}
 	if l.Dir {
 		entries, err := os.ReadDir(path)
 		if err != nil {
-			return false
+			return "", false
 		}
 		e.files = map[string][]byte{}
 		for _, en := range entries {
 			b, err := os.ReadFile(filepath.Join(path, en.Name()))
 			if err != nil {
-				return false
+				return "", false
 			}
 			e.files[en.Name()] = b
 		}
 	} else {
 		b, err := os.ReadFile(path)
 		if err != nil {
-			return false
+			return "", false
 		}
 		e.file = b
 	}
 	e.seal()
-	return e.hash == want
+	// новый хеш (файл уже заменён) или прежний (повтор умер до замены)
+	return e.hash, e.hash == want || (prev != "" && e.hash == prev)
 }
 
 func stampOf(p string, dir bool) (int64, int64, error) {

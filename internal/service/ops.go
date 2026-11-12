@@ -175,7 +175,10 @@ func init() {
 		})},
 		// нажатие кнопки общего бота: основная служба передаёт его аккаунту
 		"callback": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, q bot.CallbackQuery) (any, error) {
-			core.HandleCallback(ctx, s, &q)
+			// сбой (решение не принято) — ошибкой: основная служба повторит
+			if err := core.HandleCallback(ctx, s, &q); err != nil {
+				return nil, err
+			}
 			return map[string]bool{"ok": true}, nil
 		})},
 		"self": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, _ struct{}) (any, error) {

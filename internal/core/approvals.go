@@ -645,8 +645,39 @@ func errName(err error) string {
 // их разбирает основная служба: второй getUpdates сорвал бы её.
 func ownsUpdates(s *config.Settings) bool { return s.BotReady() && !s.SharedBot }
 
-// HandleCallback — нажатие кнопки под карточкой.
-func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) {
+// retryable — решение владельца не принято из-за сбоя (паника, база,
+// служба аккаунта не ответила), а не по существу: разбор нажатия надо
+// повторить (Pump не сдвигает смещение за ним).
+type retryable struct{ err error }
+
+func (r retryable) Error() string { return r.err.Error() }
+func (r retryable) Unwrap() error { return r.err }
+
+// isRetry — сбой, после которого нажатие надо разобрать снова.
+func isRetry(err error) bool {
+	var r retryable
+	return errors.As(err, &r)
+}
+
+// refusal — ошибка изменения черновика: отказ по существу (BadState —
+// статус уже другой) решён, прочее — сбой, повторить.
+func refusal(err error) error {
+	var bs *outbox.BadState
+	if errors.As(err, &bs) {
+		return nil
+	}
+	return retryable{err}
+}
+
+// HandleCallback — нажатие кнопки под карточкой. Ошибка (retryable) —
+// решение не принято из-за сбоя: нажатие надо разобрать снова.
+func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			_ = audit.Log(s.AuditPath(), "callback_failed", "error", fmt.Sprint(r))
+			err = retryable{fmt.Errorf("паника: %v", r)}
+		}
+	}()
 	data := q.Data
 	if q.From.ID != s.ApprovalChatID {
 		bot.AnswerCallback(ctx, s, q.ID, "Эта кнопка не для вас.")
@@ -656,7 +687,7 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 	// «@work|…» — кнопка аккаунта work под общим ботом: решает его служба
 	if acct, rest := config.SplitCallback(data); acct != "" {
 		if !config.IsOwnAccount(acct) {
-			passCallback(ctx, s, q, acct)
+			err = passCallback(ctx, s, q, acct)
 			return
 		}
 		data = rest
@@ -691,8 +722,13 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 	}
 	draftID, verdict := parts[1], parts[2]
 	box := outbox.New(s.DataDir())
-	d, err := box.Get(draftID)
-	if err != nil {
+	d, gerr := box.Get(draftID)
+	if gerr != nil {
+		var nf *outbox.NotFound
+		if !errors.As(gerr, &nf) {
+			err = retryable{gerr}
+			return
+		}
 		bot.AnswerCallback(ctx, s, q.ID, "Черновик не найден.")
 		return
 	}
@@ -714,7 +750,10 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 	// «Отправить сейчас» у автоотправки идёт обычным путём ниже: Approve
 	// принимает и scheduled, а таймер после этого черновик уже не тронет.
 	if d.Status == outbox.Scheduled && verdict == "no" {
-		if _, err := box.Cancel(draftID, fmt.Sprintf("telegram_button:%d", q.From.ID)); err != nil {
+		if _, cerr := box.Cancel(draftID, fmt.Sprintf("telegram_button:%d", q.From.ID)); cerr != nil {
+			if err = refusal(cerr); err != nil {
+				return
+			}
 			bot.AnswerCallback(ctx, s, q.ID, "Поздно — уже отправляется.")
 			return
 		}
@@ -743,8 +782,11 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 
 	var summary string
 	if verdict == "ok" {
-		if _, err := box.Approve(draftID, fmt.Sprintf("telegram_button:%d", q.From.ID)); err != nil {
-			bot.AnswerCallback(ctx, s, q.ID, err.Error())
+		if _, aerr := box.Approve(draftID, fmt.Sprintf("telegram_button:%d", q.From.ID)); aerr != nil {
+			if err = refusal(aerr); err != nil {
+				return
+			}
+			bot.AnswerCallback(ctx, s, q.ID, aerr.Error())
 			return
 		}
 		_ = audit.Log(s.AuditPath(), "approve", "draft_id", draftID, "chat", d.Chat, "by", "telegram_button")
@@ -754,8 +796,11 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		card(ctx, s, cardID, d, "⏳ **Отправляю…**")
 		summary = deliver(ctx, s, draftID, "telegram_button")
 	} else {
-		if _, err := box.Cancel(draftID, fmt.Sprintf("telegram_button:%d", q.From.ID)); err != nil {
-			bot.AnswerCallback(ctx, s, q.ID, err.Error())
+		if _, cerr := box.Cancel(draftID, fmt.Sprintf("telegram_button:%d", q.From.ID)); cerr != nil {
+			if err = refusal(cerr); err != nil {
+				return
+			}
+			bot.AnswerCallback(ctx, s, q.ID, cerr.Error())
 			return
 		}
 		attach.Drop(s, draftID)
@@ -764,22 +809,26 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		summary = "✋ **Отклонено** — сообщение не ушло."
 	}
 	card(ctx, s, cardID, d, summary)
+	return
 }
 
 // passCallback — отдать нажатие службе аккаунта acct (без неё — дочернему
 // процессу того аккаунта).
-func passCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery, acct string) {
+// Не передалось (служба аккаунта и его процесс не ответили) — retryable:
+// нажатие разберётся снова, а не потеряется.
+func passCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery, acct string) error {
 	name := config.FindAccount(acct)
 	if name == "" {
 		bot.AnswerCallback(ctx, s, q.ID, "Аккаунта "+acct+" больше нет.")
-		return
+		return nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Minute) // «Отправить» ждёт отправки
 	defer cancel()
 	if err := accounts.Call(cctx, name, "callback", q, nil); err != nil {
-		bot.AnswerCallback(ctx, s, q.ID, "Аккаунт "+name+": "+err.Error())
 		_ = audit.Log(s.AuditPath(), "callback_pass_failed", "account", name, "error", err.Error())
+		return retryable{err}
 	}
+	return nil
 }
 
 func samePtr(a, b *int64) bool {
@@ -927,16 +976,26 @@ func Pump(ctx context.Context, s *config.Settings, until time.Time, stop func() 
 			sleepCtx(ctx, 5*time.Second)
 			continue
 		}
-		offset = pumpUpdates(ctx, s, offset, updates)
+		var stalled bool
+		if offset, stalled = pumpUpdates(ctx, s, offset, updates); stalled {
+			sleepCtx(ctx, retryPauseUpdate) // решение не принялось — повтор чуть погодя
+		}
 	}
 }
+
+// retryPauseUpdate — пауза перед повторным разбором решения, которое не
+// принялось из-за сбоя (тесты сокращают).
+var retryPauseUpdate = 5 * time.Second
 
 var updateHandler = handleUpdate // тесты подменяют
 
 // pumpUpdates — разобрать пачку апдейтов, вернуть новое смещение. Решения
 // владельца (isDecision) сдвигают записанное смещение после разбора,
-// остальное — до.
-func pumpUpdates(ctx context.Context, s *config.Settings, offset int64, updates []bot.Update) int64 {
+// остальное — до. Решение не принялось из-за сбоя (retryable) — пачка
+// обрывается на нём, смещение за ним не сдвигается (stalled): Telegram
+// отдаст его снова. Начатое maxUpdateTries раз — пропускается, а владельцу
+// приходит просьба нажать ещё раз: молча оно не теряется.
+func pumpUpdates(ctx context.Context, s *config.Settings, offset int64, updates []bot.Update) (int64, bool) {
 	for _, u := range updates {
 		if u.UpdateID < offset {
 			continue // уже разобран
@@ -945,6 +1004,7 @@ func pumpUpdates(ctx context.Context, s *config.Settings, offset int64, updates 
 		if decision {
 			if tries := startInflight(s, offset, u.UpdateID); tries > maxUpdateTries {
 				_ = audit.Log(s.AuditPath(), "bot_update_skipped", "update_id", u.UpdateID, "tries", tries-1)
+				say(ctx, s, "⚠️ Нажатие кнопки не удалось разобрать (сбой, подробности — в аудите, bot_update_skipped). Нажми её ещё раз.")
 				offset = u.UpdateID + 1
 				writeOffset(s, offset)
 				continue
@@ -952,27 +1012,24 @@ func pumpUpdates(ctx context.Context, s *config.Settings, offset int64, updates 
 		} else {
 			writeOffset(s, u.UpdateID+1)
 		}
-		updateHandler(ctx, s, u)
+		err := updateHandler(ctx, s, u)
+		if decision && isRetry(err) {
+			_ = audit.Log(s.AuditPath(), "callback_retry", "update_id", u.UpdateID, "error", err.Error())
+			return offset, true
+		}
 		offset = u.UpdateID + 1
 		if decision {
 			writeOffset(s, offset)
 		}
 	}
-	return offset
+	return offset, false
 }
 
 // handleUpdate — разобрать один апдейт бота; паника не роняет службу.
-func handleUpdate(ctx context.Context, s *config.Settings, u bot.Update) {
+func handleUpdate(ctx context.Context, s *config.Settings, u bot.Update) error {
+	var err error
 	if u.CallbackQuery != nil {
-		func() {
-			// одно нажатие не должно ронять службу
-			defer func() {
-				if r := recover(); r != nil {
-					_ = audit.Log(s.AuditPath(), "callback_failed", "error", fmt.Sprint(r))
-				}
-			}()
-			HandleCallback(ctx, s, u.CallbackQuery)
-		}()
+		err = HandleCallback(ctx, s, u.CallbackQuery) // панику ловит сам
 	}
 	if u.Message != nil {
 		func() {
@@ -984,6 +1041,7 @@ func handleUpdate(ctx context.Context, s *config.Settings, u bot.Update) {
 			HandleMessage(ctx, s, u.Message)
 		}()
 	}
+	return err
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {

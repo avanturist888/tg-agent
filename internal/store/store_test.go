@@ -911,3 +911,31 @@ func TestExportHandsApprovedOnce(t *testing.T) {
 		t.Fatalf("попытка прошлого отката отдана на досылку: %v %s", err, raw)
 	}
 }
+
+// Повтор выгрузки умер между записью нового хеша и самого файла: на диске —
+// прежний свой файл, и следующий повтор узнаёт его (prev_export_hash).
+func TestExportRerunDiedBeforeWrite(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "c", "status": "pending"}]`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportLegacy(dir); err != nil {
+		t.Fatal(err)
+	}
+	var have string
+	if err := db.Q().QueryRow("SELECT export_hash FROM legacy_imports WHERE file = 'outbox.json'").Scan(&have); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Q().Exec("UPDATE legacy_imports SET export_hash = 'новый', prev_export_hash = ? WHERE file = 'outbox.json'", have); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportLegacy(dir); err != nil {
+		t.Fatalf("повтор после прерванного: %v", err)
+	}
+	if count(t, db, "SELECT count(*) FROM legacy_imports WHERE file = 'outbox.json' AND prev_export_hash = ''") != 1 {
+		t.Fatal("прежний хеш не снят после записи файла")
+	}
+}
