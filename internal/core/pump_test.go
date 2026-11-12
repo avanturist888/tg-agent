@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"tgagent/internal/bot"
 	"tgagent/internal/config"
@@ -112,5 +113,37 @@ func TestHandleCallbackPanicRetry(t *testing.T) {
 	// повтор того же нажатия видит принятое решение и ничего не делает
 	if err := HandleCallback(context.Background(), s, q); err != nil {
 		t.Fatalf("повтор принятого решения: %v", err)
+	}
+}
+
+// Решение по запросу доступа не записалось (сбой базы) — нажатие не
+// принято: retryable, запрос ждёт, повтор его решает.
+func TestAccessDecisionRetry(t *testing.T) {
+	s := watchEnv(t)
+	s.ApprovalChatID = 1
+	if err := editAccess(s, func(m map[string]*accessRequest) bool {
+		m["r1"] = &accessRequest{ID: "r1", Peer: 5, Status: accessPending, Created: time.Now()}
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q := &bot.CallbackQuery{ID: "q", Data: "a:r1:no"}
+	q.From.ID = 1
+	old := saveAccessDecision
+	saveAccessDecision = func(*config.Settings, func(map[string]*accessRequest) bool) error {
+		return errors.New("database is locked")
+	}
+	if err := HandleCallback(context.Background(), s, q); !isRetry(err) {
+		t.Fatalf("сбой записи — не повтор: %v", err)
+	}
+	saveAccessDecision = old
+	if r := loadAccess(s)["r1"]; r == nil || r.Status != accessPending {
+		t.Fatalf("после сбоя запрос не ждёт: %+v", r)
+	}
+	if err := HandleCallback(context.Background(), s, q); err != nil {
+		t.Fatal(err)
+	}
+	if r := loadAccess(s)["r1"]; r == nil || r.Status != accessDenied {
+		t.Fatalf("повтор не решил запрос: %+v", r)
 	}
 }

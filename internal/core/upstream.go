@@ -366,37 +366,40 @@ func retirePinned(ctx context.Context, s *config.Settings, c pinnedCard) {
 }
 
 // handleUpstreamCallback — «Разобрано»: открепить карточку и убрать кнопку.
-func handleUpstreamCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) {
+//
+// Решение («разобрано») — запись в базе: она снимается первой, и сбой базы
+// — retryable (нажатие разберётся снова), а не «Откреплено» при живой
+// записи, которая потом снова дошла бы до владельца эскалацией. Сбой
+// открепления — тоже повтор: запись уже снята, повтор только открепит.
+func handleUpstreamCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) error {
 	if q.Message == nil {
 		upstreamAnswer(ctx, s, q.ID, "Не вижу, какое сообщение открепить.")
-		return
+		return nil
 	}
 	id := q.Message.MessageID
 	agent := false // карточку разбирал агент — она и не закреплена
-	_ = updatePinned(s, func(m map[string]pinnedCard) {
-		for _, c := range m {
-			agent = agent || (c.ID == id && c.Agent)
+	if err := updatePinned(s, func(m map[string]pinnedCard) {
+		for src, c := range m {
+			if c.ID == id {
+				agent = agent || c.Agent
+				delete(m, src)
+			}
 		}
-	})
+	}); err != nil {
+		return retryable{err}
+	}
 	if err := upstreamBot(ctx, s, "unpinChatMessage", map[string]any{
 		"chat_id": s.ApprovalChatID, "message_id": id,
 	}, nil); err != nil && !agent {
-		upstreamAnswer(ctx, s, q.ID, "Не открепилось: "+err.Error())
 		logEvent(s, "upstream_pin_failed", "message_id", id, "error", err.Error())
-		return
+		return retryable{err}
 	}
 	_ = upstreamBot(ctx, s, "editMessageReplyMarkup", map[string]any{
 		"chat_id": s.ApprovalChatID, "message_id": id, "reply_markup": map[string]any{"inline_keyboard": [][]any{}},
 	}, nil)
-	_ = updatePinned(s, func(m map[string]pinnedCard) {
-		for src, c := range m {
-			if c.ID == id {
-				delete(m, src)
-			}
-		}
-	})
 	logEvent(s, "upstream_acked", "message_id", id)
 	upstreamAnswer(ctx, s, q.ID, "Откреплено.")
+	return nil
 }
 
 // UpstreamCard — закреплённая, ещё не разобранная карточка (tg updates).

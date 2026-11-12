@@ -702,7 +702,7 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		return
 	}
 	if strings.HasPrefix(data, "a:") {
-		handleAccessCallback(ctx, s, q) // запрос доступа к чату
+		err = handleAccessCallback(ctx, s, q) // запрос доступа к чату
 		return
 	}
 	if strings.HasPrefix(data, "n:") {
@@ -710,7 +710,7 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		return
 	}
 	if data == upstreamAck {
-		handleUpstreamCallback(ctx, s, q) // «Разобрано» под карточкой обновления
+		err = handleUpstreamCallback(ctx, s, q) // «Разобрано» под карточкой обновления
 		return
 	}
 	if !strings.HasPrefix(data, "d:") {

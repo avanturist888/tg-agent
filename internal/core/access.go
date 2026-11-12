@@ -222,16 +222,24 @@ var accessTab = store.NewTable[*accessRequest](store.TAccessRequests)
 // loadAccess — все запросы (не прочитались — пусто: запросы только
 // показываются и ищутся, решения по ним — через editAccess).
 func loadAccess(s *config.Settings) map[string]*accessRequest {
-	db, err := stateDB(s)
-	if err != nil {
-		return map[string]*accessRequest{}
-	}
-	m, err := accessTab.All(context.Background(), db.Q())
+	m, err := loadAccessErr(s)
 	if err != nil {
 		logEvent(s, "access_load_failed", "error", err.Error())
 		return map[string]*accessRequest{}
 	}
 	return m
+}
+
+// saveAccessDecision — запись решения владельца (тесты подменяют сбоем).
+var saveAccessDecision = editAccess
+
+// loadAccessErr — запросы доступа; сбой базы — ошибкой, а не «запросов нет».
+func loadAccessErr(s *config.Settings) (map[string]*accessRequest, error) {
+	db, err := stateDB(s)
+	if err != nil {
+		return nil, err
+	}
+	return accessTab.All(context.Background(), db.Q())
 }
 
 // editAccess — прочитать, поменять и записать запросы одной транзакцией
@@ -517,22 +525,30 @@ func finishAccessCard(ctx context.Context, s *config.Settings, r *accessRequest,
 }
 
 // handleAccessCallback — нажатие под карточкой запроса доступа («a:<id>:<rwa|rw|r|no>»).
-func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) {
+// Решение сначала записывается, потом владелец видит итог; сбой базы
+// (чтение запроса, запись решения) — retryable: нажатие разберётся снова
+// (выдача прав повторяется без вреда — то же правило в chats.toml).
+// Отказ выдачи прав по существу — владельцу «Не вышло», кнопки остаются.
+func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) error {
 	parts := strings.SplitN(q.Data, ":", 3)
 	for len(parts) < 3 {
 		parts = append(parts, "")
 	}
 	id, verdict := parts[1], parts[2]
-	r := loadAccess(s)[id]
+	all, err := loadAccessErr(s)
+	if err != nil {
+		return retryable{err}
+	}
+	r := all[id]
 	if r == nil {
 		bot.AnswerCallback(ctx, s, q.ID, "Запрос не найден.")
-		return
+		return nil
 	}
 	if r.Status != accessPending {
 		bot.AnswerCallback(ctx, s, q.ID, "Уже решено.")
-		return
+		return nil
 	}
-	var status string
+	var status, reply string
 	switch verdict {
 	case "rwa", "rw", "r":
 		read, send, auto := true, verdict != "r", verdict == "rwa"
@@ -542,7 +558,7 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 		fresh, err := config.Load() // белый список свежий: его могли поправить, пока карточка висела
 		if err != nil {
 			bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
-			return
+			return nil
 		}
 		if r.Scope != "" {
 			if err := grantSet(ctx, fresh, r, read, send, auto); err != nil {
@@ -552,44 +568,49 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 					// «ждущим»: иначе новый запрос агента упрётся в этот
 					r.Status, r.Outcome = accessStale, st.msg
 					status = "⌛ **Не выполнено:** " + bot.MDEscape(st.msg)
-					bot.AnswerCallback(ctx, s, q.ID, "Ничего не менял: "+st.msg)
+					reply = "Ничего не менял: " + st.msg
 					break
 				}
 				bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
 				logEvent(s, "access_grant_failed", "request_id", id, "error", err.Error())
-				return
+				return nil
 			}
 			r.Status, r.CanRead, r.CanSend, r.CanAuto = accessGranted, read, send, auto
 			status = "✅ **Разрешено:** " + setGranted(r)
-			bot.AnswerCallback(ctx, s, q.ID, "Разрешено.")
+			reply = "Разрешено."
 			break
 		}
 		alias, err := grantAccess(fresh, r, read, send, auto)
 		if err != nil {
 			bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
 			logEvent(s, "access_grant_failed", "request_id", id, "error", err.Error())
-			return
+			return nil
 		}
 		r.Status, r.Alias, r.CanRead, r.CanSend, r.CanAuto = accessGranted, alias, read, send, auto
 		status = fmt.Sprintf("✅ **Разрешено:** %s, alias `%s`", grantedRights(r), alias)
-		bot.AnswerCallback(ctx, s, q.ID, "Чат открыт агентам.")
+		reply = "Чат открыт агентам."
 	default:
 		r.Status = accessDenied
 		status = "✋ **Отказано** — белый список не менялся."
-		bot.AnswerCallback(ctx, s, q.ID, "Отказано.")
+		reply = "Отказано."
 	}
 	r.Decided = time.Now()
-	_ = editAccess(s, func(m map[string]*accessRequest) bool {
+	if err := saveAccessDecision(s, func(m map[string]*accessRequest) bool {
 		if cur := m[id]; cur != nil && cur.Status == accessPending {
 			m[id] = r
 			return true
 		}
 		return false
-	})
+	}); err != nil {
+		logEvent(s, "access_save_failed", "request_id", id, "error", err.Error())
+		return retryable{err}
+	}
+	bot.AnswerCallback(ctx, s, q.ID, reply)
 	logEvent(s, "access_"+r.Status, "request_id", id, "scope", r.Scope, "chat_id", r.Peer, "title", r.Title, "alias", r.Alias,
 		"read", r.CanRead, "send", r.CanSend, "auto_send", r.CanAuto, "by", "telegram_button")
 	finishAccessCard(ctx, s, r, status)
 	go afterAccess(context.WithoutCancel(ctx), r)
+	return nil
 }
 
 // grantedRights — права из решения владельца, для карточки и агента.
