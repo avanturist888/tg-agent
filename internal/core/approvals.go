@@ -128,11 +128,37 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 	defer cancel()
 	if cardID != nil && *cardID != 0 {
+		unlock := lockCard(d.ID)
 		shown := finishCard(ctx, s, *cardID, d, title(s, d), status, d.Note)
 		rememberCard(s, d.ID, *cardID, status, shown)
+		unlock()
 		unpinDraftCard(ctx, s, d.ID) // решено — внимание владельца больше не нужно
 	}
 }
+
+// cardLocks — итог в карточку одного черновика показывают по одному (card и
+// уборка retryCards): иначе уборка показала бы прежний итог поверх нового
+// или стёрла из очереди новый, ещё не показанный.
+var cardLocks = struct {
+	sync.Mutex
+	m map[string]*sync.Mutex
+}{m: map[string]*sync.Mutex{}}
+
+func lockCard(draftID string) func() {
+	cardLocks.Lock()
+	mu := cardLocks.m[draftID]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		cardLocks.m[draftID] = mu
+	}
+	cardLocks.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+// intermediate — промежуточный итог («Отправляю…»): за ним всегда идёт
+// окончательный, повторять его незачем.
+func intermediate(status string) bool { return strings.HasPrefix(status, "⏳") }
 
 var finishCard = bot.FinishCard // тесты подменяют
 
@@ -154,9 +180,12 @@ func rememberCard(s *config.Settings, draftID string, cardID int64, status strin
 		return
 	}
 	ctx := context.Background()
-	if shown {
+	switch {
+	case shown:
 		err = pendingCardsTab.Delete(ctx, db.Q(), draftID)
-	} else {
+	case intermediate(status):
+		return // прежний несостоявшийся окончательный главнее — его не трогаем
+	default:
 		err = pendingCardsTab.Put(ctx, db.Q(), draftID, pendingCard{Card: cardID, Status: status, At: time.Now()})
 	}
 	if err != nil {
@@ -175,22 +204,47 @@ func retryCards(ctx context.Context, s *config.Settings) {
 		return
 	}
 	box := outbox.New(s.DataDir())
-	for id, p := range pending {
+	for id := range pending {
 		if ctx.Err() != nil {
 			return
 		}
-		d, err := box.Get(id)
-		var nf *outbox.NotFound
-		switch {
-		case errors.As(err, &nf):
-			_ = pendingCardsTab.Delete(ctx, db.Q(), id) // черновика нет — и карточку держать незачем
-		case err == nil:
-			if finishCard(ctx, s, p.Card, d, title(s, d), p.Status, d.Note) {
-				_ = pendingCardsTab.Delete(ctx, db.Q(), id)
-				_ = audit.Log(s.AuditPath(), "card_recovered", "draft_id", id, "message_id", p.Card)
-			}
-		}
+		retryCard(ctx, s, db, box, id)
 	}
+}
+
+// retryCard — показать запомненный итог черновика id. Запись перечитывается
+// под локом карточки (её мог заменить или снять card), а снимается только
+// та, что показана: новую, пришедшую позже, уборка не стирает.
+func retryCard(ctx context.Context, s *config.Settings, db *store.DB, box *outbox.Outbox, id string) {
+	unlock := lockCard(id)
+	defer unlock()
+	p, ok, err := pendingCardsTab.Get(ctx, db.Q(), id)
+	if err != nil || !ok {
+		return
+	}
+	d, err := box.Get(id)
+	var nf *outbox.NotFound
+	if errors.As(err, &nf) {
+		dropCard(ctx, db, id, p) // черновика нет — и карточку держать незачем
+		return
+	}
+	if err != nil || !finishCard(ctx, s, p.Card, d, title(s, d), p.Status, d.Note) {
+		return
+	}
+	dropCard(ctx, db, id, p)
+	_ = audit.Log(s.AuditPath(), "card_recovered", "draft_id", id, "message_id", p.Card)
+}
+
+// dropCard — снять запись, если это всё ещё она (другой процесс мог
+// записать новый итог).
+func dropCard(ctx context.Context, db *store.DB, id string, shown pendingCard) {
+	_ = pendingCardsTab.Edit(ctx, db, func(m map[string]pendingCard) bool {
+		if cur, ok := m[id]; ok && cur.At.Equal(shown.At) && cur.Status == shown.Status {
+			delete(m, id)
+			return true
+		}
+		return false
+	})
 }
 
 var sendClaimed = deliverClaimed // тесты подменяют
