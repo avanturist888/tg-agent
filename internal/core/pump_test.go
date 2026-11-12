@@ -147,3 +147,23 @@ func TestAccessDecisionRetry(t *testing.T) {
 		t.Fatalf("повтор не решил запрос: %+v", r)
 	}
 }
+
+// Решение записано, а итог не доведён (процесс умер посреди tellAccess,
+// нажатие уже подтверждено) — уборка доводит его и отмечает сказанным;
+// свежее не трогает.
+func TestAccessRetold(t *testing.T) {
+	s := watchEnv(t)
+	put := func(r *accessRequest) {
+		if err := editAccess(s, func(m map[string]*accessRequest) bool { m[r.ID] = r; return true }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(&accessRequest{ID: "old", Peer: 5, Status: accessDenied, Result: "✋ **Отказано**", Decided: time.Now().Add(-time.Hour)})
+	put(&accessRequest{ID: "fresh", Peer: 6, Status: accessDenied, Result: "✋ **Отказано**", Decided: time.Now()})
+	put(&accessRequest{ID: "legacy", Peer: 7, Status: accessDenied, Decided: time.Now().Add(-time.Hour)})
+	retellAccess(context.Background(), s)
+	all := loadAccess(s)
+	if !all["old"].Told || all["fresh"].Told || all["legacy"].Told {
+		t.Fatalf("доведено: old %v, fresh %v, legacy %v", all["old"].Told, all["fresh"].Told, all["legacy"].Told)
+	}
+}

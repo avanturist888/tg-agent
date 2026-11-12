@@ -310,7 +310,14 @@ func blockForAgent(s *config.Settings, peer int64) error {
 
 // clearBlocked — владелец заново открыл группу целиком: и чаты, которые туда
 // положил агент, тоже.
-func clearBlocked(key string) { _ = config.ClearSetBlocked(key) }
+// Сбой базы — retryable: решение владельца о группе без снятых блоков
+// исполнено бы частью, и нажатие надо разобрать снова.
+func clearBlocked(key string) error {
+	if err := config.ClearSetBlocked(key); err != nil {
+		return retryable{err}
+	}
+	return nil
+}
 
 // setOf — правило на группу по ключу.
 func setOf(s *config.Settings, key string) (config.ChatSet, bool) {

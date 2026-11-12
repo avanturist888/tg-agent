@@ -214,6 +214,11 @@ type accessRequest struct {
 	PubSince float64   `json:"pub_since,omitempty"`
 	Created  time.Time `json:"created"`
 	Decided  time.Time `json:"decided,omitzero"`
+	// Result — итог для карточки, записан вместе с решением; Told — итог
+	// показан и агенту сказано (afterAccess). Решено, а не сказано (процесс
+	// умер между ними) — доводят повтор нажатия и уборка (retellAccess)
+	Result string `json:"result,omitempty"`
+	Told   bool   `json:"told,omitempty"`
 }
 
 // accessTab — запросы доступа по id.
@@ -546,6 +551,9 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 	}
 	if r.Status != accessPending {
 		bot.AnswerCallback(ctx, s, q.ID, "Уже решено.")
+		if r.Result != "" && !r.Told {
+			tellAccess(ctx, s, r) // решение записано, а итог не доведён
+		}
 		return nil
 	}
 	var status, reply string
@@ -571,6 +579,9 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 					reply = "Ничего не менял: " + st.msg
 					break
 				}
+				if isRetry(err) {
+					return err
+				}
 				bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
 				logEvent(s, "access_grant_failed", "request_id", id, "error", err.Error())
 				return nil
@@ -595,6 +606,7 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 		reply = "Отказано."
 	}
 	r.Decided = time.Now()
+	r.Result = status
 	if err := saveAccessDecision(s, func(m map[string]*accessRequest) bool {
 		if cur := m[id]; cur != nil && cur.Status == accessPending {
 			m[id] = r
@@ -608,9 +620,42 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 	bot.AnswerCallback(ctx, s, q.ID, reply)
 	logEvent(s, "access_"+r.Status, "request_id", id, "scope", r.Scope, "chat_id", r.Peer, "title", r.Title, "alias", r.Alias,
 		"read", r.CanRead, "send", r.CanSend, "auto_send", r.CanAuto, "by", "telegram_button")
-	finishAccessCard(ctx, s, r, status)
-	go afterAccess(context.WithoutCancel(ctx), r)
+	go tellAccess(context.WithoutCancel(ctx), s, r)
 	return nil
+}
+
+// tellAccess — довести записанное решение: итог в карточку, агенту —
+// сообщение, потом отметка Told. Умер процесс до отметки — повтор нажатия
+// или уборка (retellAccess) доведут снова (сообщение агенту может прийти
+// дважды — лучше, чем ни разу).
+func tellAccess(ctx context.Context, s *config.Settings, r *accessRequest) {
+	finishAccessCard(ctx, s, r, r.Result)
+	afterAccess(ctx, r)
+	if err := editAccess(s, func(m map[string]*accessRequest) bool {
+		if cur := m[r.ID]; cur != nil && cur.Status == r.Status && !cur.Told {
+			cur.Told = true
+			return true
+		}
+		return false
+	}); err != nil {
+		logEvent(s, "access_tell_failed", "request_id", r.ID, "error", err.Error())
+	}
+}
+
+// retellAccess — уборка: решения, записанные, но не доведённые (процесс
+// умер посреди tellAccess, а нажатие уже подтверждено). Свежие не трогаем
+// — их сейчас доводит сам решивший (afterAccess ждёт до 2 минут).
+func retellAccess(ctx context.Context, s *config.Settings) {
+	for _, r := range loadAccess(s) {
+		if ctx.Err() != nil {
+			return
+		}
+		if r.Status == accessPending || r.Result == "" || r.Told || time.Since(r.Decided) < 3*time.Minute {
+			continue
+		}
+		logEvent(s, "access_retold", "request_id", r.ID)
+		tellAccess(ctx, s, r)
+	}
 }
 
 // grantedRights — права из решения владельца, для карточки и агента.

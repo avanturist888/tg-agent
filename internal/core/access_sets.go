@@ -342,14 +342,18 @@ func grantSet(ctx context.Context, s *config.Settings, r *accessRequest, read, s
 	case scopeManage:
 		return chatsfile.SetManageFolders(true)
 	case scopePublic:
-		clearBlocked(config.PublicChannelsKey)
+		if err := clearBlocked(config.PublicChannelsKey); err != nil {
+			return err
+		}
 		return chatsfile.SetPublicChannels(true, note)
 	}
 	if set, ok := folderSet(s, r.Folder, r.Title); ok {
 		read, send, auto = read || set.Read, send || set.Send, auto || set.AutoSend()
 		note = set.Note
 	}
-	clearBlocked(config.FolderKey(r.Folder, ""))
+	if err := clearBlocked(config.FolderKey(r.Folder, "")); err != nil {
+		return err
+	}
 	return chatsfile.SetFolder(chatsfile.Folder{ID: r.Folder, Name: r.Title, Read: read, Send: send, Auto: send && auto, Note: note})
 }
 

@@ -113,6 +113,7 @@ func maybeSweep(ctx context.Context, s *config.Settings, last *time.Time) {
 			showDueCards(cctx, s) // «Отправлено», не показанное умершим отправителем
 			sweepPins(cctx, s)
 			publishOrphanAccess(cctx, s)
+			retellAccess(cctx, s) // решения о доступе, не доведённые до карточки и агента
 		}
 	}()
 }
