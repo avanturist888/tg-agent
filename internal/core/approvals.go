@@ -130,14 +130,26 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 	defer cancel()
 	if cardID != nil && *cardID != 0 {
-		shown := false
-		if unlock, ok := lockCard(ctx, s, d.ID); ok {
-			shown = finishCard(ctx, s, *cardID, d, title(s, d), status, d.Note)
-			unlock()
-		}
-		rememberCard(s, d.ID, *cardID, status, shown)
+		showCard(ctx, s, d, *cardID, status)
 		unpinDraftCard(ctx, s, d.ID) // решено — внимание владельца больше не нужно
 	}
+}
+
+// showCard — показать итог и поправить очередь, не отпуская лок карточки:
+// отпусти его между показом и очередью — уборка успела бы взять прежний итог
+// и показать его поверх этого. Версия итога — когда его начали показывать:
+// не показанный уходит в очередь с ней, показанный снимает из очереди
+// только записи не новее себя (новую, пришедшую, пока ждали лок, — нет).
+func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID int64, status string) {
+	version := time.Now()
+	unlock, ok := lockCard(ctx, s, d.ID)
+	if !ok {
+		rememberCard(s, d.ID, cardID, status, version, false)
+		return
+	}
+	defer unlock()
+	shown := finishCard(ctx, s, cardID, d, title(s, d), status, d.Note)
+	rememberCard(s, d.ID, cardID, status, version, shown)
 }
 
 // lockCard — итог в карточку одного черновика показывают по одному, во всех
@@ -179,20 +191,29 @@ var pendingCardsTab = store.NewTable[pendingCard](store.TPendingCards)
 // rememberCard — показан итог — забыть прежний несостоявшийся; не показан —
 // запомнить (последний итог черновика главнее): retryCards покажет, когда
 // Bot API ответит, — иначе карточка так и висела бы на «Отправляю…».
-func rememberCard(s *config.Settings, draftID string, cardID int64, status string, shown bool) {
+func rememberCard(s *config.Settings, draftID string, cardID int64, status string, version time.Time, shown bool) {
+	if !shown && intermediate(status) {
+		return // прежний несостоявшийся окончательный главнее — его не трогаем
+	}
 	db, err := stateDB(s)
 	if err != nil {
 		return
 	}
-	ctx := context.Background()
-	switch {
-	case shown:
-		err = pendingCardsTab.Delete(ctx, db.Q(), draftID)
-	case intermediate(status):
-		return // прежний несостоявшийся окончательный главнее — его не трогаем
-	default:
-		err = pendingCardsTab.Put(ctx, db.Q(), draftID, pendingCard{Card: cardID, Status: status, At: time.Now()})
-	}
+	err = pendingCardsTab.Edit(context.Background(), db, func(m map[string]pendingCard) bool {
+		cur, queued := m[draftID]
+		if queued && cur.At.After(version) {
+			return false // в очереди итог новее этого — он главнее
+		}
+		if shown {
+			if !queued {
+				return false
+			}
+			delete(m, draftID)
+		} else {
+			m[draftID] = pendingCard{Card: cardID, Status: status, At: version}
+		}
+		return true
+	})
 	if err != nil {
 		_ = audit.Log(s.AuditPath(), "card_pending_failed", "draft_id", draftID, "error", err.Error())
 	}

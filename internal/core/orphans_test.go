@@ -447,3 +447,28 @@ func TestCardRetryWaitsOtherProcess(t *testing.T) {
 		t.Fatalf("прежний итог показан поверх нового: %q", shown)
 	}
 }
+
+// Показ прежнего итога не стирает из очереди итог новее себя (его записал
+// путь, не дождавшийся лока карточки, пока показывали прежний).
+func TestCardShownKeepsNewerQueued(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	db, err := stateDB(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	old := finishCard
+	finishCard = func(context.Context, *config.Settings, int64, *outbox.Draft, string, string, string) bool { return true }
+	t.Cleanup(func() { finishCard = old })
+	newer := pendingCard{Card: 55, Status: "✅ отправлено", At: time.Now().Add(time.Minute)}
+	if err := pendingCardsTab.Put(ctx, db.Q(), d.ID, newer); err != nil {
+		t.Fatal(err)
+	}
+	cardID := int64(55)
+	card(ctx, s, &cardID, d, "⚠️ не отправлено")
+	if p, ok, _ := pendingCardsTab.Get(ctx, db.Q(), d.ID); !ok || p.Status != newer.Status {
+		t.Fatalf("новый итог стёрт старым: %+v %v", p, ok)
+	}
+}

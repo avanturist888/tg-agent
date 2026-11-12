@@ -29,10 +29,14 @@ func IsBusy(err error) bool {
 }
 
 var (
+	// heldMu — и над held, и над шагом «создать файл → записать → отметить в
+	// held»: иначе соседняя горутина увидела бы файл с нашим pid ещё без
+	// отметки, сочла бы его осиротевшим и сняла живой лок.
 	heldMu sync.Mutex
-	// локи, которые этот процесс держит прямо сейчас: отличают свой живой лок
-	// от своего же осиротевшего — pid в файле в обоих случаях наш
-	held = map[string]bool{}
+	// локи, которые этот процесс держит прямо сейчас (путь → кто держит):
+	// отличают свой живой лок от своего же осиротевшего — pid в файле в обоих
+	// случаях наш
+	held = map[string]*File{}
 )
 
 // File — лок на файл path (сам лок — path + ".lock").
@@ -52,14 +56,17 @@ type meta struct {
 }
 
 func (l *File) tryAcquire() (bool, error) {
+	heldMu.Lock()
 	f, err := os.OpenFile(l.Path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
+		heldMu.Unlock()
 		if errors.Is(err, os.ErrExist) || isSharingViolation(err) || errors.Is(err, os.ErrPermission) {
 			l.breakIfStale()
 			return false, nil
 		}
 		return false, err
 	}
+	defer heldMu.Unlock()
 	now := float64(time.Now().UnixNano()) / 1e9
 	body, _ := json.Marshal(meta{PID: os.Getpid(), TS: now})
 	_, werr := f.Write(body)
@@ -70,9 +77,7 @@ func (l *File) tryAcquire() (bool, error) {
 		_ = os.Remove(l.Path)
 		return false, errors.Join(werr, cerr)
 	}
-	heldMu.Lock()
-	held[l.Path] = true
-	heldMu.Unlock()
+	held[l.Path] = l
 	l.taken = true
 	return true, nil
 }
@@ -92,10 +97,15 @@ func (l *File) breakIfStale() {
 	var stale bool
 	switch {
 	case m.PID == os.Getpid():
-		// наш pid, но мы его не держим — снять файл при выходе не удалось
+		// наш pid, но мы его не держим — снять файл при выходе не удалось.
+		// Проверка и снятие — под heldMu: между ними своя же горутина не
+		// возьмёт лок заново
 		heldMu.Lock()
-		stale = !held[l.Path]
-		heldMu.Unlock()
+		defer heldMu.Unlock()
+		if held[l.Path] == nil {
+			_ = os.Remove(l.Path)
+		}
+		return
 	case m.PID != 0:
 		// Протухшим считаем только лок мёртвого владельца: живой процесс может
 		// законно держать сессию долго, сносить его лок по возрасту нельзя.
@@ -147,9 +157,17 @@ func (l *File) Release() {
 		return
 	}
 	l.taken = false
-	heldMu.Lock()
-	delete(held, l.Path)
-	heldMu.Unlock()
+	// сначала файл, потом отметка: пока файл наш, своя же горутина не сочтёт
+	// его осиротевшим; отметку снимаем, только если она всё ещё наша (после
+	// удаления файла лок могла взять соседняя горутина)
+	forget := func() {
+		heldMu.Lock()
+		if held[l.Path] == l {
+			delete(held, l.Path)
+		}
+		heldMu.Unlock()
+	}
+	defer forget()
 	// Windows не даёт удалить файл, пока его читает другой процесс, — это
 	// доли секунды, переждём
 	for i := 0; i < 40; i++ {
@@ -159,8 +177,8 @@ func (l *File) Release() {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	// не вышло — файл останется с нашим pid; held его уже не знает, так что
-	// и мы, и другие (после нашей смерти) снимут его как протухший
+	// не вышло — файл останется с нашим pid; held его забудет, так что и
+	// мы, и другие (после нашей смерти) снимут его как протухший
 }
 
 // With — выполнить fn под локом.
