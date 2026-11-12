@@ -39,6 +39,10 @@ const (
 	accessPending = "pending"
 	accessGranted = "granted"
 	accessDenied  = "denied"
+	// accessStale — владелец разрешил, но выполнить уже нельзя: то, о чём
+	// просили, изменилось, пока карточка висела (папка-ссылка не та). Запрос
+	// закрыт — агент может спросить заново
+	accessStale = "stale"
 )
 
 func onlyLocal(s *config.Settings) error {
@@ -190,7 +194,9 @@ type accessRequest struct {
 	Sample []string `json:"sample,omitempty"` // какие (для карточки)
 	// Members — состав папки-ссылки на момент запроса (scopeLeave): по
 	// нажатию папка должна быть той же, а не новой с тем же номером
-	Members  []int64     `json:"members,omitempty"`
+	Members []int64 `json:"members,omitempty"`
+	// Outcome — почему запрос закрыт без выполнения (accessStale)
+	Outcome  string      `json:"outcome,omitempty"`
 	Peer     int64       `json:"peer"`
 	Title    string      `json:"title"`
 	Kind     string      `json:"kind"`
@@ -448,6 +454,15 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 		}
 		if r.Scope != "" {
 			if err := grantSet(ctx, fresh, r, read, send, auto); err != nil {
+				var st *staleRequest
+				if errors.As(err, &st) {
+					// исполнять уже нечего — закрыть запрос, а не держать его
+					// «ждущим»: иначе новый запрос агента упрётся в этот
+					r.Status, r.Outcome = accessStale, st.msg
+					status = "⌛ **Не выполнено:** " + bot.MDEscape(st.msg)
+					bot.AnswerCallback(ctx, s, q.ID, "Ничего не менял: "+st.msg)
+					break
+				}
 				bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
 				logEvent(s, "access_grant_failed", "request_id", id, "error", err.Error())
 				return

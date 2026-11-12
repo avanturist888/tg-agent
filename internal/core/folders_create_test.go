@@ -204,8 +204,17 @@ func TestLeaveChatlistSameFolder(t *testing.T) {
 	}
 	other := f
 	other.Include = []int64{-9}
-	if sameChatlist(other, r) == nil {
-		t.Fatal("новая папка с тем же номером и названием")
+	var st *staleRequest
+	if err := sameChatlist(other, r); !errors.As(err, &st) {
+		t.Fatalf("новая папка с тем же номером и названием: %v", err)
+	}
+	// такой запрос закрывается «устаревшим»: агент узнаёт и может спросить снова
+	r.ID, r.Status, r.Outcome = "l", accessStale, st.msg
+	if txt := setDecisionText(&config.Settings{}, r); !strings.Contains(txt, "не выполнен") || !strings.Contains(txt, "изменился") {
+		t.Fatalf("уведомление агенту: %s", txt)
+	}
+	if st, _ := setWaitResult(&config.Settings{}, r).Get("status"); st != accessStale {
+		t.Fatalf("tg_wait_access: %v", st)
 	}
 	mine := f
 	mine.MyInvites = true

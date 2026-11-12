@@ -235,13 +235,18 @@ func requestLeaveChatlist(ctx context.Context, s *config.Settings, f tgc.Folder,
 // номером и названием).
 func sameChatlist(f tgc.Folder, r *accessRequest) error {
 	if !f.Shared || f.MyInvites || f.Title != r.Title {
-		return fmt.Errorf("папка %d — уже не та чужая папка-ссылка «%s»: ничего не менял", f.ID, r.Title)
+		return &staleRequest{fmt.Sprintf("папка %d — уже не та чужая папка-ссылка «%s»", f.ID, r.Title)}
 	}
 	if !slices.Equal(chatlistMembers(f), r.Members) {
-		return fmt.Errorf("состав папки-ссылки «%s» изменился с запроса — ничего не менял; агенту нужен новый запрос", r.Title)
+		return &staleRequest{fmt.Sprintf("состав папки-ссылки «%s» изменился с запроса", r.Title)}
 	}
 	return nil
 }
+
+// staleRequest — то, о чём просил запрос, изменилось: выполнять нельзя.
+type staleRequest struct{ msg string }
+
+func (e *staleRequest) Error() string { return e.msg }
 
 // chatlistMembers — состав папки-ссылки (явные и закреплённые чаты) по порядку.
 func chatlistMembers(f tgc.Folder) []int64 {
@@ -363,6 +368,10 @@ func setGranted(r *accessRequest) string {
 }
 
 func setDecisionText(s *config.Settings, r *accessRequest) string {
+	if r.Status == accessStale {
+		return fmt.Sprintf("tg-agent: запрос %s не выполнен — %s. Ничего не менял. Если это всё ещё нужно, "+
+			"посмотри папку заново и попроси снова.", r.ID, r.Outcome)
+	}
 	if r.Status != accessGranted {
 		return fmt.Sprintf("tg-agent: владелец отказал (%s, запрос %s). Не проси снова без новой просьбы владельца.", r.Title, r.ID)
 	}
@@ -403,6 +412,9 @@ func setWaitResult(s *config.Settings, r *accessRequest) *omap.Map {
 		}
 	case accessDenied:
 		out.Set("hint", "Владелец отказал. Не проси снова без его новой просьбы.")
+	case accessStale:
+		out.Set("reason", r.Outcome).Set("hint",
+			"Владелец разрешил, но выполнить было уже нельзя (reason) — ничего не менял. Нужно — посмотри заново и попроси снова.")
 	default:
 		out.Set("status", "waiting").Set("hint", "Владелец ещё не нажал кнопку. Это не отказ: решение придёт уведомлением; займись другим.")
 	}
