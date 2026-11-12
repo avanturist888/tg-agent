@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -505,5 +506,28 @@ func TestStoreUnsavedPrefix(t *testing.T) {
 	st.Put(ctx, &Message{Chat: chat, WAID: "O", Time: t0, Text: "ещё"})
 	if m, _ := st.Get(ctx, id); m.Text != "вторая" || st.owed {
 		t.Fatalf("порядок нарушен: %q, долг %v", m.Text, st.owed)
+	}
+}
+
+func TestScrubNodes(t *testing.T) {
+	got := scrubNodes(`Node handling took 6s for <notification type="privacy_token"><tokens><token>abc</token></tokens></notification>`)
+	if strings.Contains(got, "token>") || strings.Contains(got, "abc") || !strings.HasPrefix(got, "Node handling took 6s for") {
+		t.Fatalf("узел не скрыт: %q", got)
+	}
+	got = scrubNodes(`failed to download: Get "https://mmg.whatsapp.net/v/t62/abc?ccb=11-4&oh=SECRET&oe=1": context deadline exceeded`)
+	if strings.Contains(got, "SECRET") || strings.Contains(got, "t62") || !strings.Contains(got, "mmg.whatsapp.net") {
+		t.Fatalf("адрес не скрыт: %q", got)
+	}
+	for _, in := range []string{
+		`history sync: invalid direct path v/t62/abc?ccb=11-4&oh=SECRET&oe=1`,
+		`Get "https://mmg.whatsapp.net/v/a?x='&oh=SECRET": timeout`,
+		`dial wss://web.whatsapp.com/ws/chat?token=SECRET failed`,
+	} {
+		if got := scrubNodes(in); strings.Contains(got, "SECRET") {
+			t.Fatalf("подпись не скрыта: %q", got)
+		}
+	}
+	if got := scrubNodes("просто ошибка"); got != "просто ошибка" {
+		t.Fatalf("испорчено: %q", got)
 	}
 }

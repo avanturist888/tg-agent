@@ -317,6 +317,9 @@ func waConnected(ctx context.Context, c *wac.Client, loader func() (*config.Sett
 	} else {
 		logEvent(s, "wa_groups", "count", n)
 	}
+	if err := c.SyncAppState(ctx); err != nil {
+		logEvent(s, "wa_appstate_failed", "error", err.Error())
+	}
 	(waNet{}).catchup(ctx, s)
 }
 

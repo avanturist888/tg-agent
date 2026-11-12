@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
@@ -140,7 +141,8 @@ func (c *Client) Run(ctx context.Context) error {
 	if pairing && c.Pair == nil {
 		return ErrNoSession
 	}
-	wa := whatsmeow.NewClient(device, waLog.Noop)
+	// предупреждения и ошибки whatsmeow — в вывод службы (data/service.log)
+	wa := whatsmeow.NewClient(device, newWarnLog("whatsmeow"))
 	wa.EnableAutoReconnect = true
 	wa.AutomaticMessageRerequestFromPhone = true
 	// присутствие («в сети») не шлём: иначе телефон перестаёт показывать
@@ -303,10 +305,13 @@ func (c *Client) handle(ctx context.Context, evt any) {
 		c.ingest(ctx, v, true, false)
 	case *events.HistorySync:
 		c.history(ctx, v)
-	case *events.PushName:
-		c.forgetName(v.JID)
-	case *events.Contact:
-		c.forgetName(v.JID)
+	case *events.AppStateSyncComplete:
+		c.log("wa_appstate_synced", "name", string(v.Name), "version", v.Version)
+		c.forgetNames() // контакты при полной синхронизации — одним событием в конце
+	case *events.AppStateSyncError:
+		c.log("wa_appstate_failed", "name", string(v.Name), "error", v.Error.Error())
+	case *events.PushName, *events.Contact:
+		c.forgetNames()
 	case *events.GroupInfo:
 		if v.Name != nil {
 			if id, err := c.Store.ChatID(ctx, v.JID.String(), "group"); err == nil {
@@ -569,9 +574,9 @@ func (c *Client) history(ctx context.Context, v *events.HistorySync) {
 	c.log("wa_history_sync", "type", v.Data.GetSyncType().String(), "chats", len(v.Data.GetConversations()), "messages", n)
 }
 
-func (c *Client) forgetName(jid types.JID) {
+func (c *Client) forgetNames() {
 	c.mu.Lock()
-	delete(c.names, jid.ToNonAD().String())
+	c.names = nil
 	c.mu.Unlock()
 }
 
@@ -611,11 +616,11 @@ func (c *Client) Name(ctx context.Context, jidStr, pushName string) string {
 		return pushName // не запоминаем: из контактов может появиться настоящее
 	}
 	if name == "" {
+		// номер не запоминаем: контакты телефона догружаются после входа
 		if jid.Server == types.DefaultUserServer {
-			name = "+" + jid.User
-		} else {
-			name = jid.User
+			return "+" + jid.User
 		}
+		return jid.User
 	}
 	c.mu.Lock()
 	if c.names == nil {
@@ -647,6 +652,25 @@ func (c *Client) ChatTitle(ctx context.Context, ch Chat) string {
 		}
 	}
 	return ch.JID
+}
+
+// SyncAppState — догрузить состояние приложения (контакты телефона, их
+// имена), если оно ещё не загружено: whatsmeow берёт его только когда
+// приходят ключи, и сбой той загрузки ничем не повторяется. Уже загруженное
+// не перекачивается.
+func (c *Client) SyncAppState(ctx context.Context) error {
+	wa, err := c.WA(ctx)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, name := range appstate.AllPatchNames {
+		if err := wa.FetchAppState(ctx, name, false, true); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+		}
+	}
+	c.forgetNames()
+	return errors.Join(errs...)
 }
 
 // SyncGroups — названия всех групп аккаунта (после входа: в истории их нет).
