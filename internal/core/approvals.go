@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +54,7 @@ type botOffset struct {
 	Bot      string `json:"bot"`
 	Inflight int64  `json:"inflight,omitempty"`
 	Tries    int    `json:"tries,omitempty"`
+	Err      string `json:"err,omitempty"` // последний сбой его разбора
 }
 
 // maxUpdateTries — столько раз разбор одного решения может начаться заново
@@ -63,27 +65,45 @@ const maxUpdateTries = 3
 // startInflight — отметить, что решение id начали разбирать; вернёт, в
 // который раз. Ошибка базы — 1: смещение тогда тоже не записалось бы, и
 // разбор лучше повторить, чем потерять.
-func startInflight(s *config.Settings, offset, id int64) int {
+func startInflight(s *config.Settings, offset, id int64) (int, string) {
 	db, err := stateDB(s)
 	if err != nil {
-		return 1
+		return 1, ""
 	}
-	tries := 1
+	tries, lastErr := 1, ""
 	ctx := context.Background()
 	err = db.Write(ctx, func(tx *sql.Tx) error {
 		var v botOffset
 		if ok, err := store.GetKV(ctx, tx, store.KeyBotOffset, &v); err != nil {
 			return err
 		} else if ok && v.Inflight == id && v.Bot == botID(s) {
-			tries = v.Tries + 1
+			tries, lastErr = v.Tries+1, v.Err
 		}
-		return store.PutKV(ctx, tx, store.KeyBotOffset, botOffset{Offset: offset, Bot: botID(s), Inflight: id, Tries: tries})
+		return store.PutKV(ctx, tx, store.KeyBotOffset, botOffset{Offset: offset, Bot: botID(s), Inflight: id, Tries: tries, Err: lastErr})
 	})
 	if err != nil {
 		_ = audit.Log(s.AuditPath(), "bot_offset_failed", "error", err.Error())
-		return 1
+		return 1, ""
 	}
-	return tries
+	return tries, lastErr
+}
+
+// noteInflightErr — запомнить сбой разбора решения id: его покажет просьба
+// владельцу нажать ещё раз, если повторы не помогут.
+func noteInflightErr(s *config.Settings, id int64, e error) {
+	db, err := stateDB(s)
+	if err != nil {
+		return
+	}
+	ctx := context.Background()
+	_ = db.Write(ctx, func(tx *sql.Tx) error {
+		var v botOffset
+		if ok, err := store.GetKV(ctx, tx, store.KeyBotOffset, &v); err != nil || !ok || v.Inflight != id {
+			return err
+		}
+		v.Err = e.Error()
+		return store.PutKV(ctx, tx, store.KeyBotOffset, v)
+	})
 }
 
 // isDecision — апдейт несёт решение владельца, разбор которого можно
@@ -1026,9 +1046,18 @@ func pumpUpdates(ctx context.Context, s *config.Settings, offset int64, updates 
 		}
 		decision := isDecision(u)
 		if decision {
-			if tries := startInflight(s, offset, u.UpdateID); tries > maxUpdateTries {
-				_ = audit.Log(s.AuditPath(), "bot_update_skipped", "update_id", u.UpdateID, "tries", tries-1)
-				say(ctx, s, "⚠️ Нажатие кнопки не удалось разобрать (сбой, подробности — в аудите, bot_update_skipped). Нажми её ещё раз.")
+			if tries, lastErr := startInflight(s, offset, u.UpdateID); tries > maxUpdateTries {
+				// пропустить — только сказав владельцу: не дошла просьба —
+				// нажатие остаётся за смещением, повтор скажет снова
+				text := "⚠️ Нажатие кнопки не удалось разобрать"
+				if lastErr != "" {
+					text += " (" + html.EscapeString(lastErr) + ")"
+				}
+				if err := sayErr(ctx, s, text+". Нажми её ещё раз."); err != nil {
+					_ = audit.Log(s.AuditPath(), "bot_update_skip_unsaid", "update_id", u.UpdateID, "error", err.Error())
+					return offset, true
+				}
+				_ = audit.Log(s.AuditPath(), "bot_update_skipped", "update_id", u.UpdateID, "tries", tries-1, "error", lastErr)
 				offset = u.UpdateID + 1
 				writeOffset(s, offset)
 				continue
@@ -1039,6 +1068,7 @@ func pumpUpdates(ctx context.Context, s *config.Settings, offset int64, updates 
 		err := updateHandler(ctx, s, u)
 		if decision && isRetry(err) {
 			_ = audit.Log(s.AuditPath(), "callback_retry", "update_id", u.UpdateID, "error", err.Error())
+			noteInflightErr(s, u.UpdateID, err)
 			return offset, true
 		}
 		offset = u.UpdateID + 1

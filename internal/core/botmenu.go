@@ -82,11 +82,16 @@ func HandleMessage(ctx context.Context, s *config.Settings, m *bot.Message) {
 
 // say — простое сообщение владельцу (HTML).
 func say(ctx context.Context, s *config.Settings, text string) {
-	if err := bot.Call(ctx, s, "sendMessage", map[string]any{
-		"chat_id": s.ApprovalChatID, "text": text, "parse_mode": "HTML",
-	}, nil); err != nil {
+	if err := sayErr(ctx, s, text); err != nil {
 		logEvent(s, "command_failed", "error", err.Error())
 	}
+}
+
+// sayErr — say с ошибкой: кому важно, дошло ли (тесты подменяют).
+var sayErr = func(ctx context.Context, s *config.Settings, text string) error {
+	return bot.Call(ctx, s, "sendMessage", map[string]any{
+		"chat_id": s.ApprovalChatID, "text": text, "parse_mode": "HTML",
+	}, nil)
 }
 
 // ── автоотправка ─────────────────────────────────────────────────────────

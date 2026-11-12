@@ -572,8 +572,7 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 		}
 		fresh, err := config.Load() // белый список свежий: его могли поправить, пока карточка висела
 		if err != nil {
-			bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
-			return nil
+			return grantFailed(ctx, s, q, id, err)
 		}
 		if r.Scope != "" {
 			if err := grantSet(ctx, fresh, r, read, send, auto); err != nil {
@@ -586,12 +585,7 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 					reply = "Ничего не менял: " + st.msg
 					break
 				}
-				if isRetry(err) {
-					return err
-				}
-				bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
-				logEvent(s, "access_grant_failed", "request_id", id, "error", err.Error())
-				return nil
+				return grantFailed(ctx, s, q, id, err)
 			}
 			r.Status, r.CanRead, r.CanSend, r.CanAuto = accessGranted, read, send, auto
 			status = "✅ **Разрешено:** " + setGranted(r)
@@ -600,9 +594,7 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 		}
 		alias, err := grantAccess(fresh, r, read, send, auto)
 		if err != nil {
-			bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
-			logEvent(s, "access_grant_failed", "request_id", id, "error", err.Error())
-			return nil
+			return grantFailed(ctx, s, q, id, err)
 		}
 		r.Status, r.Alias, r.CanRead, r.CanSend, r.CanAuto = accessGranted, alias, read, send, auto
 		status = fmt.Sprintf("✅ **Разрешено:** %s, alias `%s`", grantedRights(r), alias)
@@ -690,6 +682,19 @@ func retellAccess(ctx context.Context, s *config.Settings) {
 		logEvent(s, "access_retold", "request_id", r.ID)
 		tellAccess(ctx, s, r)
 	}
+}
+
+// grantFailed — выдать права не вышло (конфиг не прочитался, chats.toml не
+// записался, Telegram не ответил при выходе из папки): решение владельца
+// не исполнено — повтор (retryable), а не «обработано». Не помогут повторы
+// — владелец получит просьбу нажать ещё раз с этой ошибкой.
+func grantFailed(ctx context.Context, s *config.Settings, q *bot.CallbackQuery, id string, err error) error {
+	bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error()+" — повторяю.")
+	logEvent(s, "access_grant_failed", "request_id", id, "error", err.Error())
+	if isRetry(err) {
+		return err
+	}
+	return retryable{err}
 }
 
 // grantedRights — права из решения владельца, для карточки и агента.

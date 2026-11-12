@@ -20,7 +20,14 @@ func stateWaiting(s *config.Settings) string {
 	if err != nil {
 		return err.Error()
 	}
-	return db.LegacyBlocked()
+	if why := db.LegacyBlocked(); why != "" {
+		return why
+	}
+	if db.LegacyPending() {
+		// не дождался лока переноса или файл попросил повтора — тоже не всё
+		return "перенос старых файлов ещё не закончен"
+	}
+	return ""
 }
 
 // Подписки и запросы доступа старой установки переносятся через свои типы:

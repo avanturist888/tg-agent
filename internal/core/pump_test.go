@@ -60,7 +60,23 @@ func TestPumpPoisonSkipped(t *testing.T) {
 	for range maxUpdateTries {
 		startInflight(s, 5, 5)
 	}
-	if off, _ := pumpUpdates(context.Background(), s, readOffset(s), []bot.Update{u}); off != 6 || handled != 0 {
+	said := []string{}
+	sayFails := true
+	oldSay := sayErr
+	sayErr = func(_ context.Context, _ *config.Settings, text string) error {
+		if sayFails {
+			return errors.New("bot api down")
+		}
+		said = append(said, text)
+		return nil
+	}
+	t.Cleanup(func() { sayErr = oldSay })
+	// просьба владельцу не дошла — нажатие не пропускается
+	if off, stalled := pumpUpdates(context.Background(), s, readOffset(s), []bot.Update{u}); off != 5 || !stalled || handled != 0 || readOffset(s) != 5 {
+		t.Fatalf("просьба не дошла, а смещение %d (записано %d), stalled %v", off, readOffset(s), stalled)
+	}
+	sayFails = false
+	if off, _ := pumpUpdates(context.Background(), s, readOffset(s), []bot.Update{u}); off != 6 || handled != 0 || len(said) != 1 {
 		t.Fatalf("смещение %d, разобрано %d", off, handled)
 	}
 	if readOffset(s) != 6 {
