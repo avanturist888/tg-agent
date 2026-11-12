@@ -23,10 +23,10 @@
 // не держится открытым). Пока такая сборка жива (обновление: exe уже
 // заменены, а старые процессы ещё доживают — tg cutover), её лок — только
 // запись в файле. Поэтому, заперев файл, захват читает его: запись без
-// "os" с живым pid другого процесса — лок старой сборки, он занят. Пустой
-// файл, созданный не нами, — занят, пока молод (freshEmpty): старая сборка
-// пишет pid сразу после создания, а сборка с OS-локами — сразу после
-// блокировки. Давний пустой — брошенный, свободен.
+// "os" с живым pid другого процесса — лок старой сборки, он занят. Эта
+// сборка создаёт файл сразу с записью (openLock), так что пустой файл —
+// только у старой: занят, пока молод (freshEmpty: она пишет pid сразу после
+// создания); давний пустой — брошенный, свободен.
 package lock
 
 import (
@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"time"
@@ -42,6 +43,12 @@ import (
 // StaleAfter — возраст файла лока старой сборки (O_EXCL) без записанного
 // владельца, после которого он считается брошенным (Peek).
 const StaleAfter = 120 * time.Second
+
+// Паузы ожидания лока (Acquire).
+const (
+	minPoll = 5 * time.Millisecond
+	maxPoll = 250 * time.Millisecond
+)
 
 // Busy — лок держит кто-то другой дольше, чем мы согласны ждать.
 type Busy struct{ Msg string }
@@ -73,21 +80,17 @@ type meta struct {
 // released — запись отпущенного лока.
 var released = []byte(`{"os":true}`)
 
-// freshEmpty — сколько пустой файл, созданный не нами, считается занятым
-// (его создатель вот-вот запишет владельца).
+// freshEmpty — сколько пустой файл считается занятым: его создатель —
+// сборка до OS-локов — вот-вот запишет владельца.
 const freshEmpty = 5 * time.Second
 
-// oldOwner — файл, возможно, держит процесс сборки до OS-локов (или его
-// только что создал другой процесс и ещё не записал владельца).
-func oldOwner(f *os.File, created bool) bool {
+// oldOwner — файл, возможно, держит процесс сборки до OS-локов.
+func oldOwner(f *os.File) bool {
 	raw, err := readAll(f)
 	if err != nil {
 		return true // не прочесть — не судить: следующая попытка
 	}
 	if len(raw) == 0 {
-		if created {
-			return false
-		}
 		st, err := f.Stat()
 		return err != nil || time.Since(st.ModTime()) < freshEmpty
 	}
@@ -103,7 +106,7 @@ func (l *File) tryAcquire() (bool, error) {
 	if l.f != nil {
 		return false, fmt.Errorf("лок %s уже взят этим же объектом", l.Path)
 	}
-	f, created, err := openLock(l.Path, true)
+	f, err := openLock(l.Path, true)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) || busyOpen(err) {
 			return false, nil // файл как раз удаляют, отпуская лок
@@ -120,7 +123,7 @@ func (l *File) tryAcquire() (bool, error) {
 	}
 	// прежний держатель мог удалить файл, пока мы его открывали: тогда
 	// заперт удалённый, а по пути уже лежит (или вот-вот ляжет) новый
-	if !samePath(f, l.Path) || oldOwner(f, created) {
+	if !samePath(f, l.Path) || oldOwner(f) {
 		unlock(f)
 		_ = f.Close()
 		return false, nil
@@ -133,6 +136,37 @@ func (l *File) tryAcquire() (bool, error) {
 	return true, nil
 }
 
+// openLock — открыть файл лока; create — создать, если его нет. Новый файл
+// появляется по пути сразу с записью отпущенного лока (временный файл, затем
+// перенос без замены): иначе соседний захват увидел бы пустой файл и принял
+// бы его за лок старой сборки, который она как раз пишет.
+func openLock(path string, create bool) (*os.File, error) {
+	for i := 0; ; i++ {
+		f, err := openExisting(path)
+		if err == nil || !create || !errors.Is(err, os.ErrNotExist) || i >= 10 {
+			return f, err
+		}
+		// нет (или его удалил отпустивший лок) — положить новый
+		if err := createReleased(path); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+	}
+}
+
+func createReleased(path string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".new-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name) // после переноса его уже нет; после ссылки — лишний
+	_, werr := tmp.Write(released)
+	if cerr := tmp.Close(); werr != nil || cerr != nil {
+		return errors.Join(werr, cerr)
+	}
+	return placeNew(name, path)
+}
+
 func samePath(f *os.File, path string) bool {
 	a, err := f.Stat()
 	if err != nil {
@@ -142,9 +176,13 @@ func samePath(f *os.File, path string) bool {
 	return err == nil && os.SameFile(a, b)
 }
 
-// Acquire ждёт лок до Timeout или отмены ctx.
+// Acquire ждёт лок до Timeout или отмены ctx. Паузы между попытками растут
+// от minPoll до maxPoll со случайной добавкой: ждущие не просыпаются разом
+// (иначе за каждый такт лок доставался бы одному), а освободившийся лок
+// следующий берёт быстро.
 func (l *File) Acquire(ctx context.Context) error {
 	deadline := time.Now().Add(l.Timeout)
+	pause := minPoll
 	for {
 		ok, err := l.tryAcquire()
 		if err != nil {
@@ -160,8 +198,9 @@ func (l *File) Acquire(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(pause + rand.N(pause)):
 		}
+		pause = min(2*pause, maxPoll)
 	}
 }
 
@@ -217,7 +256,7 @@ func Held(path string) bool {
 // пишут или процесс упал между созданием и записью).
 func Peek(path string) (present, alive bool) {
 	p := path + ".lock"
-	f, _, err := openLock(p, false)
+	f, err := openLock(p, false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, false

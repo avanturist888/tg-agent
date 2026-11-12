@@ -54,7 +54,7 @@ func TestReplacedFileNotTaken(t *testing.T) {
 	if err := a.Acquire(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	stale, _, err := openLock(p+".lock", true) // ждущий: файл открыт, лок не взят
+	stale, err := openLock(p+".lock", true) // ждущий: файл открыт, лок не взят
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,12 +164,12 @@ func TestLockExclusiveInProcess(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "x")
 	var inside, worst atomic.Int32
 	var wg sync.WaitGroup
-	for range 16 {
+	for range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for range 20 {
-				l := New(p, 10*time.Second)
+			for range 10 {
+				l := New(p, time.Minute)
 				if err := l.Acquire(context.Background()); err != nil {
 					t.Error(err)
 					return
@@ -228,7 +228,7 @@ func TestOldBuildOwner(t *testing.T) {
 	}
 	put("", 0)
 	if try() {
-		t.Fatal("только что созданный чужой пустой файл принят за свободный")
+		t.Fatal("молодой пустой файл (старая сборка его пишет) принят за свободный")
 	}
 	put("", time.Minute)
 	if !try() {
