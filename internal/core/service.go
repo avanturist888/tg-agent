@@ -1046,6 +1046,16 @@ func WaitApproval(ctx context.Context, s *config.Settings, draftID string, timeo
 // (кнопка, tg approve, автоотправка). Единственная точка, где сообщение
 // реально уходит в Telegram.
 func DeliverApproved(ctx context.Context, s *config.Settings, draftID, by string) (*omap.Map, error) {
+	if !claimDelivery(draftID) {
+		return nil, denied("Черновик %s уже отправляется — второй раз не отправляю. Итог — tg_wait_approval(draft_id).", draftID)
+	}
+	defer releaseDelivery(draftID)
+	return deliverClaimed(ctx, s, draftID, by)
+}
+
+// deliverClaimed — DeliverApproved для черновика, уже взятого в отправку
+// (claimDelivery).
+func deliverClaimed(ctx context.Context, s *config.Settings, draftID, by string) (*omap.Map, error) {
 	box := outbox.New(s.OutboxPath())
 	d, err := box.Get(draftID)
 	if err != nil {

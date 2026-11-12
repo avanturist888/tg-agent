@@ -115,6 +115,9 @@ func accountMark() string {
 
 // card переписывает карточку итогом (строка статуса — в markdown).
 func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draft, status string) {
+	if status == "" {
+		return // итог напишет тот, кто черновик сейчас отправляет (deliver)
+	}
 	if cardID != nil && *cardID != 0 {
 		bot.FinishCard(ctx, s, *cardID, d, title(s, d), status, d.Note)
 		unpinDraftCard(ctx, s, d.ID) // решено — внимание владельца больше не нужно
@@ -125,13 +128,20 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 // Человек уже нажал «Отправить» (или окно отмены закрылось): временные сбои
 // переживаем сами, прежде чем сдаваться и звать агента.
 func deliver(ctx context.Context, s *config.Settings, draftID, by string) string {
+	if !claimDelivery(draftID) {
+		// его уже отправляет другой путь этого процесса: итог в карточку
+		// напишет он, второй отправки не будет
+		_ = audit.Log(s.AuditPath(), "send_already_running", "draft_id", draftID, "by", by)
+		return ""
+	}
+	defer releaseDelivery(draftID)
 	box := outbox.New(s.OutboxPath())
 	var (
 		result *omap.Map
 		errMsg string
 	)
 	for attempt := 1; attempt <= 3; attempt++ {
-		r, err := DeliverApproved(ctx, s, draftID, by)
+		r, err := deliverClaimed(ctx, s, draftID, by)
 		if err == nil {
 			result = r
 			break
@@ -605,11 +615,46 @@ func RecoverInterrupted(ctx context.Context, s *config.Settings) {
 		if d.SendError != nil {
 			continue // уже сорвалось и об этом знают — не долбим повторно
 		}
+		// одобренное уже этим процессом отправляет его же путь (автоотправка
+		// захватила черновик секундой раньше) — 12.11.2026 оно ушло дважды
+		if !approvedBefore(d, processStarted) {
+			continue
+		}
 		_ = audit.Log(s.AuditPath(), "recover_interrupted", "draft_id", d.ID, "chat", d.Chat)
 		summary := deliver(ctx, s, d.ID, by+" (дослано после перезапуска службы)")
 		card(ctx, s, d.BotMessageID, d, summary)
 	}
 }
+
+// processStarted — когда запущен этот процесс: черновики, одобренные позже,
+// не «прерваны прошлой службой».
+var processStarted = time.Now()
+
+// approvedBefore — черновик одобрен раньше t (без отметки — считаем, что
+// раньше). Отметка — с точностью до секунды: одобренное в ту же секунду, что
+// t, тоже «раньше» — пусть лучше досылка попробует (от второй отправки
+// бережёт claimDelivery и перечитанный статус), чем черновик застрянет.
+func approvedBefore(d *outbox.Draft, t time.Time) bool {
+	if d.ApprovedAt == nil {
+		return true
+	}
+	at, err := time.Parse(time.RFC3339, *d.ApprovedAt)
+	return err != nil || !at.After(t.Truncate(time.Second))
+}
+
+// delivering — черновики, которые этот процесс сейчас отправляет. Отправку
+// ведёт служба (кнопка, автоотправка, досылка после перезапуска,
+// tg_send_draft — всё в ней), и два пути не должны отправить один черновик
+// дважды: статус approved до конца отправки не меняется.
+var delivering sync.Map
+
+// claimDelivery — взять черновик в отправку; false — его уже отправляют.
+func claimDelivery(id string) bool {
+	_, busy := delivering.LoadOrStore(id, struct{}{})
+	return !busy
+}
+
+func releaseDelivery(id string) { delivering.Delete(id) }
 
 // RunButtons — постоянный слушатель кнопок бота (часть службы): нажатие
 // срабатывает, даже если агент ушёл; заодно досылает автоотправку в срок.
