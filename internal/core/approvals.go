@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -128,33 +130,36 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 	defer cancel()
 	if cardID != nil && *cardID != 0 {
-		unlock := lockCard(d.ID)
-		shown := finishCard(ctx, s, *cardID, d, title(s, d), status, d.Note)
+		shown := false
+		if unlock, ok := lockCard(ctx, s, d.ID); ok {
+			shown = finishCard(ctx, s, *cardID, d, title(s, d), status, d.Note)
+			unlock()
+		}
 		rememberCard(s, d.ID, *cardID, status, shown)
-		unlock()
 		unpinDraftCard(ctx, s, d.ID) // решено — внимание владельца больше не нужно
 	}
 }
 
-// cardLocks — итог в карточку одного черновика показывают по одному (card и
-// уборка retryCards): иначе уборка показала бы прежний итог поверх нового
-// или стёрла из очереди новый, ещё не показанный.
-var cardLocks = struct {
-	sync.Mutex
-	m map[string]*sync.Mutex
-}{m: map[string]*sync.Mutex{}}
-
-func lockCard(draftID string) func() {
-	cardLocks.Lock()
-	mu := cardLocks.m[draftID]
-	if mu == nil {
-		mu = &sync.Mutex{}
-		cardLocks.m[draftID] = mu
+// lockCard — итог в карточку одного черновика показывают по одному, во всех
+// процессах профиля (card и уборка retryCards): иначе уборка показала бы
+// прежний итог поверх нового или стёрла из очереди новый, ещё не
+// показанный. Лок — файловый (data/cards/<id>), сетевой вызов — под ним, но
+// вне транзакции базы. Не дождались — итог не показан (уйдёт в очередь).
+func lockCard(ctx context.Context, s *config.Settings, draftID string) (func(), bool) {
+	dir := filepath.Join(s.DataDir(), "cards")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, false
 	}
-	cardLocks.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	l := lock.New(filepath.Join(dir, draftID), cardLockWait)
+	if err := l.Acquire(ctx); err != nil {
+		_ = audit.Log(s.AuditPath(), "card_lock_failed", "draft_id", draftID, "error", err.Error())
+		return nil, false
+	}
+	return l.Release, true
 }
+
+// cardLockWait — сколько ждать, пока другой путь покажет итог той же карточки.
+const cardLockWait = 30 * time.Second
 
 // intermediate — промежуточный итог («Отправляю…»): за ним всегда идёт
 // окончательный, повторять его незачем.
@@ -216,7 +221,10 @@ func retryCards(ctx context.Context, s *config.Settings) {
 // под локом карточки (её мог заменить или снять card), а снимается только
 // та, что показана: новую, пришедшую позже, уборка не стирает.
 func retryCard(ctx context.Context, s *config.Settings, db *store.DB, box *outbox.Outbox, id string) {
-	unlock := lockCard(id)
+	unlock, ok := lockCard(ctx, s, id)
+	if !ok {
+		return
+	}
 	defer unlock()
 	p, ok, err := pendingCardsTab.Get(ctx, db.Q(), id)
 	if err != nil || !ok {

@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"tgagent/internal/config"
+	"tgagent/internal/lock"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
 )
@@ -402,5 +404,46 @@ func TestCardRetryKeepsNewer(t *testing.T) {
 	retryCards(ctx, s)
 	if _, ok, _ := pendingCardsTab.Get(ctx, db.Q(), d.ID); ok {
 		t.Fatal("показанный итог остался в очереди")
+	}
+}
+
+// Другой процесс держит лок карточки: показывает новый итог и снимает
+// очередь. Уборка этого процесса ждёт лок, перечитывает очередь и прежний
+// итог поверх нового не показывает.
+func TestCardRetryWaitsOtherProcess(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	db, err := stateDB(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := pendingCardsTab.Put(ctx, db.Q(), d.ID, pendingCard{Card: 55, Status: "⚠️ старый", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	var shown []string
+	old := finishCard
+	finishCard = func(_ context.Context, _ *config.Settings, _ int64, _ *outbox.Draft, _, status, _ string) bool {
+		shown = append(shown, status)
+		return true
+	}
+	t.Cleanup(func() { finishCard = old })
+	other := lock.New(filepath.Join(s.DataDir(), "cards", d.ID), time.Second)
+	os.MkdirAll(filepath.Join(s.DataDir(), "cards"), 0o700)
+	if err := other.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { retryCards(ctx, s); close(done) }()
+	time.Sleep(200 * time.Millisecond)
+	// «другой процесс» показал новый итог и снял очередь
+	if err := pendingCardsTab.Delete(ctx, db.Q(), d.ID); err != nil {
+		t.Fatal(err)
+	}
+	other.Release()
+	<-done
+	if len(shown) != 0 {
+		t.Fatalf("прежний итог показан поверх нового: %q", shown)
 	}
 }
