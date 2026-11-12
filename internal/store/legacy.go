@@ -550,6 +550,21 @@ func importOutbox(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 			}
 		case err != nil:
 			return 0, err
+		case d.Status == "approved" && !draftFinal(cur):
+			// старая сборка (откат) взяла его в отправку, а итога в файле
+			// нет — могло уйти. Попытка — и для черновика, который в базе ещё
+			// ждёт решения или автоотправки (иначе база отправила бы его
+			// второй раз), и для одобренного без отметки попытки. Тело базы
+			// у одобренного главнее (в нём мог быть записанный сбой)
+			if cur == "approved" {
+				_, err = tx.ExecContext(ctx, "UPDATE drafts SET send_attempts = MAX(send_attempts, 1) WHERE id = ?", d.ID)
+			} else {
+				_, err = tx.ExecContext(ctx, "UPDATE drafts SET status = ?, expires = ?, send_at = NULL, body = ?, send_attempts = MAX(send_attempts, 1) WHERE id = ?",
+					d.Status, unixOf(d.ExpiresAt), compact(raw), d.ID)
+			}
+			if err != nil {
+				return 0, err
+			}
 		case draftFinal(d.Status) && !draftFinal(cur):
 			// файл снова записала старая сборка, и черновик в нём уже решён
 			// (отправлен, отменён): итог главнее — иначе база отправила бы

@@ -362,8 +362,11 @@ type BotEntry struct {
 	Env      []string `json:"env,omitempty"` // куда ещё записан
 }
 
-// vaultMu — чтение и замена сведений о ботах в этом процессе по очереди
-// (сами записи — таблица bots основного data/).
+// vaultMu — в этом процессе по очереди: запись токена в диспетчер и
+// сведений о боте в базу (таблица bots основного data/). Между процессами
+// сведения меняются по одной записи в транзакции (editBot), а не заменой
+// всей таблицы снимком: иначе снимок стёр бы записи, добавленные другим
+// процессом (или переносом bot_tokens.json) после его чтения.
 var vaultMu sync.Mutex
 
 var botsTab = store.NewTable[*BotEntry](store.TBots)
@@ -447,23 +450,30 @@ func vaultToken(key string) (string, bool) {
 	return tok, err == nil && tok != ""
 }
 
-// writeVault — записать сведения о ботах (то, что loadVault прочитал и
-// поменял под vaultMu).
-func writeVault(v map[string]*BotEntry) error {
+// editBot — прочитать, поменять и записать сведения о боте key одной
+// транзакцией. fn получает запись (nil — её нет) и возвращает новую (nil —
+// ничего не писать).
+func editBot(key string, fn func(e *BotEntry) *BotEntry) error {
 	db, err := vaultDB()
 	if err != nil {
 		return err
 	}
-	return botsTab.Edit(context.Background(), db, func(m map[string]*BotEntry) bool {
-		clear(m)
-		for k, e := range v {
-			if e != nil {
-				cp := *e
-				cp.Token = "" // секрет — только в диспетчере
-				m[k] = &cp
-			}
+	ctx := context.Background()
+	return db.Write(ctx, func(tx *sql.Tx) error {
+		e, ok, err := botsTab.Get(ctx, tx, key)
+		if err != nil {
+			return err
 		}
-		return true
+		if !ok {
+			e = nil
+		}
+		next := fn(e)
+		if next == nil {
+			return nil
+		}
+		cp := *next
+		cp.Token = "" // секрет — только в диспетчере
+		return botsTab.Put(ctx, tx, key, &cp)
 	})
 }
 
@@ -510,36 +520,39 @@ func saveBotToken(ctx context.Context, s *config.Settings, tok, source string) (
 	}
 	vaultMu.Lock()
 	defer vaultMu.Unlock()
-	v := loadVault()
 	key := strings.ToLower(me.Username)
-	e := v[key]
-	if e == nil {
-		e = &BotEntry{}
-		v[key] = e
-	}
-	e.Username, e.BotID, e.Name = "@"+me.Username, strconv.FormatInt(me.ID, 10), me.FirstName
-	if cur, _ := vaultToken(key); cur != tok {
-		e.Env = nil // старый токен в тех файлах больше не действует
-	}
+	cur, _ := vaultToken(key)
 	if err := credSet(botCredTarget(key), tok); err != nil {
 		return "", fmt.Errorf("токен не записан в диспетчер учётных данных Windows: %w", err)
 	}
-	e.SavedAt, e.Source = time.Now().Format(time.RFC3339), source
-	if err := writeVault(v); err != nil {
+	username := "@" + me.Username
+	err = editBot(key, func(e *BotEntry) *BotEntry {
+		if e == nil {
+			e = &BotEntry{}
+		}
+		e.Username, e.BotID, e.Name = username, strconv.FormatInt(me.ID, 10), me.FirstName
+		if cur != tok {
+			e.Env = nil // старый токен в тех файлах больше не действует
+		}
+		e.SavedAt, e.Source = time.Now().Format(time.RFC3339), source
+		return e
+	})
+	if err != nil {
 		return "", err
 	}
-	logEvent(s, "bot_token_saved", "bot", e.Username, "source", source)
-	return e.Username, nil
+	logEvent(s, "bot_token_saved", "bot", username, "source", source)
+	return username, nil
 }
 
 func noteEnv(username, where string) {
 	vaultMu.Lock()
 	defer vaultMu.Unlock()
-	v := loadVault()
-	if e := v[strings.ToLower(strings.TrimPrefix(username, "@"))]; e != nil {
-		e.Env = append(e.Env, where)
-		_ = writeVault(v)
-	}
+	_ = editBot(strings.ToLower(strings.TrimPrefix(username, "@")), func(e *BotEntry) *BotEntry {
+		if e != nil {
+			e.Env = append(e.Env, where)
+		}
+		return e
+	})
 }
 
 // VaultToken — токен из хранилища по @username (для tg bot-token).

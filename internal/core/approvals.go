@@ -198,8 +198,11 @@ func stillTrue(s *config.Settings, id, status string) bool {
 
 // outcomeFits — подходит ли итог status (по его значку) к состоянию
 // черновика d: «Отправлено» — только отправленному (и ушедшему, чья
-// отметка ещё не легла в базу, — sent-unsaved), «Не отправлено» и
-// «Отправляю…» — только одобренному (ещё не ушедшему), «Отменено» —
+// отметка ещё не легла в базу, — sent-unsaved), «Отправляю…» — только
+// одобренному (ещё не ушедшему), «Не отправлено» — только одобренному и
+// только о том сбое, что записан у него сейчас (status несёт его текст:
+// deliver пишет в карточку ровно то, что записал MarkSendError), —
+// сбой прошлой попытки после нового повтора уже неправда. «Отменено» —
 // отменённому, «Протухло» — протухшему. Прочие итоги не проверяются.
 func outcomeFits(s *config.Settings, status string, d *outbox.Draft) bool {
 	switch {
@@ -208,7 +211,12 @@ func outcomeFits(s *config.Settings, status string, d *outbox.Draft) bool {
 			return true
 		}
 		return d.Status == outbox.Sent
-	case strings.HasPrefix(status, "⚠️"), intermediate(status):
+	case strings.HasPrefix(status, "⚠️"):
+		// сбой не записался (MarkSendError не смог) — сверять не с чем.
+		// Текст в базе мог быть обрезан, а экранирование посимвольное:
+		// экранированный обрезок — начало экранированного целого
+		return d.Status == outbox.Approved && (d.SendError == nil || strings.Contains(status, bot.MDEscape(*d.SendError)))
+	case intermediate(status):
 		return d.Status == outbox.Approved
 	case strings.HasPrefix(status, "✋"):
 		return d.Status == outbox.Cancelled

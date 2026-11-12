@@ -389,6 +389,33 @@ func TestLegacyFinalWins(t *testing.T) {
 	}
 }
 
+// Повторный перенос (откат и снова обновление): старая сборка взяла в
+// отправку черновик, который база знает нерешённым, и итога не записала.
+// Он — попытка («могло уйти»): ни автоотправка, ни досылка его не повторят.
+func TestLegacyReimportApprovedIsAttempt(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "scheduled", "send_at": "2099-01-01T00:00:00+00:00"},
+		{"id": "b", "status": "pending"}]`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Q().Exec("UPDATE drafts SET status = 'approved' WHERE id = 'b'"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "approved"}, {"id": "b", "status": "approved"}]`)
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if count(t, db, "SELECT count(*) FROM drafts WHERE id = 'a' AND status = 'approved' AND send_at IS NULL AND send_attempts = 1") != 1 {
+		t.Fatal("взятое старой сборкой из автоотправки — не попытка")
+	}
+	if count(t, db, "SELECT send_attempts FROM drafts WHERE id = 'b'") != 1 {
+		t.Fatal("одобренное без отметки попытки — не попытка")
+	}
+}
+
 // Два процесса открывают базу одновременно: перенос — один раз, оба без ошибки.
 func TestLegacyConcurrentOpen(t *testing.T) {
 	dir := t.TempDir()

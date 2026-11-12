@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"tgagent/internal/bot"
 	"tgagent/internal/config"
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
@@ -621,5 +622,36 @@ func TestCardStaleSnapshotNotShown(t *testing.T) {
 	}
 	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); st.pending() {
 		t.Fatalf("неправда осталась в очереди: %+v", st)
+	}
+}
+
+// Сбой прошлой попытки, собранный по старому снимку, не заменяет в карточке
+// сбой нового повтора: оба при статусе approved, но записан — новый.
+func TestCardOldFailureNotShown(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	snap, err := box.MarkSendError(d.ID, "нет связи")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := box.MarkSendError(d.ID, "часть ушла"); err != nil {
+		t.Fatal(err)
+	}
+	var shown []string
+	old := finishCard
+	finishCard = func(_ context.Context, _ *config.Settings, _ int64, _ *outbox.Draft, _, status, _ string) bool {
+		shown = append(shown, status)
+		return true
+	}
+	t.Cleanup(func() { finishCard = old })
+	cardID := int64(55)
+	card(context.Background(), s, &cardID, snap, "⚠️ **Не отправлено** — "+bot.MDEscape(*snap.SendError))
+	if len(shown) != 0 {
+		t.Fatalf("сбой прошлой попытки показан: %q", shown)
+	}
+	card(context.Background(), s, &cardID, snap, "⚠️ **Не отправлено** — "+bot.MDEscape("часть ушла"))
+	if len(shown) != 1 {
+		t.Fatalf("записанный сбой не показан: %q", shown)
 	}
 }
