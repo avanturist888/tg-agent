@@ -8,11 +8,22 @@ package store
 // сборку — переименовать обратно. Так обновление у пользователя проходит
 // само: служба после перезапуска открывает базу, и всё на месте.
 //
+// Переносить можно, только когда старая сборка больше ничего не пишет и не
+// отправляет: её процессы (служба, окно, tg tool-call без службы, send-due)
+// не знают о базе и, живые, переписали бы файл уже после переноса или
+// отправили черновик, который отправит и новая. Поэтому перенос ждёт
+// отметки обновления (CutoverFile): её ставит tg cutover — scripts\build.ps1
+// зовёт его после замены exe, когда службы остановлены, и он дожидается
+// (или завершает) процессы прежних сборок. Новые процессы после замены exe
+// запускаются уже из новой сборки, так что после отметки старых не бывает.
+// Прослойки агентов (tg mcp) не в счёт: у них нет состояния, вызовы они
+// отдают службе или свежему bin\tg.exe.
+//
 // Перенос никогда не затирает базу: строки, которые в ней уже есть,
-// остаются (INSERT OR IGNORE). Поэтому файл, появившийся снова (его
-// записала ещё работающая старая сборка — например, открытое окно
-// управления), безопасно влить ещё раз: добавится только новое
-// (legacy_reappeared в аудите).
+// остаются (INSERT OR IGNORE). Файл, появившийся снова (после отката на
+// старую сборку и нового обновления), безопасно влить ещё раз: добавится
+// только новое, а решённый в нём черновик (отправлен, отменён) главнее
+// нерешённого в базе (legacy_reappeared в аудите).
 
 import (
 	"bytes"
@@ -65,6 +76,37 @@ var (
 	legacy   []Legacy
 )
 
+// CutoverFile — отметка в data/ профиля: процессов старой сборки больше нет
+// (tg cutover), старые файлы можно переносить.
+const CutoverFile = "legacy-cutover"
+
+// RequireCutover — переносить только после отметки CutoverFile. Включает
+// программа (cmd/tg); тестам пакетов, где старой сборки нет, отметка не нужна.
+var RequireCutover bool
+
+// MarkCutover — поставить отметку обновления в каталоге dir (data/ профиля).
+func MarkCutover(dir, build string) error {
+	raw, _ := json.Marshal(map[string]any{"at": time.Now().Format(time.RFC3339), "build": build})
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return fsx.WriteFile(filepath.Join(dir, CutoverFile), raw, 0o600)
+}
+
+// LegacyPresent — какие старые файлы лежат в dir (data/ профиля).
+func LegacyPresent(dir string) []string {
+	var out []string
+	for _, l := range legacyList() {
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(l.File))); err == nil {
+			out = append(out, l.File)
+		}
+	}
+	return out
+}
+
+// waitingCutover — почему перенос ждёт ("" — не ждёт).
+const waitingCutover = "старая сборка могла ещё работать — перенос ждёт tg cutover (его делает scripts\\build.ps1)"
+
 // RegisterLegacy — перенос файла, формат которого знает другой пакет
 // (например, где по пути нужен диспетчер учётных данных). Вызывать из init.
 func RegisterLegacy(l Legacy) {
@@ -86,17 +128,22 @@ func legacyList() []Legacy {
 func (db *DB) ImportLegacy() error {
 	ctx := context.Background()
 	list := legacyList()
-	present := false
-	for _, l := range list {
-		if _, err := os.Stat(filepath.Join(db.Dir, filepath.FromSlash(l.File))); err == nil {
-			present = true
-			break
-		}
-	}
-	if !present {
+	present := LegacyPresent(db.Dir)
+	if len(present) == 0 {
 		db.pending.Store(false)
+		db.setBlocked("")
 		return nil // переносить нечего — лок не нужен
 	}
+	if RequireCutover {
+		if _, err := os.Stat(filepath.Join(db.Dir, CutoverFile)); err != nil {
+			db.pending.Store(true)
+			if db.setBlocked(waitingCutover) {
+				db.auditLog("legacy_import_waiting", "files", strings.Join(present, ", "), "reason", waitingCutover)
+			}
+			return nil
+		}
+	}
+	db.setBlocked("")
 	pending := false
 	err := lock.With(ctx, filepath.Join(db.Dir, "legacy-import"), legacyLockWait, func() error {
 		for _, l := range list {
@@ -120,6 +167,22 @@ func (db *DB) ImportLegacy() error {
 // LegacyPending — что-то отложено (ErrRetry, занятый лок): службе стоит
 // заглянуть скоро, а не через обычный интервал.
 func (db *DB) LegacyPending() bool { return db.pending.Load() }
+
+// LegacyBlocked — почему старые файлы не переносятся ("" — ничто не мешает).
+func (db *DB) LegacyBlocked() string {
+	db.blockedMu.Lock()
+	defer db.blockedMu.Unlock()
+	return db.blocked
+}
+
+// setBlocked — запомнить причину; true — она новая (записать в аудит раз).
+func (db *DB) setBlocked(why string) bool {
+	db.blockedMu.Lock()
+	defer db.blockedMu.Unlock()
+	changed := db.blocked != why
+	db.blocked = why
+	return changed
+}
 
 func (db *DB) auditLog(action string, kv ...any) {
 	_ = audit.Log(filepath.Join(db.Dir, "audit.jsonl"), action, kv...)
@@ -392,7 +455,7 @@ var builtinLegacy = []Legacy{
 	docFile("pinned_drafts.json", TPinnedDrafts),
 	{File: "t3-threads.json", Locked: true, Import: docImport(TT3Threads)},
 	docFile("upstream_cards.json", TUpstreamCards),
-	{File: "account_notes.json", Locked: true, Import: docImport(TAccountNotes)},
+	{File: "account_notes.json", Locked: true, Import: importNotes},
 	{File: "upstream.json", Import: importUpstream},
 	kvFile("bot_offset.json", KeyBotOffset),
 	kvFile("upstream_thread.json", KeyUpstreamThread),
@@ -708,6 +771,63 @@ func importAgentFolders(ctx context.Context, tx *sql.Tx, path string) (int, erro
 		}
 	}
 	return len(list), nil
+}
+
+// importNotes — заметки к аккаунтам: списки по аккаунту сливаются по id
+// заметки (не «аккаунт уже есть — пропустить»): в снова появившемся файле
+// новая заметка лежит рядом с уже перенесёнными.
+func importNotes(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+	var m map[string][]json.RawMessage
+	if ok, err := readJSON(path, &m); !ok {
+		return 0, err
+	}
+	n := 0
+	for acct, notes := range m {
+		var cur []json.RawMessage
+		var body string
+		switch err := tx.QueryRowContext(ctx, "SELECT body FROM "+TAccountNotes+" WHERE key = ?", acct).Scan(&body); {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return 0, err
+		default:
+			if json.Unmarshal([]byte(body), &cur) != nil {
+				continue // в базе не разобрать — не трогаем
+			}
+		}
+		seen := map[string]bool{}
+		for _, raw := range cur {
+			seen[noteID(raw)] = true
+		}
+		added := false
+		for _, raw := range notes {
+			if id := noteID(raw); id == "" || !seen[id] {
+				cur = append(cur, json.RawMessage(compact(raw)))
+				seen[id] = true
+				added = true
+				n++
+			}
+		}
+		if !added {
+			continue
+		}
+		merged, err := json.Marshal(cur)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO "+TAccountNotes+"(key, body) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body",
+			acct, string(merged)); err != nil {
+			return 0, err
+		}
+	}
+	return n, nil
+}
+
+func noteID(raw json.RawMessage) string {
+	var v struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(raw, &v)
+	return v.ID
 }
 
 func importUpstream(ctx context.Context, tx *sql.Tx, path string) (int, error) {

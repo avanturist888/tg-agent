@@ -105,6 +105,9 @@ func RequestSetAccess(ctx context.Context, s *config.Settings, o SetAccessOpts) 
 func submitSetRequest(ctx context.Context, s *config.Settings, req *accessRequest, out *omap.Map) (*omap.Map, error) {
 	for _, r := range loadAccess(s) {
 		if r.Status == accessPending && r.Scope == req.Scope && r.Folder == req.Folder && (r.Send || !req.Send) {
+			if _, err := adoptOrphan(ctx, s, r.ID); err != nil { // карточка того запроса не ушла — отправить
+				return nil, err
+			}
 			return out.Set("request_id", r.ID).Set("status", accessPending).Set("next_step",
 				"Такой запрос уже ждёт владельца. Дождись: tg_wait_access(request_id)."), nil
 		}

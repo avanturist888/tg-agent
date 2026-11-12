@@ -90,10 +90,12 @@ func sweepPins(ctx context.Context, s *config.Settings) {
 	}
 }
 
-// maybeSweepPins — из цикла автоотправки раз в минуту, в стороне: подвисший
-// Bot API не должен задерживать автоотправку.
-func maybeSweepPins(ctx context.Context, s *config.Settings, last *time.Time) {
-	if time.Since(*last) < time.Minute || !s.BotReady() || !sweeping.CompareAndSwap(false, true) {
+// maybeSweep — уборка из цикла автоотправки раз в минуту, в стороне:
+// подвисший Bot API или отправка не должны задерживать автоотправку.
+// Протухшие карточки — открепить; одобренное, которое никто не отправил, —
+// дослать; запрос доступа, чья карточка не ушла, — отправить.
+func maybeSweep(ctx context.Context, s *config.Settings, last *time.Time) {
+	if time.Since(*last) < time.Minute || !sweeping.CompareAndSwap(false, true) {
 		return
 	}
 	*last = time.Now()
@@ -101,6 +103,10 @@ func maybeSweepPins(ctx context.Context, s *config.Settings, last *time.Time) {
 		defer sweeping.Store(false)
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 		defer cancel()
-		sweepPins(cctx, s)
+		recoverApproved(cctx, s, time.Now().Add(-recoverOrphansAfter), "дослано: одобривший процесс не отправил")
+		if s.BotReady() {
+			sweepPins(cctx, s)
+			publishOrphanAccess(cctx, s)
+		}
 	}()
 }

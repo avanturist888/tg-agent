@@ -48,6 +48,9 @@ type DB struct {
 	Dir     string // data/ профиля
 	sql     *sql.DB
 	pending atomic.Bool // перенос старых файлов отложен (LegacyPending)
+
+	blockedMu sync.Mutex
+	blocked   string // почему перенос ждёт (LegacyBlocked)
 }
 
 var (

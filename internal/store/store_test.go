@@ -412,3 +412,69 @@ func TestLegacyConcurrentOpen(t *testing.T) {
 		t.Fatal("перенос задвоен или потерян")
 	}
 }
+
+// Пока tg cutover не отметил, что процессов старой сборки нет, старые
+// файлы не трогаются (живой старый процесс писал бы мимо базы); после
+// отметки — переносятся.
+func TestLegacyWaitsCutover(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	RequireCutover = true
+	t.Cleanup(func() { RequireCutover = false })
+	write(t, filepath.Join(dir, "upstream_cards.json"), `{"s1": {"n": 1}}`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, db, "SELECT count(*) FROM upstream_cards"); n != 0 {
+		t.Fatalf("перенесено до отметки: %d", n)
+	}
+	if !db.LegacyPending() || db.LegacyBlocked() == "" {
+		t.Fatal("перенос не помечен как ждущий")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "upstream_cards.json")); err != nil {
+		t.Fatal("старый файл тронут до отметки")
+	}
+	if got := LegacyPresent(dir); len(got) != 1 || got[0] != "upstream_cards.json" {
+		t.Fatalf("LegacyPresent = %v", got)
+	}
+	if err := MarkCutover(dir, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, db, "SELECT count(*) FROM upstream_cards"); n != 1 || db.LegacyPending() || db.LegacyBlocked() != "" {
+		t.Fatalf("после отметки: строк %d, pending %v, blocked %q", n, db.LegacyPending(), db.LegacyBlocked())
+	}
+	audit, _ := os.ReadFile(filepath.Join(dir, "audit.jsonl"))
+	if strings.Count(string(audit), "legacy_import_waiting") != 1 {
+		t.Fatalf("audit: %s", audit)
+	}
+}
+
+// Заметки к аккаунту в снова появившемся файле сливаются по id, а не
+// теряются из-за того, что у аккаунта в базе уже есть заметки.
+func TestLegacyNotesMerge(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "account_notes.json"), `{"main": [{"id": "n1", "text": "раз"}]}`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "account_notes.json"), `{"main": [{"id": "n1", "text": "раз (старая правка)"}, {"id": "n2", "text": "два"}], "work": [{"id": "n3", "text": "три"}]}`)
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	var main, work string
+	if err := db.Q().QueryRow("SELECT body FROM account_notes WHERE key = 'main'").Scan(&main); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Q().QueryRow("SELECT body FROM account_notes WHERE key = 'work'").Scan(&work); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(main, `"n2"`) || strings.Contains(main, "старая правка") || strings.Count(main, `"id"`) != 2 || !strings.Contains(work, `"n3"`) {
+		t.Fatalf("main = %s, work = %s", main, work)
+	}
+}

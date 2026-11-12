@@ -432,7 +432,7 @@ func RunAutoSend(ctx context.Context, loader func() (*config.Settings, error)) {
 		if next, err := outbox.New(s.DataDir()).NextDue(); err == nil && next != nil && !time.Now().Before(*next) {
 			SendDue(ctx, s)
 		}
-		maybeSweepPins(ctx, s, &swept) // протухшие карточки — открепить
+		maybeSweep(ctx, s, &swept) // карточки, недосланное, запросы без карточки
 	}
 }
 
@@ -625,6 +625,19 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 // но прошлая служба не успела отправить — её убили между нажатием и
 // отправкой. В режимах без бота статус approved законно ждёт агента или CLI.
 func RecoverInterrupted(ctx context.Context, s *config.Settings) {
+	recoverApproved(ctx, s, processStarted, "дослано после перезапуска службы")
+}
+
+// recoverOrphansAfter — одобренное раньше этого срока и всё ещё не
+// отправленное служба досылает сама (раз в минуту, sweepMinute): тот, кто
+// одобрил, умер, не взяв черновик в отправку (tg tool-call без службы,
+// перенос очереди старой сборки уже после запуска службы). Пока отправляет
+// живой процесс, черновик держит его захват (ClaimSend) — второй отправки нет.
+const recoverOrphansAfter = time.Minute
+
+// recoverApproved — дослать одобренное кнопкой или автоотправкой раньше
+// cutoff, которое никто не отправил.
+func recoverApproved(ctx context.Context, s *config.Settings, cutoff time.Time, why string) {
 	drafts, err := outbox.New(s.DataDir()).List(outbox.Approved)
 	if err != nil {
 		return
@@ -640,11 +653,11 @@ func RecoverInterrupted(ctx context.Context, s *config.Settings) {
 		}
 		// одобренное уже этим процессом отправляет его же путь (автоотправка
 		// захватила черновик секундой раньше) — 12.11.2026 оно ушло дважды
-		if !approvedBefore(d, processStarted) {
+		if !approvedBefore(d, cutoff) {
 			continue
 		}
-		_ = audit.Log(s.AuditPath(), "recover_interrupted", "draft_id", d.ID, "chat", d.Chat)
-		summary := deliver(ctx, s, d.ID, by+" (дослано после перезапуска службы)")
+		_ = audit.Log(s.AuditPath(), "recover_interrupted", "draft_id", d.ID, "chat", d.Chat, "why", why)
+		summary := deliver(ctx, s, d.ID, by+" ("+why+")")
 		card(ctx, s, d.BotMessageID, d, summary)
 	}
 }

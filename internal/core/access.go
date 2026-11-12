@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -207,8 +208,12 @@ type accessRequest struct {
 	CanAuto  bool        `json:"can_auto,omitempty"` // автоотправка — решил владелец при допуске
 	Agent    *inbox.Addr `json:"agent,omitempty"`    // куда сообщить о решении
 	CardID   int64       `json:"card_id,omitempty"`
-	Created  time.Time   `json:"created"`
-	Decided  time.Time   `json:"decided,omitzero"`
+	// кто сейчас отправляет карточку (запрос записан до неё — publishAccess);
+	// умер, не отправив, — запрос сирота, его карточку шлёт следующий
+	PubPID   int       `json:"pub_pid,omitempty"`
+	PubSince float64   `json:"pub_since,omitempty"`
+	Created  time.Time `json:"created"`
+	Decided  time.Time `json:"decided,omitzero"`
 }
 
 // accessTab — запросы доступа по id.
@@ -310,6 +315,9 @@ func RequestAccess(ctx context.Context, s *config.Settings, chatID int64, read, 
 	// такой же запрос ещё ждёт кнопки — вторую карточку не шлём
 	for _, r := range loadAccess(s) {
 		if r.Status == accessPending && r.Peer == chatID && (r.Read || !read) && (r.Send || !send) {
+			if _, err := adoptOrphan(ctx, s, r.ID); err != nil { // карточка того запроса не ушла — отправить
+				return nil, err
+			}
 			return out.Set("request_id", r.ID).Set("status", accessPending).Set("next_step",
 				"Такой запрос уже ждёт владельца. Дождись: tg_wait_access(request_id)."), nil
 		}
@@ -388,7 +396,11 @@ func accessKeyboard(s *config.Settings, r *accessRequest) map[string]any {
 // publishAccess — записать запрос и отправить владельцу карточку. Id
 // запроса закрепляется в базе до карточки: он уходит в её кнопки, и
 // совпадение со старым запросом после этого направило бы нажатие не туда.
+// Пока карточка не ушла, запрос помечен отправляющим процессом (PubPID):
+// умрёт он между записью и карточкой — запрос не повиснет без кнопок
+// (orphaned, publishOrphanAccess).
 func publishAccess(ctx context.Context, s *config.Settings, req *accessRequest, existing *config.ChatRule) error {
+	req.PubPID, req.PubSince = os.Getpid(), pubNow()
 	if err := editAccess(s, func(m map[string]*accessRequest) bool {
 		for m[req.ID] != nil { // id случайный: не занять чужой
 			req.ID = outbox.NewID()
@@ -403,17 +415,81 @@ func publishAccess(ctx context.Context, s *config.Settings, req *accessRequest, 
 		_ = editAccess(s, func(m map[string]*accessRequest) bool { delete(m, req.ID); return true })
 		return fmt.Errorf("карточка в бот не ушла: %w", err)
 	}
-	req.CardID = card
+	return recordAccessCard(s, req, card)
+}
+
+func pubNow() float64 { return float64(time.Now().UnixNano()) / 1e9 }
+
+// recordAccessCard — карточка ушла: запомнить её и снять отметку отправки.
+func recordAccessCard(s *config.Settings, req *accessRequest, card int64) error {
+	req.CardID, req.PubPID, req.PubSince = card, 0, 0
 	return editAccess(s, func(m map[string]*accessRequest) bool {
 		if r := m[req.ID]; r != nil {
-			r.CardID = card
+			r.CardID, r.PubPID, r.PubSince = card, 0, 0
 			return true
 		}
 		return false
 	})
 }
 
-func sendAccessCard(ctx context.Context, s *config.Settings, r *accessRequest, existing *config.ChatRule) (int64, error) {
+// orphaned — запрос ждёт кнопки, а карточки нет и отправлять её некому:
+// отправлявший процесс умер между записью запроса и карточкой.
+func (r *accessRequest) orphaned() bool {
+	return r.Status == accessPending && r.CardID == 0 && (r.PubPID == 0 || !lock.PIDAlive(r.PubPID, r.PubSince))
+}
+
+// adoptOrphan — отправить карточку осиротевшего запроса (тот же id: его
+// уже знает агент). Взять его можно только одному — отметка ставится в той
+// же транзакции, где проверено, что он сирота. false — не сирота (карточка
+// есть или её отправляет живой процесс).
+func adoptOrphan(ctx context.Context, s *config.Settings, id string) (bool, error) {
+	var req *accessRequest
+	if err := editAccess(s, func(m map[string]*accessRequest) bool {
+		r := m[id]
+		if r == nil || !r.orphaned() {
+			return false
+		}
+		r.PubPID, r.PubSince = os.Getpid(), pubNow()
+		cp := *r
+		req = &cp
+		return true
+	}); err != nil || req == nil {
+		return false, err
+	}
+	var existing *config.ChatRule
+	if rule, ok := s.Chats[req.Alias]; ok && req.Alias != "" && req.Scope == "" {
+		existing = &rule
+	}
+	card, err := sendAccessCard(ctx, s, req, existing)
+	if err != nil {
+		// отметку снять: следующая уборка попробует снова (запрос оставляем —
+		// агент уже ждёт его id)
+		_ = editAccess(s, func(m map[string]*accessRequest) bool {
+			if r := m[id]; r != nil && r.CardID == 0 {
+				r.PubPID, r.PubSince = 0, 0
+				return true
+			}
+			return false
+		})
+		logEvent(s, "access_card_failed", "request_id", id, "error", err.Error())
+		return true, fmt.Errorf("карточка в бот не ушла: %w", err)
+	}
+	logEvent(s, "access_card_recovered", "request_id", id)
+	return true, recordAccessCard(s, req, card)
+}
+
+// publishOrphanAccess — уборка службы: карточки осиротевших запросов.
+func publishOrphanAccess(ctx context.Context, s *config.Settings) {
+	for id, r := range loadAccess(s) {
+		if r.orphaned() {
+			_, _ = adoptOrphan(ctx, s, id)
+		}
+	}
+}
+
+var sendAccessCard = postAccessCard // тесты подменяют
+
+func postAccessCard(ctx context.Context, s *config.Settings, r *accessRequest, existing *config.ChatRule) (int64, error) {
 	var msg struct {
 		MessageID int64 `json:"message_id"`
 	}

@@ -81,6 +81,16 @@ try {
         Get-CimInstance Win32_Process |
             Where-Object { $_.CommandLine -match 'tgw?(\.old[-0-9]*)?\.exe"?\s+(serve|approvals)' } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    # состояние сборки до 12.11.2026 (JSON-файлы в data/) переносится в
+    # state.db, только когда её процессов не осталось: tg cutover дожидается
+    # их (вызовы инструментов, CLI) или завершает (окно управления) и ставит
+    # отметку. Состояние уже в базе — он сразу выходит.
+    & bin\tg.exe cutover
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning 'tg cutover не закончил: старое состояние не перенесено, служба работает без него. Разберись и повтори: bin\tg.exe cutover'
+    }
+    if ($tasks.Count -gt 0) {
         foreach ($t in $tasks) {
             Start-ScheduledTask -TaskName $t.TaskName
             Write-Host "Служба $($t.TaskName) перезапущена: $((Get-ScheduledTask -TaskName $t.TaskName).State)"

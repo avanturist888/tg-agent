@@ -102,6 +102,7 @@ func init() {
 		{name: "updates", help: "карточки обновлений MAX: что ждёт разбора, ack — разобрано (tg updates help)", run: cmdUpdates},
 		{name: "agents", help: "агенты из контейнеров: MCP по HTTP (--new-token — токен для .env)", run: cmdAgents},
 		{name: "gui", help: "окно управления: чаты, черновики, настройки", run: cmdGUI},
+		{name: "cutover", help: "после обновления: дождаться процессов прежней сборки, чтобы перенести её состояние (зовёт scripts\\build.ps1)", run: cmdCutover},
 		// служебные: их запускает сама программа
 		{name: "tool-list", run: cmdToolList},
 		{name: "tool-call", run: cmdToolCall},
@@ -990,6 +991,10 @@ func cmdDoctor(ctx context.Context, args []string) int {
 	} else {
 		fmt.Printf("[v] база состояния: %s (схема %d, перенесено старых файлов: %d)\n",
 			filepath.Join(db.Dir, store.FileName), store.Version(), db.LegacyImported())
+		if why := db.LegacyBlocked(); why != "" {
+			fmt.Println("[x] старые файлы состояния не перенесены:", why)
+			problems = append(problems, "старое состояние (черновики, подписки) ещё не в базе: bin\\tg.exe cutover")
+		}
 	}
 	up := service.Up(ctx)
 	var status service.Status
