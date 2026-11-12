@@ -187,6 +187,31 @@ type archiveChatIn struct {
 	Unarchive bool   `json:"unarchive,omitempty" jsonschema:"true — достать из архива; по умолчанию убрать в архив"`
 }
 
+type createFolderIn struct {
+	Account string   `json:"account,omitempty" jsonschema:"аккаунт (по умолчанию основной)"`
+	Title   string   `json:"title" jsonschema:"название папки"`
+	Emoji   *string  `json:"emoji,omitempty" jsonschema:"значок папки (эмодзи из набора Telegram), необязательно"`
+	Chats   []int64  `json:"chats,omitempty" jsonschema:"id чатов из tg_unfiled_chats или tg_folder_chats — добавить явно"`
+	Include []string `json:"include,omitempty" jsonschema:"правила — какие чаты попадают сами: contacts, non_contacts, groups, channels, bots"`
+	Exclude []string `json:"exclude,omitempty" jsonschema:"кроме: muted (заглушённые), read (прочитанные), archived (архив)"`
+}
+
+type editFolderIn struct {
+	Account string   `json:"account,omitempty" jsonschema:"аккаунт (по умолчанию основной)"`
+	Folder  string   `json:"folder" jsonschema:"папка: id или название из tg_list_folders"`
+	Title   string   `json:"title,omitempty" jsonschema:"новое название"`
+	Emoji   *string  `json:"emoji,omitempty" jsonschema:"новый значок; пустая строка — убрать"`
+	Include []string `json:"include,omitempty" jsonschema:"правила заменить на эти: contacts, non_contacts, groups, channels, bots; [] — без правил"`
+	Exclude []string `json:"exclude,omitempty" jsonschema:"исключения правил заменить на эти: muted, read, archived; [] — без исключений"`
+	Hide    []int64  `json:"hide_chats,omitempty" jsonschema:"id чатов — в «Не показывать» этой папки"`
+	Unhide  []int64  `json:"unhide_chats,omitempty" jsonschema:"id чатов — убрать из «Не показывать»"`
+}
+
+type deleteFolderIn struct {
+	Account string `json:"account,omitempty" jsonschema:"аккаунт (по умолчанию основной)"`
+	Folder  string `json:"folder" jsonschema:"папка: id или название из tg_list_folders"`
+}
+
 type waitAccessIn struct {
 	RequestID  string `json:"request_id" jsonschema:"id запроса из tg_request_access"`
 	TimeoutSec int    `json:"timeout_sec,omitempty" jsonschema:"сколько ждать, секунд (по умолчанию 300)"`
@@ -429,7 +454,8 @@ chat_id — id из tg_folder_chats; send=true — нужна и отправк�
 folder — папку целиком (id или название из tg_list_folders; её новые чаты
 откроются сами), public_channels=true — все публичные каналы аккаунта (с
 @username, только чтение), manage_folders=true — право раскладывать чаты
-по папкам и архиву (tg_unfiled_chats, tg_move_chat, tg_archive_chat;
+по папкам и архиву и заводить папки (tg_unfiled_chats, tg_move_chat,
+tg_archive_chat, tg_create_folder, tg_edit_folder, tg_delete_folder;
 сообщений оно не открывает).
 Владелец может разрешить с автоотправкой (сообщения уходят сами, с окном
 на отмену), разрешить с подтверждением каждого сообщения, разрешить только
@@ -508,6 +534,62 @@ tg_list_folders. Чат, попадающий в папку по её прави
 					return nil, err
 				}
 				return core.ArchiveChat(ctx, s, in.ChatID, !in.Unarchive)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_create_folder", Description: `Завести новую папку Telegram владельца.
+
+chats — чаты, добавленные явно (id из tg_unfiled_chats или tg_folder_chats);
+include — правила, по которым чаты попадают сами (contacts, non_contacts,
+groups, channels, bots), exclude — кроме каких (muted, read, archived).
+Нужно хотя бы одно из chats или include. Название не может совпадать с
+папкой, открытой агентам решением владельца. Нужно право раскладывать чаты
+(tg_request_access(manage_folders=true)). Папка не открывает сообщений
+своих чатов. Не заводи папки без просьбы владельца.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in createFolderIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				if err := checkAccount(in.Account); err != nil {
+					return nil, err
+				}
+				return core.CreateFolder(ctx, s, core.FolderOpts{Title: in.Title, Emoji: in.Emoji, Chats: in.Chats,
+					Include: in.Include, Exclude: in.Exclude})
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_edit_folder", Description: `Изменить папку Telegram владельца: название, значок, правила, «Не показывать».
+
+title, emoji — переименовать и сменить значок; include заменяет правила
+включения, exclude — их исключения (слова — как в tg_create_folder;
+не указанное не меняется, [] — снять всё);
+hide_chats — чаты в «Не показывать» (папка их не покажет, даже если они
+подходят под её правила), unhide_chats — убрать оттуда. Добавить чат
+явно или вынуть его — tg_move_chat.
+Папку, открытую агентам решением владельца (access в tg_list_folders),
+можно только скрывать и возвращать чаты: название и правила меняет он;
+возвращённый тобой чат доступа к сообщениям не даёт. Папку-ссылку менять
+нельзя. Нужно право раскладывать чаты (tg_request_access(manage_folders=true)).`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in editFolderIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 3*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				if err := checkAccount(in.Account); err != nil {
+					return nil, err
+				}
+				return core.EditFolder(ctx, s, in.Folder, core.FolderOpts{Title: in.Title, Emoji: in.Emoji,
+					Include: in.Include, Exclude: in.Exclude, Hide: in.Hide, Unhide: in.Unhide})
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_delete_folder", Description: `Удалить папку Telegram владельца; чаты из неё остаются в списке чатов.
+
+Можно только папку, которую завёл агент (made_by_agent в tg_list_folders),
+или папку владельца, в которой не осталось ни правил, ни чатов. Остальные
+папки владельца, папку-ссылку и папку, открытую агентам, удаляет только он. Нужно право раскладывать чаты
+(tg_request_access(manage_folders=true)).`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in deleteFolderIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				if err := checkAccount(in.Account); err != nil {
+					return nil, err
+				}
+				return core.DeleteFolder(ctx, s, in.Folder)
 			})
 		})
 

@@ -69,37 +69,58 @@ type NotEditable struct{ Msg string }
 
 func (e *NotEditable) Error() string { return e.Msg }
 
-// MoveChat — положить чат в папку (add) или вынуть из неё. Как в клиентах
-// Telegram: вынуть чат, который попадает в папку по её правилам («все
-// каналы»), — значит добавить его в исключения.
-func (c *Conn) MoveChat(ctx context.Context, folderID int, marked int64, add bool) error {
+// filterOf — папка как её хранит Telegram; папку-ссылку и чужую — нельзя.
+func (c *Conn) filterOf(ctx context.Context, folderID int) (*tg.DialogFilter, error) {
 	res, err := c.API.MessagesGetDialogFilters(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var filter *tg.DialogFilter
 	for _, f := range res.Filters {
 		switch v := f.(type) {
 		case *tg.DialogFilter:
 			if v.ID == folderID {
-				filter = v
+				return v, nil
 			}
 		case *tg.DialogFilterChatlist:
 			if v.ID == folderID {
-				return &NotEditable{"Это папка-ссылка: её состав раздаётся по приглашению, менять его может только владелец."}
+				return nil, &NotEditable{"Это папка-ссылка: её состав раздаётся по приглашению, менять его может только владелец."}
 			}
 		}
 	}
-	if filter == nil {
-		return &NotEditable{fmt.Sprintf("Папки %d нет — список: tg_list_folders.", folderID)}
-	}
+	return nil, &NotEditable{fmt.Sprintf("Папки %d нет — список: tg_list_folders.", folderID)}
+}
+
+// inputOf — чат (id формата Bot API) для списков папки.
+func (c *Conn) inputOf(ctx context.Context, marked int64) (tg.InputPeerClass, error) {
 	t, err := c.resolveID(ctx, marked)
+	if err != nil {
+		return nil, err
+	}
+	if t.Kind == "self" {
+		return &tg.InputPeerSelf{}, nil
+	}
+	return t.Input, nil
+}
+
+func (c *Conn) putFilter(ctx context.Context, filter *tg.DialogFilter) error {
+	req := &tg.MessagesUpdateDialogFilterRequest{ID: filter.ID}
+	req.SetFilter(filter)
+	_, err := c.API.MessagesUpdateDialogFilter(ctx, req)
+	ForgetDialogs()
+	return err
+}
+
+// MoveChat — положить чат в папку (add) или вынуть из неё. Как в клиентах
+// Telegram: вынуть чат, который попадает в папку по её правилам («все
+// каналы»), — значит добавить его в исключения.
+func (c *Conn) MoveChat(ctx context.Context, folderID int, marked int64, add bool) error {
+	filter, err := c.filterOf(ctx, folderID)
 	if err != nil {
 		return err
 	}
-	input := t.Input
-	if t.Kind == "self" {
-		input = &tg.InputPeerSelf{}
+	input, err := c.inputOf(ctx, marked)
+	if err != nil {
+		return err
 	}
 	self := c.Peers.SelfID()
 	same := func(p tg.InputPeerClass) bool { return inputMarkedID(p, self) == marked }
@@ -110,10 +131,7 @@ func (c *Conn) MoveChat(ctx context.Context, folderID int, marked int64, add boo
 	if err != nil {
 		return err
 	}
-	rules := Folder{Contacts: filter.Contacts, NonContacts: filter.NonContacts, Groups: filter.Groups,
-		Broadcasts: filter.Broadcasts, Bots: filter.Bots, ExcludeMuted: filter.ExcludeMuted,
-		ExcludeRead: filter.ExcludeRead, ExcludeArchived: filter.ExcludeArchived}
-	byRules := c.InFolder(page, rules, marked)
+	byRules := c.InFolder(page, rulesOf(filter), marked)
 	filter.ExcludePeers = drop(filter.ExcludePeers)
 	if add {
 		if !byRules && !slices.ContainsFunc(filter.IncludePeers, same) && !slices.ContainsFunc(filter.PinnedPeers, same) {
@@ -126,9 +144,124 @@ func (c *Conn) MoveChat(ctx context.Context, folderID int, marked int64, add boo
 			filter.ExcludePeers = append(filter.ExcludePeers, input)
 		}
 	}
-	req := &tg.MessagesUpdateDialogFilterRequest{ID: folderID}
-	req.SetFilter(filter)
-	_, err = c.API.MessagesUpdateDialogFilter(ctx, req)
+	return c.putFilter(ctx, filter)
+}
+
+func rulesOf(f *tg.DialogFilter) Folder {
+	return Folder{Contacts: f.Contacts, NonContacts: f.NonContacts, Groups: f.Groups,
+		Broadcasts: f.Broadcasts, Bots: f.Bots, ExcludeMuted: f.ExcludeMuted,
+		ExcludeRead: f.ExcludeRead, ExcludeArchived: f.ExcludeArchived}
+}
+
+// FolderRules — правила папки: какие чаты в неё попадают сами.
+type FolderRules struct {
+	Contacts, NonContacts, Groups, Broadcasts, Bots bool
+	ExcludeMuted, ExcludeRead, ExcludeArchived      bool
+}
+
+// apply — только через сеттеры: SetFlags при кодировании биты ставит, но не
+// снимает, и снятое правило полученной папки осталось бы включённым.
+func (r FolderRules) apply(f *tg.DialogFilter) {
+	r.applyInclude(f)
+	r.applyExclude(f)
+}
+
+func (r FolderRules) applyInclude(f *tg.DialogFilter) {
+	f.SetContacts(r.Contacts)
+	f.SetNonContacts(r.NonContacts)
+	f.SetGroups(r.Groups)
+	f.SetBroadcasts(r.Broadcasts)
+	f.SetBots(r.Bots)
+}
+
+func (r FolderRules) applyExclude(f *tg.DialogFilter) {
+	f.SetExcludeMuted(r.ExcludeMuted)
+	f.SetExcludeRead(r.ExcludeRead)
+	f.SetExcludeArchived(r.ExcludeArchived)
+}
+
+// setEmoticon — значок. Пустой — тоже с битом флага: без бита Telegram
+// оставляет прежний значок, а пустая строка его снимает (проверено
+// 12.11.2026).
+func setEmoticon(f *tg.DialogFilter, e string) {
+	f.SetEmoticon(e)
+}
+
+// FolderEdit — что поменять в папке; nil и пустое — не трогать.
+type FolderEdit struct {
+	Title    string
+	Emoticon *string
+	// Include — заменить правила включения (Contacts…Bots), Exclude —
+	// исключения правил (ExcludeMuted…): одно без другого не трогает другое
+	Include, Exclude *FolderRules
+	// Hide — в «Не показывать» (и вон из явно добавленных), Unhide — оттуда
+	Hide, Unhide []int64
+}
+
+// CreateFolder — новая папка с номером id: правила и явно добавленные чаты.
+func (c *Conn) CreateFolder(ctx context.Context, id int, title, emoticon string, rules FolderRules, chats []int64) error {
+	filter := &tg.DialogFilter{ID: id, Title: tg.TextWithEntities{Text: title}}
+	setEmoticon(filter, emoticon)
+	rules.apply(filter)
+	for _, marked := range chats {
+		input, err := c.inputOf(ctx, marked)
+		if err != nil {
+			return fmt.Errorf("чат %d: %w", marked, err)
+		}
+		filter.IncludePeers = append(filter.IncludePeers, input)
+	}
+	return c.putFilter(ctx, filter)
+}
+
+// EditFolder — переименовать, сменить правила, скрыть чаты или вернуть их.
+func (c *Conn) EditFolder(ctx context.Context, folderID int, e FolderEdit) error {
+	filter, err := c.filterOf(ctx, folderID)
+	if err != nil {
+		return err
+	}
+	if e.Title != "" {
+		filter.Title = tg.TextWithEntities{Text: e.Title}
+	}
+	if e.Emoticon != nil {
+		setEmoticon(filter, *e.Emoticon)
+	}
+	if e.Include != nil {
+		e.Include.applyInclude(filter)
+	}
+	if e.Exclude != nil {
+		e.Exclude.applyExclude(filter)
+	}
+	self := c.Peers.SelfID()
+	in := func(list []int64) func(tg.InputPeerClass) bool {
+		return func(p tg.InputPeerClass) bool { return slices.Contains(list, inputMarkedID(p, self)) }
+	}
+	if len(e.Unhide) > 0 {
+		filter.ExcludePeers = slices.DeleteFunc(filter.ExcludePeers, in(e.Unhide))
+	}
+	if len(e.Hide) > 0 {
+		filter.IncludePeers = slices.DeleteFunc(filter.IncludePeers, in(e.Hide))
+		filter.PinnedPeers = slices.DeleteFunc(filter.PinnedPeers, in(e.Hide))
+		for _, marked := range e.Hide {
+			if slices.ContainsFunc(filter.ExcludePeers, in([]int64{marked})) {
+				continue
+			}
+			input, err := c.inputOf(ctx, marked)
+			if err != nil {
+				return fmt.Errorf("чат %d: %w", marked, err)
+			}
+			filter.ExcludePeers = append(filter.ExcludePeers, input)
+		}
+	}
+	return c.putFilter(ctx, filter)
+}
+
+// DeleteFolder — удалить папку (чаты остаются в списке чатов).
+func (c *Conn) DeleteFolder(ctx context.Context, folderID int) error {
+	if _, err := c.filterOf(ctx, folderID); err != nil {
+		return err
+	}
+	_, err := c.API.MessagesUpdateDialogFilter(ctx, &tg.MessagesUpdateDialogFilterRequest{ID: folderID})
+	ForgetDialogs()
 	return err
 }
 

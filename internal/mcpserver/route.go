@@ -58,7 +58,7 @@ var (
 		"tg_list_topics", "tg_draft_message", "tg_edit_message", "tg_react", "tg_subscribe", "tg_unsubscribe",
 		"tg_draft_poll", "tg_poll_votes", "tg_vote", "tg_pass", "tg_mark_read")
 	accountTools = set("tg_list_folders", "tg_folder_chats", "tg_request_access", "tg_unfiled_chats",
-		"tg_move_chat", "tg_archive_chat")
+		"tg_move_chat", "tg_archive_chat", "tg_create_folder", "tg_edit_folder", "tg_delete_folder")
 	idTools    = set("tg_wait_approval", "tg_send_draft", "tg_cancel_draft", "tg_wait_access")
 	everyTools = set("tg_list_chats", "tg_list_drafts")
 )

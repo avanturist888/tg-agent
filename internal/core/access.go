@@ -58,11 +58,14 @@ func ListFolders(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 	if n := netOf(s); n != nil {
 		return n.listFolders(ctx, s)
 	}
-	var folders []tgc.Folder
-	err := tgc.Run(ctx, s, tgc.Opts{Caller: "folders"}, func(ctx context.Context, c *tgc.Conn) error {
-		var err error
-		folders, err = c.Folders(ctx)
-		return err
+	folders, byAgent, err := listedFolders(ctx, s, func() ([]tgc.Folder, error) {
+		var folders []tgc.Folder
+		err := tgc.Run(ctx, s, tgc.Opts{Caller: "folders"}, func(ctx context.Context, c *tgc.Conn) error {
+			var err error
+			folders, err = c.Folders(ctx)
+			return err
+		})
+		return folders, err
 	})
 	if err != nil {
 		return nil, err
@@ -77,6 +80,12 @@ func ListFolders(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 			item.Set("shared", true)
 		}
 		item.Set("pinned_and_included", len(f.Pinned)+len(f.Include))
+		if len(f.Exclude) > 0 {
+			item.Set("hidden", len(f.Exclude))
+		}
+		if byAgent[f.ID] {
+			item.Set("made_by_agent", true)
+		}
 		if rules := f.Rules(); len(rules) > 0 {
 			item.Set("rules", rules)
 		}
@@ -108,31 +117,34 @@ func FolderChats(ctx context.Context, s *config.Settings, folder string) (*omap.
 		rows  []tgc.DialogRow
 		known = map[int64]config.ChatRule{} // id → правило белого списка
 	)
-	err := tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "folder_chats"}, func(ctx context.Context, c *tgc.Conn) error {
-		folders, err := c.Folders(ctx)
-		if err != nil {
-			return err
-		}
-		var titles []string
-		ok := false
-		for _, f := range folders {
-			titles = append(titles, fmt.Sprintf("%d «%s»", f.ID, f.Title))
-			if strconv.Itoa(f.ID) == folder || strings.EqualFold(f.Title, folder) {
-				found, ok = f, true
+	err := watchFolders(ctx, s, func(see func([]tgc.Folder) *agentBook) error {
+		return tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "folder_chats"}, func(ctx context.Context, c *tgc.Conn) error {
+			folders, err := c.Folders(ctx)
+			if err != nil {
+				return err
 			}
-		}
-		if !ok {
-			return &Bad{Msg: fmt.Sprintf("Папки «%s» нет. Есть: %s.", folder, strings.Join(titles, ", "))}
-		}
-		if rows, err = c.FolderChats(ctx, found, 0); err != nil {
-			return err
-		}
-		for _, r := range s.Rules() {
-			if id := ruleMarkedID(r, c); id != 0 {
-				known[id] = r
+			see(folders)
+			var titles []string
+			ok := false
+			for _, f := range folders {
+				titles = append(titles, fmt.Sprintf("%d «%s»", f.ID, f.Title))
+				if strconv.Itoa(f.ID) == folder || strings.EqualFold(f.Title, folder) {
+					found, ok = f, true
+				}
 			}
-		}
-		return nil
+			if !ok {
+				return &Bad{Msg: fmt.Sprintf("Папки «%s» нет. Есть: %s.", folder, strings.Join(titles, ", "))}
+			}
+			if rows, err = c.FolderChats(ctx, found, 0); err != nil {
+				return err
+			}
+			for _, r := range s.Rules() {
+				if id := ruleMarkedID(r, c); id != 0 {
+					known[id] = r
+				}
+			}
+			return nil
+		})
 	})
 	if err != nil {
 		return nil, err

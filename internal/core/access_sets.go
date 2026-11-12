@@ -56,7 +56,7 @@ func RequestSetAccess(ctx context.Context, s *config.Settings, o SetAccessOpts) 
 		req.Scope, req.Title = scopeManage, "папки и архив"
 		if s.Manage.Folders {
 			return out.Set("scope", scopeManage).Set("status", "already_allowed").
-				Set("hint", "Право уже есть: tg_unfiled_chats, tg_move_chat, tg_archive_chat."), nil
+				Set("hint", "Право уже есть: tg_unfiled_chats, tg_move_chat, tg_archive_chat, tg_create_folder, tg_edit_folder, tg_delete_folder."), nil
 		}
 	case o.Public:
 		if n := netOf(s); n != nil {
@@ -205,8 +205,10 @@ func setCardMarkdown(r *accessRequest, status string) string {
 	case scopeManage:
 		b.WriteString("🗂 **Агент просит право раскладывать чаты по папкам**\n\n")
 		b.WriteString("Сможет: видеть чаты вне папок (только названия), класть чаты в папки и вынимать, " +
-			"убирать в архив и доставать. Сообщений это не открывает; чат, который он сам положит в " +
-			"открытую агентам папку, доступа ему не даст.\n")
+			"убирать в архив и доставать, заводить папки, переименовывать их, менять правила и " +
+			"«Не показывать», удалять свои папки и папки без правил и чатов. Сообщений это не открывает; " +
+			"чат, который он сам положит в открытую агентам папку, доступа ему не даст, а открытые " +
+			"агентам папки он не переименует, не перенастроит и не удалит.\n")
 	case scopePublic:
 		b.WriteString("📢 **Агент просит доступ ко всем публичным каналам**\n\n")
 		fmt.Fprintf(&b, "**Каналы:** с @username, на которые ты подписан (без закрытых по ссылке, без групп и личек) — сейчас %d", r.Count)
@@ -269,7 +271,7 @@ func setDecisionText(s *config.Settings, r *accessRequest) string {
 	}
 	switch r.Scope {
 	case scopeManage:
-		return fmt.Sprintf("tg-agent: владелец дал право раскладывать чаты (запрос %s): tg_unfiled_chats, tg_move_chat, tg_archive_chat.", r.ID)
+		return fmt.Sprintf("tg-agent: владелец дал право раскладывать чаты (запрос %s): tg_unfiled_chats, tg_move_chat, tg_archive_chat, tg_create_folder, tg_edit_folder, tg_delete_folder.", r.ID)
 	}
 	n := 0
 	for _, rule := range s.Rules() {
@@ -294,7 +296,7 @@ func setWaitResult(s *config.Settings, r *accessRequest) *omap.Map {
 	case accessGranted:
 		out.Set("granted", setGranted(r))
 		if r.Scope == scopeManage {
-			out.Set("hint", "tg_unfiled_chats, tg_move_chat, tg_archive_chat.")
+			out.Set("hint", "tg_unfiled_chats, tg_move_chat, tg_archive_chat, tg_create_folder, tg_edit_folder, tg_delete_folder.")
 		} else {
 			out.Set("hint", "Чаты группы — в tg_list_chats (поле via).")
 		}

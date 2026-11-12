@@ -40,22 +40,25 @@ func UnfiledChats(ctx context.Context, s *config.Settings, archived string) (*om
 	}
 	var rows []tgc.DialogRow
 	known := map[int64]config.ChatRule{}
-	err := tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "unfiled_chats"}, func(ctx context.Context, c *tgc.Conn) error {
-		folders, err := c.Folders(ctx)
-		if err != nil {
-			return err
-		}
-		page, err := c.Dialogs(ctx)
-		if err != nil {
-			return err
-		}
-		rows = c.Unfiled(page, folders)
-		for _, r := range s.Rules() {
-			if id := ruleMarkedID(r, c); id != 0 {
-				known[id] = r
+	err := watchFolders(ctx, s, func(see func([]tgc.Folder) *agentBook) error {
+		return tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "unfiled_chats"}, func(ctx context.Context, c *tgc.Conn) error {
+			folders, err := c.Folders(ctx)
+			if err != nil {
+				return err
 			}
-		}
-		return nil
+			see(folders)
+			page, err := c.Dialogs(ctx)
+			if err != nil {
+				return err
+			}
+			rows = c.Unfiled(page, folders)
+			for _, r := range s.Rules() {
+				if id := ruleMarkedID(r, c); id != 0 {
+					known[id] = r
+				}
+			}
+			return nil
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -109,66 +112,62 @@ func MoveChat(ctx context.Context, s *config.Settings, chatID int64, from, to st
 		inFrom, inTo   bool
 		alreadyMessage string
 	)
-	err := tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "move_chat"}, func(ctx context.Context, c *tgc.Conn) error {
-		info, err := c.ChatInfo(ctx, chatID)
-		if err != nil {
-			return &Bad{Msg: fmt.Sprintf("Чат %d не найден среди чатов аккаунта: %v", chatID, err)}
-		}
-		title = info.Title
-		folders, err := c.Folders(ctx)
-		if err != nil {
-			return err
-		}
-		find := func(ref string) (tgc.Folder, bool, error) {
-			if ref == "" {
-				return tgc.Folder{}, false, nil
+	// под тем же локом, что правка и удаление папок: фильтр папки читается
+	// и пишется целиком, и параллельная операция потеряла бы чужую правку
+	// (или вернула бы удалённую папку)
+	err := withFolders(ctx, s, func(b *agentBook) error {
+		return tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "move_chat"}, func(ctx context.Context, c *tgc.Conn) error {
+			info, err := c.ChatInfo(ctx, chatID)
+			if err != nil {
+				return &Bad{Msg: fmt.Sprintf("Чат %d не найден среди чатов аккаунта: %v", chatID, err)}
 			}
-			f, ok := findTGFolder(folders, ref, "")
-			if !ok {
-				f, ok = findTGFolder(folders, "", ref)
+			title = info.Title
+			folders, err := c.Folders(ctx)
+			if err != nil {
+				return err
 			}
-			if !ok {
-				var names []string
-				for _, f := range folders {
-					names = append(names, fmt.Sprintf("%d «%s»", f.ID, f.Title))
+			b.sync(folders)
+			find := func(ref string) (tgc.Folder, bool, error) {
+				if ref == "" {
+					return tgc.Folder{}, false, nil
 				}
-				return f, false, &Bad{Msg: fmt.Sprintf("Папки «%s» нет. Есть: %s.", ref, strings.Join(names, ", "))}
+				f, err := pickFolder(folders, ref)
+				return f, err == nil, err
 			}
-			return f, true, nil
-		}
-		if fromF, fromOK, err = find(from); err != nil {
-			return err
-		}
-		if toF, toOK, err = find(to); err != nil {
-			return err
-		}
-		if fromOK && toOK && fromF.ID == toF.ID {
-			return &Bad{Msg: "from_folder и to_folder — одна папка."}
-		}
-		page, err := c.Dialogs(ctx)
-		if err != nil {
-			return err
-		}
-		inFrom = fromOK && c.InFolder(page, fromF, chatID)
-		inTo = toOK && c.InFolder(page, toF, chatID)
-		if (!fromOK || !inFrom) && (!toOK || inTo) {
-			alreadyMessage = "Ничего менять не нужно: чат уже так и лежит."
+			if fromF, fromOK, err = find(from); err != nil {
+				return err
+			}
+			if toF, toOK, err = find(to); err != nil {
+				return err
+			}
+			if fromOK && toOK && fromF.ID == toF.ID {
+				return &Bad{Msg: "from_folder и to_folder — одна папка."}
+			}
+			page, err := c.Dialogs(ctx)
+			if err != nil {
+				return err
+			}
+			inFrom = fromOK && c.InFolder(page, fromF, chatID)
+			inTo = toOK && c.InFolder(page, toF, chatID)
+			if (!fromOK || !inFrom) && (!toOK || inTo) {
+				alreadyMessage = "Ничего менять не нужно: чат уже так и лежит."
+				return nil
+			}
+			if toOK && !inTo {
+				if err := blockForAgent(s, chatID); err != nil {
+					return err
+				}
+				if err := c.MoveChat(ctx, toF.ID, chatID, true); err != nil {
+					return err
+				}
+			}
+			if fromOK && inFrom {
+				if err := c.MoveChat(ctx, fromF.ID, chatID, false); err != nil {
+					return err
+				}
+			}
 			return nil
-		}
-		if toOK && !inTo {
-			if err := blockForAgent(s, chatID); err != nil {
-				return err
-			}
-			if err := c.MoveChat(ctx, toF.ID, chatID, true); err != nil {
-				return err
-			}
-		}
-		if fromOK && inFrom {
-			if err := c.MoveChat(ctx, fromF.ID, chatID, false); err != nil {
-				return err
-			}
-		}
-		return nil
+		})
 	})
 	if err != nil {
 		return nil, folderErr(err)
@@ -253,7 +252,8 @@ func folderErr(err error) error {
 	case "FILTER_INCLUDE_TOO_MUCH", "DIALOG_FILTERS_TOO_MUCH", "CHATLIST_INCLUDE_INVALID":
 		return &Bad{Msg: "Telegram не принял: в папке уже предел явно добавленных чатов (100, с Premium — 200)."}
 	case "FILTER_INCLUDE_EMPTY":
-		return &Bad{Msg: "Telegram не оставляет папку пустой: это последний её чат. Удалить папку может владелец."}
+		return &Bad{Msg: "Telegram не оставляет папку пустой: в ней не останется ни чатов, ни правил. " +
+			"Удалить папку — tg_delete_folder."}
 	}
 	return err
 }
