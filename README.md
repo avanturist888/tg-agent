@@ -117,7 +117,7 @@ bin\tg.exe deny work-team                  # закрыть доступ сов�
 Нужен Go (версию он подтянет сам по `go.mod`).
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File <tg-agent>\scripts\build.ps1
+powershell -ExecutionPolicy Bypass -File <tg-agent>\scripts\build.ps1 -Artifacts <каталог-пакета>
 ```
 
 Скрипт прогоняет тесты и кладёт `tg.exe` и `tgw.exe` в `bin\`.
@@ -237,10 +237,15 @@ Telegram, лент в реальном времени нет, а нажатие 
 ### Обновление
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File <tg-agent>\scripts\build.ps1
+powershell -ExecutionPolicy Bypass -File <tg-agent>\scripts\build.ps1 -Artifacts <каталог-пакета>
 ```
 
-Прогоняет тесты, собирает и перезапускает службу. Агентов останавливать не
+Сначала на worker выполняется `scripts\build-worker.ps1 -Artifacts <новый каталог>`:
+тесты, vet и сборка exe/DLL с манифестом SHA256. Пакет возвращается через
+общий мост `wk get`. Локально команда выше запускается с
+`-Artifacts <каталог пакета>`: проверяет состав, ревизию и суммы, сохраняет
+прежние файлы и перезапускает службу. До выпуска общего моста wk обновление
+этим путём ожидает его подключения. Агентов останавливать не
 нужно: их MCP-прослойка замечает новую сборку сама. Открытое окно управления
 открыть заново.
 

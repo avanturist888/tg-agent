@@ -1,0 +1,5 @@
+(^|/)\.env[^/]*(/|$)
+^data(/|$)
+^profiles(/|$)
+^config/chats\.toml$
+^config/(agents|t3)\.toml$

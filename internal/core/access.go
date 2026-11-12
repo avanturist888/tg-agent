@@ -224,9 +224,9 @@ type accessRequest struct {
 	CardShown bool   `json:"card_shown,omitempty"`
 	// CardLost — карточку отправляли, но её номер неизвестен (Bot API не
 	// ответил — она могла и уйти): итог тогда — отдельным сообщением
-	CardLost  bool   `json:"card_lost,omitempty"`
-	AgentTold bool   `json:"agent_told,omitempty"`
-	Told      bool   `json:"told,omitempty"`
+	CardLost  bool `json:"card_lost,omitempty"`
+	AgentTold bool `json:"agent_told,omitempty"`
+	Told      bool `json:"told,omitempty"`
 }
 
 // accessTab — запросы доступа по id.
@@ -556,7 +556,7 @@ var finishAccessCard = func(ctx context.Context, s *config.Settings, r *accessRe
 		if r.PubPID != 0 && lock.PIDAlive(r.PubPID, r.PubSince) {
 			return false
 		}
-		if r.CardLost {
+		if r.CardLost || r.PubPID != 0 {
 			// карточка могла уйти, а её номера нет — итог отдельным
 			// сообщением, иначе владелец его не увидит
 			return sayErr(ctx, s, "Запрос доступа к «"+html.EscapeString(r.Title)+"»: "+

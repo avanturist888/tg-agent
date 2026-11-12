@@ -983,6 +983,14 @@ func SendDueLoop(ctx context.Context, loader func() (*config.Settings, error)) e
 		if err != nil {
 			return err
 		}
+		db, err := stateDB(s)
+		if err != nil {
+			return err
+		}
+		if err := db.ImportLegacy(); err != nil || stateWaiting(s) != "" {
+			sleepCtx(ctx, time.Second)
+			continue
+		}
 		next, err := outbox.New(s.DataDir()).NextDue()
 		if err != nil {
 			return err
@@ -990,7 +998,11 @@ func SendDueLoop(ctx context.Context, loader func() (*config.Settings, error)) e
 		if next == nil {
 			return nil
 		}
-		sleepCtx(ctx, time.Until(*next)+500*time.Millisecond)
+		delay := time.Until(*next) + 500*time.Millisecond
+		if delay < 500*time.Millisecond {
+			delay = 500 * time.Millisecond
+		}
+		sleepCtx(ctx, delay)
 		SendDue(ctx, s)
 	}
 	return ctx.Err()

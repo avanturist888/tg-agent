@@ -309,3 +309,32 @@ func TestAccessCardLostSaid(t *testing.T) {
 		t.Fatalf("сказано: %q", said)
 	}
 }
+
+func TestAccessCardPublisherDiedSaid(t *testing.T) {
+	s := watchEnv(t)
+	old := sayErr
+	called := false
+	sayErr = func(context.Context, *config.Settings, string) error { called = true; return nil }
+	t.Cleanup(func() { sayErr = old })
+	r := &accessRequest{ID: "dead", Title: "Chat", Status: accessDenied, PubPID: 999999, Result: "Denied"}
+	if !finishAccessCard(context.Background(), s, r, r.Result) || !called {
+		t.Fatal("publisher died without CardLost: owner did not receive outcome")
+	}
+}
+
+func TestSendDueLoopWaitsForLegacy(t *testing.T) {
+	s := watchEnv(t)
+	old := store.RequireCutover
+	store.RequireCutover = true
+	t.Cleanup(func() { store.RequireCutover = old })
+	if err := os.WriteFile(filepath.Join(s.DataDir(), "outbox.json"), []byte(`[]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	calls := 0
+	_ = SendDueLoop(ctx, func() (*config.Settings, error) { calls++; return s, nil })
+	if calls > 1 {
+		t.Fatalf("busy loop during pending import: %d loader calls", calls)
+	}
+}
