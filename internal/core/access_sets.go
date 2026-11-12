@@ -225,9 +225,29 @@ func requestLeaveChatlist(ctx context.Context, s *config.Settings, f tgc.Folder,
 		return nil, &Bad{Msg: "Бот подтверждений не настроен — спросить владельца кнопкой нельзя."}
 	}
 	req := &accessRequest{ID: outbox.NewID(), Scope: scopeLeave, Folder: strconv.Itoa(f.ID), Title: f.Title,
-		Reason: reason, Status: accessPending, Agent: agentFrom(ctx), Created: time.Now()}
+		Reason: reason, Status: accessPending, Agent: agentFrom(ctx), Created: time.Now(), Members: chatlistMembers(f)}
 	sample(req, rows)
 	return submitSetRequest(ctx, s, req, omap.New())
+}
+
+// sameChatlist — папка по нажатию та же, что в карточке: чужая папка-ссылка
+// с тем названием и тем составом, что владелец видел (а не новая под тем же
+// номером и названием).
+func sameChatlist(f tgc.Folder, r *accessRequest) error {
+	if !f.Shared || f.MyInvites || f.Title != r.Title {
+		return fmt.Errorf("папка %d — уже не та чужая папка-ссылка «%s»: ничего не менял", f.ID, r.Title)
+	}
+	if !slices.Equal(chatlistMembers(f), r.Members) {
+		return fmt.Errorf("состав папки-ссылки «%s» изменился с запроса — ничего не менял; агенту нужен новый запрос", r.Title)
+	}
+	return nil
+}
+
+// chatlistMembers — состав папки-ссылки (явные и закреплённые чаты) по порядку.
+func chatlistMembers(f tgc.Folder) []int64 {
+	m := append(slices.Clone(f.Include), f.Pinned...)
+	slices.Sort(m)
+	return slices.Compact(m)
 }
 
 // leaveChatlist — владелец нажал «Разрешить»: покинуть ту же папку-ссылку.
@@ -248,8 +268,8 @@ func leaveChatlist(ctx context.Context, s *config.Settings, r *accessRequest) er
 			if i < 0 {
 				return nil // папки уже нет — делать нечего
 			}
-			if f := folders[i]; !f.Shared || f.MyInvites || f.Title != r.Title {
-				return fmt.Errorf("папка %d — уже не та чужая папка-ссылка «%s»: ничего не менял", id, r.Title)
+			if err := sameChatlist(folders[i], r); err != nil {
+				return err
 			}
 			return c.LeaveChatlist(ctx, id)
 		})

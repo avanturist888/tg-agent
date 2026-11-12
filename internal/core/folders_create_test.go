@@ -193,3 +193,23 @@ func TestLeaveChatlistCard(t *testing.T) {
 		t.Fatalf("без reason: %v", err)
 	}
 }
+
+// Нажатие старой карточки не покидает другую папку-ссылку с тем же номером
+// и названием: состав сверяется с тем, что владелец видел.
+func TestLeaveChatlistSameFolder(t *testing.T) {
+	f := tgc.Folder{ID: 2, Title: "AI", Shared: true, Include: []int64{-3, -1}, Pinned: []int64{-2}}
+	r := &accessRequest{Scope: scopeLeave, Folder: "2", Title: "AI", Members: chatlistMembers(f)}
+	if err := sameChatlist(f, r); err != nil {
+		t.Fatalf("та же папка: %v", err)
+	}
+	other := f
+	other.Include = []int64{-9}
+	if sameChatlist(other, r) == nil {
+		t.Fatal("новая папка с тем же номером и названием")
+	}
+	mine := f
+	mine.MyInvites = true
+	if sameChatlist(mine, r) == nil {
+		t.Fatal("своя папка-ссылка")
+	}
+}

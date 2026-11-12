@@ -184,10 +184,13 @@ type accessRequest struct {
 	ID string `json:"id"`
 	// Scope — о чём просят: "" — один чат, иначе scopeFolder, scopePublic,
 	// scopeManage или scopeLeave (покинуть чужую папку-ссылку)
-	Scope    string      `json:"scope,omitempty"`
-	Folder   string      `json:"folder,omitempty"` // id папки (scopeFolder)
-	Count    int         `json:"count,omitempty"`  // сколько чатов в группе на момент запроса
-	Sample   []string    `json:"sample,omitempty"` // какие (для карточки)
+	Scope  string   `json:"scope,omitempty"`
+	Folder string   `json:"folder,omitempty"` // id папки (scopeFolder)
+	Count  int      `json:"count,omitempty"`  // сколько чатов в группе на момент запроса
+	Sample []string `json:"sample,omitempty"` // какие (для карточки)
+	// Members — состав папки-ссылки на момент запроса (scopeLeave): по
+	// нажатию папка должна быть той же, а не новой с тем же номером
+	Members  []int64     `json:"members,omitempty"`
 	Peer     int64       `json:"peer"`
 	Title    string      `json:"title"`
 	Kind     string      `json:"kind"`
