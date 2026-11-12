@@ -1189,6 +1189,13 @@ func sendDraft(ctx context.Context, c draftSender, t tgc.Target, d *outbox.Draft
 		}
 		ids, err := c.SendFiles(ctx, t, files, reply)
 		if err != nil {
+			// текст или часть файлов уже ушли — повтор всего черновика
+			// продублировал бы их у получателя: отказ окончательный (как в
+			// WhatsApp и MAX), а не временный сбой
+			if d.Text != "" || len(ids) > 0 {
+				return nil, &Denied{Msg: fmt.Sprintf("часть сообщения ушла (%s), дальше ошибка — повторять не стал, чтобы не продублировать: %v",
+					partialWhat(d.Text != "", len(ids)), err)}
+			}
 			return nil, err
 		}
 		if _, ok := result.Get("message_id"); !ok && len(ids) > 0 {
@@ -1197,6 +1204,18 @@ func sendDraft(ctx context.Context, c draftSender, t tgc.Target, d *outbox.Draft
 		result.Set("file_message_ids", ids)
 	}
 	return result, nil
+}
+
+// partialWhat — что из черновика уже ушло: для отказа после частичной отправки.
+func partialWhat(text bool, files int) string {
+	var parts []string
+	if text {
+		parts = append(parts, "текст")
+	}
+	if files > 0 {
+		parts = append(parts, fmt.Sprintf("файлов: %d", files))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // finishDelivery — сообщение ушло: отметить черновик, убрать копии файлов,

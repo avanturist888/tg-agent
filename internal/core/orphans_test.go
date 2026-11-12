@@ -151,3 +151,44 @@ func TestRecoverCancelledAfterPartial(t *testing.T) {
 		t.Fatalf("частичная отправка не записана: %+v", got)
 	}
 }
+
+// Пока досылка шла по своему списку, другой путь отправил часть черновика
+// и записал отказ: досылка смотрит на черновик в момент захвата и его не
+// трогает. Частичная отправка при досылке — тоже без второго прохода.
+func TestRecoverSkipsFreshFailure(t *testing.T) {
+	s := watchEnv(t)
+	s.SendPolicy = "bot_approval"
+	ctx := context.Background()
+	box := outbox.New(s.DataDir())
+	mk := func() *outbox.Draft {
+		d, err := box.Create(outbox.CreateOpts{Chat: "test", Text: "раз", TTLMin: 60})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d, err = box.Approve(d.ID, "auto_send"); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	first, second := mk(), mk()
+	sends := map[string]int{}
+	old := sendClaimed
+	sendClaimed = func(_ context.Context, _ *config.Settings, id, _ string) (*omap.Map, error) {
+		sends[id]++
+		if id == first.ID {
+			// другой путь тем временем: часть второго ушла, отказ записан
+			if _, err := box.MarkSendError(second.ID, "часть сообщения ушла"); err != nil {
+				t.Fatal(err)
+			}
+			return nil, &Denied{Msg: "часть сообщения ушла"}
+		}
+		return omap.New().Set("message_id", 1), nil
+	}
+	t.Cleanup(func() { sendClaimed = old })
+	later := time.Now().Add(time.Hour)
+	recoverApproved(ctx, s, later, "test")
+	recoverApproved(ctx, s, later, "test")
+	if sends[first.ID] != 1 || sends[second.ID] != 0 {
+		t.Fatalf("отправки: %v", sends)
+	}
+}

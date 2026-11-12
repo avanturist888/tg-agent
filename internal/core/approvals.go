@@ -144,6 +144,15 @@ func card(ctx context.Context, s *config.Settings, cardID *int64, d *outbox.Draf
 var sendClaimed = deliverClaimed // тесты подменяют
 
 func deliver(ctx context.Context, s *config.Settings, draftID, by string) string {
+	return deliverAs(ctx, s, draftID, by, false)
+}
+
+// deliverAs — deliver; recovery — это досылка (recoverApproved): черновик,
+// у которого уже записан сбой, она не трогает. Проверка — по черновику,
+// прочитанному вместе с захватом, а не по списку, с которого досылка
+// начинала: пока она шла, другой путь мог отправить часть и записать отказ.
+// Повтор после сбоя — только явный (tg_send_draft).
+func deliverAs(ctx context.Context, s *config.Settings, draftID, by string, recovery bool) string {
 	box := outbox.New(s.DataDir())
 	claim, cur, err := box.ClaimSend(draftID)
 	switch {
@@ -161,6 +170,10 @@ func deliver(ctx context.Context, s *config.Settings, draftID, by string) string
 		return finalSummary(s, cur)
 	}
 	defer claim.Release()
+	if recovery && cur.SendError != nil {
+		_ = audit.Log(s.AuditPath(), "recover_skipped_failed", "draft_id", draftID, "error", *cur.SendError)
+		return ""
+	}
 	var (
 		result *omap.Map
 		errMsg string
@@ -676,7 +689,7 @@ func recoverApproved(ctx context.Context, s *config.Settings, cutoff time.Time, 
 		// у каждого черновика свой срок: долгий сбой одного не съедает время
 		// остальных (тогда они получили бы ошибку без попытки отправить)
 		dctx, cancel := context.WithTimeout(ctx, recoverBudget)
-		summary := deliver(dctx, s, d.ID, by+" ("+why+")")
+		summary := deliverAs(dctx, s, d.ID, by+" ("+why+")", true)
 		cancel()
 		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute) // итог в карточку — и после остановки
 		card(cctx, s, d.BotMessageID, d, summary)

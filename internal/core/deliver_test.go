@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"tgagent/internal/omap"
@@ -12,6 +13,8 @@ import (
 type fakeSender struct {
 	sent, edited, files int
 	polls               []tgc.PollOut
+	filesErr            error // SendFiles: ушло filesOK файлов, дальше эта ошибка
+	filesOK             int
 }
 
 func (f *fakeSender) SendMessage(_ context.Context, _ tgc.Target, _ string, _ *int64, format string) (*omap.Map, error) {
@@ -39,7 +42,33 @@ func (f *fakeSender) SendFiles(_ context.Context, _ tgc.Target, files []tgc.OutF
 	for i := range ids {
 		ids[i] = 500 + i
 	}
+	if f.filesErr != nil {
+		return ids[:f.filesOK], f.filesErr
+	}
 	return ids, nil
+}
+
+// Текст или часть файлов ушли, дальше сбой: отказ окончательный — повтор
+// задвоил бы ушедшее. Ничего не ушло — обычный сбой, его можно повторить.
+func TestSendDraftPartialIsFinal(t *testing.T) {
+	ctx := context.Background()
+	files := []outbox.FileSnap{{Path: "a.txt", Name: "a.txt"}, {Path: "b.txt", Name: "b.txt"}}
+	var d *Denied
+	for _, c := range []struct {
+		name    string
+		draft   outbox.Draft
+		ok      int
+		partial bool
+	}{
+		{"текст ушёл", outbox.Draft{Text: "раз", Files: files}, 0, true},
+		{"файл ушёл", outbox.Draft{Files: files}, 1, true},
+		{"ничего не ушло", outbox.Draft{Files: files}, 0, false},
+	} {
+		_, err := sendDraft(ctx, &fakeSender{filesErr: errors.New("upload failed"), filesOK: c.ok}, tgc.Target{}, &c.draft)
+		if err == nil || errors.As(err, &d) != c.partial {
+			t.Errorf("%s: %v", c.name, err)
+		}
+	}
 }
 
 // Ответ отправки — с настоящим message_id: без него tg_wait_approval отдаёт 0,
