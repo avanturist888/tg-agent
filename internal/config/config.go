@@ -160,24 +160,35 @@ type Settings struct {
 	// SharedBot — у профиля нет своего бота: карточки идут ботом основного
 	// профиля, а нажатия принимает основная служба (CallbackPrefix).
 	SharedBot bool
-	// Network — чей аккаунт у профиля: telegram (по умолчанию) или max
-	// (TG_NETWORK=max: служба держит клиент MAX, ключи Telegram не нужны).
+	// Network — чей аккаунт у профиля: telegram (по умолчанию), max или
+	// whatsapp (TG_NETWORK: служба держит клиент этой сети, ключи Telegram
+	// не нужны).
 	Network string
 }
 
 const (
 	NetTelegram = "telegram"
 	NetMAX      = "max"
+	NetWA       = "whatsapp"
 )
 
 // IsMAX — профиль аккаунта MAX.
 func (s *Settings) IsMAX() bool { return s.Network == NetMAX }
 
+// IsWA — профиль аккаунта WhatsApp.
+func (s *Settings) IsWA() bool { return s.Network == NetWA }
+
+// IsTelegram — профиль аккаунта Telegram (не MAX и не WhatsApp).
+func (s *Settings) IsTelegram() bool { return s.Network == NetTelegram || s.Network == "" }
+
 // Network — сеть профиля этого процесса (после SetProfile и чтения .env).
 func Network() string {
 	applyDotenv(EnvPath())
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("TG_NETWORK")), NetMAX) {
+	switch n := strings.ToLower(strings.TrimSpace(os.Getenv("TG_NETWORK"))); n {
+	case NetMAX:
 		return NetMAX
+	case NetWA, "wa":
+		return NetWA
 	}
 	return NetTelegram
 }

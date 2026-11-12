@@ -38,6 +38,7 @@ const (
 	// столько проверок источника подряд с ошибкой — сказать владельцу (раз)
 	upstreamFailNotice = 6
 	upstreamAck        = "u:ack"
+	upstreamAgentWait  = 6 * time.Hour
 )
 
 var (
@@ -58,6 +59,9 @@ type pinnedCard struct {
 	ID    int64  `json:"id"`
 	Text  string `json:"text"`            // HTML карточки: дописать пометку при замене
 	Agent bool   `json:"agent,omitempty"` // разбирает агент: не закреплена
+	// At — когда карточку отдали агенту: не разобрал за upstreamAgentWait —
+	// она уходит владельцу (письмо в занятый тред могло так и не дойти)
+	At time.Time `json:"at,omitempty"`
 }
 
 var pinnedMu sync.Mutex
@@ -118,6 +122,7 @@ func CheckUpstream(ctx context.Context, s *config.Settings) (*upstream.State, er
 		return nil, err
 	}
 	now := time.Now()
+	escalateStale(ctx, s, now)
 	first := false
 	for _, r := range upstream.Check(ctx, upstreamClient(), st, upstreamSources()) {
 		id := r.Source.ID
@@ -256,6 +261,35 @@ func upstreamBrief(r upstream.Result) string {
 	return b.String()
 }
 
+// escalateStale — карточки, которые агент не разобрал за upstreamAgentWait,
+// — владельцу: агент мог не получить задание (письмо ждало в очереди треда,
+// а тред закрыли) или не довести его до ack/escalate. Не вышло — повторим
+// со следующей проверкой.
+func escalateStale(ctx context.Context, s *config.Settings, now time.Time) {
+	var stale []string
+	_ = updatePinned(s, func(m map[string]pinnedCard) {
+		for src, c := range m {
+			switch {
+			case !c.Agent:
+			case c.At.IsZero(): // карточка из прежней сборки — отсчёт с сейчас
+				c.At = now
+				m[src] = c
+			case now.Sub(c.At) >= upstreamAgentWait:
+				stale = append(stale, src)
+			}
+		}
+	})
+	for _, src := range stale {
+		note := fmt.Sprintf("агент не разобрал за %d ч (мог не получить задание) — посмотри сам или напиши агенту tg-agent.",
+			int(upstreamAgentWait.Hours()))
+		if _, err := EscalateUpstream(ctx, s, src, note); err != nil {
+			logEvent(s, "upstream_stale_failed", "source", src, "error", err.Error())
+			continue
+		}
+		logEvent(s, "upstream_agent_stale", "source", src)
+	}
+}
+
 // sendPinned — карточка изменения с кнопкой «Разобрано». Сначала её
 // разбирает агент: карточка без звука и не закреплена. Агента не разбудить —
 // закреплена для владельца.
@@ -275,7 +309,7 @@ func sendPinned(ctx context.Context, s *config.Settings, text, source, title, br
 		logEvent(s, "notify_failed", "what", "upstream", "source", source, "error", err.Error())
 		return err
 	}
-	card := pinnedCard{ID: sent.MessageID, Text: text, Agent: toAgent}
+	card := pinnedCard{ID: sent.MessageID, Text: text, Agent: toAgent, At: time.Now()}
 	if toAgent {
 		check := "Проверь, затрагивает ли это клиент MAX (internal/maxc, core/max*.go) и слежение (internal/upstream)."
 		for _, src := range upstream.Sources() {
@@ -290,6 +324,10 @@ func sendPinned(ctx context.Context, s *config.Settings, text, source, title, br
 		if err := upstreamWake(ctx, s, title, task); err != nil {
 			logEvent(s, "upstream_wake_failed", "source", source, "error", err.Error())
 			card.Agent = false
+			// пробуждение могло съесть срок проверки — владельцу свой срок
+			octx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			defer cancel()
+			ctx = octx
 			_ = upstreamBot(ctx, s, "editMessageText", map[string]any{
 				"chat_id": s.ApprovalChatID, "message_id": sent.MessageID, "text": text, "parse_mode": "HTML",
 				"link_preview_options": map[string]any{"is_disabled": true}, "reply_markup": upstreamKeyboard(s),
@@ -298,12 +336,13 @@ func sendPinned(ctx context.Context, s *config.Settings, text, source, title, br
 			logEvent(s, "upstream_agent_woken", "source", source, "message_id", sent.MessageID)
 		}
 	}
+	var pinErr error
 	if !card.Agent {
 		// само сообщение могло прийти без звука (ждали агента) — тогда звучит закрепление
-		if err := upstreamBot(ctx, s, "pinChatMessage", map[string]any{
+		if pinErr = upstreamBot(ctx, s, "pinChatMessage", map[string]any{
 			"chat_id": s.ApprovalChatID, "message_id": sent.MessageID, "disable_notification": !toAgent,
-		}, nil); err != nil {
-			logEvent(s, "upstream_pin_failed", "source", source, "message_id", sent.MessageID, "error", err.Error())
+		}, nil); pinErr != nil {
+			logEvent(s, "upstream_pin_failed", "source", source, "message_id", sent.MessageID, "error", pinErr.Error())
 		}
 	}
 	var old pinnedCard
@@ -315,6 +354,11 @@ func sendPinned(ctx context.Context, s *config.Settings, text, source, title, br
 	}
 	if old.ID != 0 {
 		retirePinned(ctx, s, old)
+	}
+	if pinErr != nil && toAgent {
+		// карточка пришла без звука, агента нет, закрепить не вышло — владелец
+		// её не заметит: не запоминать изменение, следующая проверка повторит
+		return pinErr
 	}
 	return nil
 }
@@ -536,7 +580,7 @@ func SetUpstreamThread(thread string) error {
 }
 
 var nestorSend = func(ctx context.Context, exe, text string, args ...string) error {
-	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, exe, args...)
 	cmd.Stdin = strings.NewReader(text)
@@ -564,7 +608,9 @@ func wakeProjectAgent(ctx context.Context, s *config.Settings, title, text strin
 		return errors.New("Нестор не найден (TG_NESTOR, PATH, ~/nestor/bin)")
 	}
 	if t := ReadUpstreamThread(); t != nil {
-		err := nestorSend(ctx, exe, "«"+title+"»\n\n"+text, "send", t.Thread, "-")
+		tctx, cancel := context.WithTimeout(ctx, 30*time.Second) // на запасной путь должно остаться время
+		err := nestorSend(tctx, exe, "«"+title+"»\n\n"+text, "send", t.Thread, "-")
+		cancel()
 		if err == nil {
 			return nil
 		}

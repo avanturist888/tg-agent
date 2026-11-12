@@ -822,7 +822,7 @@ quiz=true — викторина: correct — номера верных вари
 у опроса нет текста.
 reply_to, topic, note — как в tg_draft_message.
 
-Только Telegram: в MAX опросы через tg-agent пока не создаются.`},
+Только Telegram: в MAX и WhatsApp опросы через tg-agent пока не создаются.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in pollIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 10*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 				p := outbox.PollSpec{Question: in.Question, Options: in.Options, Anonymous: !in.PublicVoters,

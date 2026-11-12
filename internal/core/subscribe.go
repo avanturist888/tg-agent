@@ -282,7 +282,7 @@ func memoTopic(alias string, id int) (topicRef, bool) {
 
 // topicsOf — темы сообщений чата-форума (nil — не форум или не вышло узнать).
 var topicsOf = func(ctx context.Context, s *config.Settings, rule config.ChatRule, ids []int) map[int]topicRef {
-	if s.IsMAX() || !maybeForum(rule) || len(ids) == 0 { // в MAX тем нет
+	if !s.IsTelegram() || !maybeForum(rule) || len(ids) == 0 { // в MAX и WhatsApp тем нет
 		return nil
 	}
 	out := map[int]topicRef{}
@@ -590,8 +590,8 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, o SubOpts) 
 		return nil, &Bad{Msg: noInbox}
 	}
 	var topicName string
-	if o.Topic != 0 && s.IsMAX() {
-		return nil, &Bad{Msg: "В MAX тем нет — подписывайся без topic."}
+	if n := netOf(s); o.Topic != 0 && n != nil {
+		return nil, &Bad{Msg: "В " + n.name() + " тем нет — подписывайся без topic."}
 	}
 	if o.Topic != 0 {
 		if topicName, err = checkTopic(ctx, s, rule, o.Topic); err != nil {

@@ -261,16 +261,17 @@ func part(acct string, res mcp.Result) *omap.Map {
 	return out.Merge(m)
 }
 
-// maxOnlyTelegram — инструменты, которых у аккаунта MAX пока нет.
+// maxOnlyTelegram — инструменты, которых у аккаунтов MAX и WhatsApp пока нет.
 var maxOnlyTelegram = set("tg_list_topics")
 
-// maxGuard — в процессе профиля MAX такие вызовы получают понятный отказ, а
+// maxGuard — в процессе профиля MAX или WhatsApp такие вызовы получают понятный отказ, а
 // не ошибку Telegram.
 func maxGuard(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 		if call, ok := req.(*mcp.CallToolRequest); ok && method == "tools/call" && call.Params != nil &&
-			maxOnlyTelegram[call.Params.Name] && config.Network() == config.NetMAX {
-			return Failed(&core.Bad{Msg: fmt.Sprintf("%s: в MAX нет тем форумов — читай и пиши без topic.", call.Params.Name)}), nil
+			maxOnlyTelegram[call.Params.Name] && config.Network() != config.NetTelegram {
+			return Failed(&core.Bad{Msg: fmt.Sprintf("%s: в %s нет тем форумов — читай и пиши без topic.",
+				call.Params.Name, core.NetName(config.Network()))}), nil
 		}
 		return next(ctx, method, req)
 	}

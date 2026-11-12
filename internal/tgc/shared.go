@@ -257,6 +257,12 @@ func Serve(ctx context.Context, s *config.Settings, ev Events, onReady func(ctx 
 	return nil
 }
 
+// serveOnce — одно соединение: всё внутри client.Run. Start/Stop/Done из gotd
+// v0.164 (lifecycle.go) разобраны 12.11.2026 и не взяты: тело (ожидание
+// входа, gaps.Run) всё равно живёт на своём контексте, который пришлось бы
+// гасить по Done, — это та же отмена, что сейчас; из Run уходят лишь канал up
+// и ветка сторожа «не подключились», а sharedState.ready переживает
+// пересоздание клиента и Done его не заменит. Проще не становится.
 func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage, upd *updState, ev Events,
 	onReady func(ctx context.Context, c *Conn), onNoLogin func(ctx context.Context)) error {
 	c := &Conn{Settings: s, hub: newUpdateHub(), Peers: LoadPeers(s.PeersPath())}

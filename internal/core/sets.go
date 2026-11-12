@@ -45,8 +45,8 @@ func setsChanged(ctx context.Context, loader func() (*config.Settings, error)) {
 	}
 	pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	if s.IsMAX() {
-		maxCatchup(pctx, s)
+	if n := netOf(s); n != nil {
+		n.catchup(pctx, s)
 	} else {
 		_, _ = PollOnce(pctx, s)
 	}
@@ -78,8 +78,8 @@ func RefreshSets(ctx context.Context, s *config.Settings, force bool) (bool, err
 		fresh map[string]config.SetState
 		err   error
 	)
-	if s.IsMAX() {
-		fresh, err = maxSetMembers(ctx, s)
+	if n := netOf(s); n != nil {
+		fresh, err = n.setMembers(ctx, s)
 	} else {
 		fresh, err = tgSetMembers(ctx, s)
 	}

@@ -250,8 +250,8 @@ var metaOf = func(ctx context.Context, s *config.Settings, rule config.ChatRule,
 			topic *omap.Map
 		)
 		o := ReadOpts{IDs: part}
-		if s.IsMAX() {
-			msgs, err = maxReadChat(cctx, s, rule, o, len(part))
+		if n := netOf(s); n != nil {
+			msgs, err = n.readChat(cctx, s, rule, o, len(part))
 		} else {
 			err = readTelegram(cctx, s, rule, o, len(part), &msgs, &forum, &topic)
 		}

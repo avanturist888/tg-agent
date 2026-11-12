@@ -55,8 +55,8 @@ func ListFolders(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 	if err := onlyLocal(s); err != nil {
 		return nil, err
 	}
-	if s.IsMAX() {
-		return maxListFolders(ctx, s)
+	if n := netOf(s); n != nil {
+		return n.listFolders(ctx, s)
 	}
 	var folders []tgc.Folder
 	err := tgc.Run(ctx, s, tgc.Opts{Caller: "folders"}, func(ctx context.Context, c *tgc.Conn) error {
@@ -100,8 +100,8 @@ func FolderChats(ctx context.Context, s *config.Settings, folder string) (*omap.
 	if folder == "" {
 		return nil, &Bad{Msg: "Укажи папку: id или название из tg_list_folders."}
 	}
-	if s.IsMAX() {
-		return maxFolderChats(ctx, s, folder)
+	if n := netOf(s); n != nil {
+		return n.folderChats(ctx, s, folder)
 	}
 	var (
 		found tgc.Folder
@@ -259,12 +259,12 @@ func RequestAccess(ctx context.Context, s *config.Settings, chatID int64, read, 
 		existing *config.ChatRule
 	)
 	var err error
-	if s.IsMAX() {
-		if info, err = maxChatInfo(ctx, chatID); err != nil {
+	if n := netOf(s); n != nil {
+		if info, err = n.chatInfo(ctx, chatID); err != nil {
 			return nil, err
 		}
 		for _, r := range s.Rules() {
-			if id, e := maxChatID(r); e == nil && id == chatID {
+			if id, e := n.ruleChatID(r); e == nil && id == chatID {
 				existing = &r
 				break
 			}
@@ -528,8 +528,8 @@ func afterAccess(ctx context.Context, r *accessRequest) {
 		}
 	}
 	if r.Status == accessGranted && r.CanRead && r.Scope != scopeManage {
-		if s.IsMAX() {
-			maxCatchup(ctx, s)
+		if n := netOf(s); n != nil {
+			n.catchup(ctx, s)
 		} else {
 			_, _ = PollOnce(ctx, s) // лента появится сразу, а не через минуту
 		}

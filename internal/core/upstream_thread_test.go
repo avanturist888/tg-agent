@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"tgagent/internal/config"
 )
@@ -57,5 +58,45 @@ func TestUpstreamWakeThread(t *testing.T) {
 
 	if err := SetUpstreamThread(""); err != nil || ReadUpstreamThread() != nil {
 		t.Fatalf("сброс: %v", err)
+	}
+}
+
+// Карточку, которую агент не разобрал за upstreamAgentWait, получает
+// владелец: письмо в занятый тред могло не дойти.
+func TestUpstreamAgentStale(t *testing.T) {
+	f := &fakeUpstream{value: "26.10.6"}
+	s := f.install(t)
+	ctx := context.Background()
+	upstreamWake = func(context.Context, *config.Settings, string, string) error { return nil }
+	CheckUpstream(ctx, s)
+	f.value = "26.11.0"
+	CheckUpstream(ctx, s)
+	f.take()
+	escalateStale(ctx, s, time.Now().Add(time.Hour))
+	if calls := f.take(); len(calls) != 0 {
+		t.Fatalf("рано: %q", calls)
+	}
+	escalateStale(ctx, s, time.Now().Add(upstreamAgentWait+time.Minute))
+	if calls := f.take(); strings.Join(calls, "|") != "editMessageText:2|pinChatMessage:2" ||
+		!strings.Contains(f.lastEdit, "агент не разобрал") {
+		t.Fatalf("владельцу: %q %q", calls, f.lastEdit)
+	}
+	if cards, _ := PinnedUpstream(s); len(cards) != 1 || cards[0].Agent {
+		t.Fatalf("после: %+v", cards)
+	}
+	// неудачное закрепление без агента — изменение не запоминается
+	f.value = "26.12.0"
+	upstreamWake = func(context.Context, *config.Settings, string, string) error { return errors.New("нет") }
+	f.mu.Lock()
+	oldBot := upstreamBot
+	f.mu.Unlock()
+	upstreamBot = func(ctx context.Context, s *config.Settings, method string, p any, out any) error {
+		if method == "pinChatMessage" {
+			return errors.New("бот недоступен")
+		}
+		return oldBot(ctx, s, method, p, out)
+	}
+	if st, _ := CheckUpstream(ctx, s); st.Sources["web"].Values["v"] != "26.11.0" {
+		t.Fatalf("запомнено, хотя владелец не увидел: %v", st.Sources["web"].Values)
 	}
 }

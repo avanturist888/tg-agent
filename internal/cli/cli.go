@@ -96,6 +96,7 @@ func init() {
 		{name: "mcp", help: "MCP-сервер для Claude Code (stdio)", run: cmdMCP},
 		{name: "t3", help: "окружения T3 Code в контейнерах и треды шлюза (tg t3 help)", run: cmdT3},
 		{name: "max", help: "аккаунт MAX: вход по QR, перенос из PyMax, состояние (tg max help)", run: cmdMax},
+		{name: "wa", help: "аккаунт WhatsApp: связать устройство (QR или код), состояние (tg wa help)", run: cmdWA},
 		{name: "updates", help: "карточки обновлений MAX: что ждёт разбора, ack — разобрано (tg updates help)", run: cmdUpdates},
 		{name: "agents", help: "агенты из контейнеров: MCP по HTTP (--new-token — токен для .env)", run: cmdAgents},
 		{name: "gui", help: "окно управления: чаты, черновики, настройки", run: cmdGUI},
@@ -975,7 +976,7 @@ func cmdDoctor(ctx context.Context, args []string) int {
 		fmt.Println("[x]", err)
 		return 1
 	}
-	fmt.Printf("[v] .env прочитан, api_id=%d, корень %s\n", s.APIID, config.Root)
+	fmt.Printf("[v] .env прочитан, сеть %s, api_id=%d, корень %s\n", core.NetName(s.Network), s.APIID, config.Root)
 	if p := config.Profile(); p != "" {
 		fmt.Printf("[v] профиль %s: %s\n", p, config.Home())
 	}
@@ -1007,14 +1008,22 @@ func cmdDoctor(ctx context.Context, args []string) int {
 			problems = append(problems, "Telegram не ответил на проверку сессии")
 			break
 		}
-		switch chk.Session {
-		case "ok":
+		switch {
+		case chk.Session == "ok" && !s.IsTelegram():
+			fmt.Printf("[v] вход в %s: %s\n", core.NetName(s.Network), chk.User.FirstName)
+		case chk.Session == "ok":
 			u := chk.User.Username
 			if u == "" {
 				u = "—"
 			}
 			fmt.Printf("[v] авторизован: %s @%s (id %d)\n", chk.User.FirstName, u, chk.User.ID)
-		case "not_logged_in":
+		case chk.Session == "not_logged_in" && s.IsWA():
+			fmt.Println("[x] WhatsApp: устройство не связано")
+			problems = append(problems, "аккаунт не подключён — владелец связывает устройство: tg --profile "+config.Profile()+" wa login")
+		case chk.Session == "not_logged_in" && s.IsMAX():
+			fmt.Println("[x] MAX: входа нет")
+			problems = append(problems, "аккаунт не подключён — tg --profile "+config.Profile()+" max login")
+		case chk.Session == "not_logged_in":
 			fmt.Println("[x] сессия:", s.SessionPath)
 			problems = append(problems, "аккаунт не подключён — выполни `tg login` или войди в окне управления")
 		default:

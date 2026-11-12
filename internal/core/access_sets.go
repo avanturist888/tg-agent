@@ -50,8 +50,8 @@ func RequestSetAccess(ctx context.Context, s *config.Settings, o SetAccessOpts) 
 	out := omap.New()
 	switch {
 	case o.Manage:
-		if s.IsMAX() {
-			return nil, &Bad{Msg: "В MAX раскладывать чаты по папкам агент пока не умеет."}
+		if n := netOf(s); n != nil {
+			return nil, &Bad{Msg: "В " + n.name() + " раскладывать чаты по папкам агент пока не умеет."}
 		}
 		req.Scope, req.Title = scopeManage, "папки и архив"
 		if s.Manage.Folders {
@@ -59,8 +59,8 @@ func RequestSetAccess(ctx context.Context, s *config.Settings, o SetAccessOpts) 
 				Set("hint", "Право уже есть: tg_unfiled_chats, tg_move_chat, tg_archive_chat."), nil
 		}
 	case o.Public:
-		if s.IsMAX() {
-			return nil, &Bad{Msg: "В MAX у каналов нет публичных @username — проси папку (folder)."}
+		if n := netOf(s); n != nil {
+			return nil, &Bad{Msg: "В " + n.name() + " у каналов нет публичных @username — проси папку (folder)."}
 		}
 		req.Scope, req.Title = scopePublic, "публичные каналы"
 		if set, ok := setOf(s, config.PublicChannelsKey); ok && set.Read {
@@ -125,7 +125,15 @@ func sample(r *accessRequest, rows []tgc.DialogRow) {
 
 // folderSample — папка по id или названию: её id, название и чаты.
 func folderSample(ctx context.Context, s *config.Settings, r *accessRequest, folder string) error {
-	if s.IsMAX() {
+	if n := netOf(s); n != nil {
+		return n.folderSample(ctx, s, r, folder)
+	}
+	return tgFolderSample(ctx, s, r, folder)
+}
+
+// maxFolderSample — folderSample для MAX.
+func maxFolderSample(ctx context.Context, s *config.Settings, r *accessRequest, folder string) error {
+	{
 		c, err := maxConn(ctx)
 		if err != nil {
 			return err
@@ -162,6 +170,9 @@ func folderSample(ctx context.Context, s *config.Settings, r *accessRequest, fol
 		}
 		return nil
 	}
+}
+
+func tgFolderSample(ctx context.Context, s *config.Settings, r *accessRequest, folder string) error {
 	return tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "request_access"}, func(ctx context.Context, c *tgc.Conn) error {
 		folders, err := c.Folders(ctx)
 		if err != nil {

@@ -70,6 +70,12 @@ type ValueArgs struct {
 	Value string `json:"value"`
 }
 
+// WALoginArgs — tg wa login: номер (вход кодом вместо QR) и «связать заново».
+type WALoginArgs struct {
+	Phone string `json:"phone,omitempty"`
+	Force bool   `json:"force,omitempty"`
+}
+
 // Self — владелец аккаунта.
 type Self struct {
 	ID        int64  `json:"id"`
@@ -197,14 +203,30 @@ func init() {
 		"max_status": {local: true, fn: func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return core.MaxState(ctx)
 		}},
+		"wa_status": {local: true, fn: func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return core.WAState(ctx)
+		}},
+		// вход в WhatsApp — в самой службе (tg wa login показывает QR или код)
+		"wa_login": {local: true, fn: func(ctx context.Context, raw json.RawMessage) (any, error) {
+			var a WALoginArgs
+			if len(raw) > 0 {
+				if err := json.Unmarshal(raw, &a); err != nil {
+					return nil, err
+				}
+			}
+			return core.WALoginStart(ctx, a.Phone, a.Force)
+		}},
+		"wa_login_state": {local: true, fn: func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return core.WALoginState(), nil
+		}},
 		// токен бота из ответа BotFather — только трубой в настройки (tg bot-token)
 		"bot_token": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, a BotTokenArgs) (any, error) {
 			tok, id, err := core.LastBotToken(ctx, s, a.Chat, a.Limit)
 			return BotToken{Token: tok, MessageID: id}, err
 		})},
 		"dialogs": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, a LimitArgs) (any, error) {
-			if s.IsMAX() {
-				return maxDialogRows(ctx)
+			if rows, ok, err := core.NetworkDialogs(ctx, s); ok {
+				return rows, err
 			}
 			var rows []tgc.DialogRow
 			err := tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
@@ -278,6 +300,26 @@ func check(ctx context.Context, s *config.Settings) Check {
 	var out Check
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
+	if !s.IsTelegram() { // MAX, WhatsApp: вход — у клиента своей сети в службе
+		name, err := core.NetworkAccount(ctx, s)
+		var bad *core.Bad
+		switch {
+		case err == nil:
+			out.Session, out.User = "ok", &Self{FirstName: name}
+		case errors.As(err, &bad):
+			out.Session = "not_logged_in"
+		default:
+			out.Session, out.SessionError = "error", err.Error()
+		}
+		if s.BotReady() {
+			if name, err := bot.Me(ctx, s); err == nil {
+				out.Bot = "@" + name
+			} else {
+				out.BotError = err.Error()
+			}
+		}
+		return out
+	}
 	err := tgc.Run(ctx, s, tgc.Opts{Wait: 20 * time.Second}, func(ctx context.Context, c *tgc.Conn) error {
 		u, err := c.Self(ctx)
 		if err != nil {
@@ -379,18 +421,3 @@ func typed(err error) error {
 
 // ToolResult — результат инструмента, как его отдаёт служба.
 type ToolResult = mcp.CallToolResult
-
-// maxDialogRows — чаты аккаунта MAX в виде диалогов Telegram (tg dialogs,
-// tg allow --match).
-func maxDialogRows(ctx context.Context) ([]tgc.DialogRow, error) {
-	chats, err := core.MaxDialogs(ctx)
-	if err != nil {
-		return nil, err
-	}
-	rows := make([]tgc.DialogRow, len(chats))
-	for i, c := range chats {
-		kind := map[string]string{"DIALOG": "user", "CHAT": "group", "CHANNEL": "channel"}[c.Kind]
-		rows[i] = tgc.DialogRow{ID: c.ID, Title: c.Title, Kind: kind, Unread: c.Unread}
-	}
-	return rows, nil
-}

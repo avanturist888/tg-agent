@@ -20,8 +20,8 @@ func MarkRead(ctx context.Context, s *config.Settings, chat string, upTo int) (*
 	if err != nil {
 		return nil, err
 	}
-	if s.IsMAX() {
-		return nil, denied("В MAX отмечать прочитанное агент пока не умеет.")
+	if n := netOf(s); n != nil {
+		return nil, denied("В %s отмечать прочитанное агент пока не умеет.", n.name())
 	}
 	if upTo <= 0 {
 		return nil, &Bad{Msg: "up_to_id — id последнего поста, который ты обработал (из tg_read_chat)."}

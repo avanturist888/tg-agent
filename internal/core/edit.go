@@ -89,8 +89,8 @@ func EditMessage(ctx context.Context, s *config.Settings, chat string, messageID
 		return nil, &Bad{Msg: fmt.Sprintf("Слишком длинно: %d символов, предел Telegram — 32768.", n)}
 	}
 	var old string
-	if s.IsMAX() {
-		if old, err = maxEditOld(ctx, s, rule, messageID); err != nil {
+	if n := netOf(s); n != nil {
+		if old, err = n.editOld(ctx, s, rule, messageID); err != nil {
 			return nil, err
 		}
 		return editDraft(ctx, s, rule, orig, messageID, old, text, note, format, nil)

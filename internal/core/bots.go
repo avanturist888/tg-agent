@@ -79,8 +79,8 @@ func botFatherRule(s *config.Settings) (config.ChatRule, error) {
 
 // DraftBotOp — tg_botfather: действие в BotFather через черновик.
 func DraftBotOp(ctx context.Context, s *config.Settings, b outbox.BotSpec, note string) (*omap.Map, error) {
-	if s.IsMAX() {
-		return nil, denied("BotFather — это Telegram; в MAX ботов так не заводят.")
+	if n := netOf(s); n != nil {
+		return nil, denied("BotFather — это Telegram; в %s ботов так не заводят.", n.name())
 	}
 	b.Action = strings.ToLower(strings.TrimSpace(b.Action))
 	spec, ok := botActions[b.Action]

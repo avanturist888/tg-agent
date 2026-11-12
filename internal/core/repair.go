@@ -27,7 +27,7 @@ var repairSince = time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
 // RepairSentIDs — дописать message_id отправленным черновикам, у которых он 0.
 // Что не нашлось однозначно, остаётся как есть (repair_sent_skipped в аудите).
 func RepairSentIDs(ctx context.Context, s *config.Settings) {
-	if s.IsMAX() {
+	if !s.IsTelegram() {
 		return
 	}
 	box := outbox.New(s.OutboxPath())

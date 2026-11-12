@@ -491,7 +491,9 @@ func maxDeliver(ctx context.Context, s *config.Settings, rule config.ChatRule, d
 		m, err := c.Send(ctx, chatID, body, o)
 		if err != nil {
 			if len(ids) > 0 { // часть уже ушла — так и сказать
-				return nil, fmt.Errorf("ушло %d сообщений из %d, дальше ошибка: %w", len(ids), len(batches), err)
+				// повтор всего черновика продублировал бы ушедшее — не повторять
+				return nil, &Denied{Msg: fmt.Sprintf("ушло %d сообщений из %d, дальше ошибка (повторять не стал, чтобы не продублировать): %v",
+					len(ids), len(batches), err)}
 			}
 			return nil, err
 		}

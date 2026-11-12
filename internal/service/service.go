@@ -68,8 +68,7 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 	svcCtx := ctx
 	go func() {
 		defer func() { done <- struct{}{} }()
-		if s.IsMAX() { // профиль аккаунта MAX: вместо Telegram — клиент MAX
-			core.RunMax(ctx, loader)
+		if core.RunNetwork(ctx, s, loader) { // профиль MAX или WhatsApp: вместо Telegram — клиент своей сети
 			return
 		}
 		if err := tgc.Serve(ctx, s, tgc.Events{Message: core.FeedOnMessage(loader),
@@ -89,7 +88,7 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 	}()
 	go func() {
 		defer func() { done <- struct{}{} }()
-		for ctx.Err() == nil && !s.IsMAX() { // MAX наверстывает сам, после каждого входа
+		for ctx.Err() == nil && s.IsTelegram() { // MAX и WhatsApp наверстывают сами, после каждого входа
 			sleep(ctx, ReconcileEvery)
 			reconcile(ctx, loader)
 		}

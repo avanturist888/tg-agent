@@ -23,8 +23,8 @@ func canManage(s *config.Settings) error {
 	if err := onlyLocal(s); err != nil {
 		return err
 	}
-	if s.IsMAX() {
-		return denied("В MAX раскладывать чаты по папкам агент пока не умеет.")
+	if n := netOf(s); n != nil {
+		return denied("В %s раскладывать чаты по папкам агент пока не умеет.", n.name())
 	}
 	if !s.Manage.Folders {
 		return denied("Раскладывать чаты по папкам и архиву — отдельное право владельца. Попроси его: " +

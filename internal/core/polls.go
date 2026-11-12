@@ -86,8 +86,8 @@ func DraftPoll(ctx context.Context, s *config.Settings, chat string, p outbox.Po
 	if err != nil {
 		return nil, err
 	}
-	if s.IsMAX() {
-		return nil, &Bad{"Опросы пока только в Telegram: в MAX tg-agent их не создаёт."}
+	if n := netOf(s); n != nil {
+		return nil, &Bad{"Опросы пока только в Telegram: в " + n.name() + " tg-agent их не создаёт."}
 	}
 	p.Options = slices.Clone(p.Options)
 	if err := checkPoll(&p); err != nil {
@@ -131,7 +131,7 @@ func PollVotes(ctx context.Context, s *config.Settings, chat string, messageID, 
 	if err != nil {
 		return nil, err
 	}
-	if s.IsMAX() {
+	if !s.IsTelegram() {
 		return nil, &Bad{"Опросы пока только в Telegram."}
 	}
 	if limit <= 0 || limit > 500 {
@@ -179,7 +179,7 @@ func DraftVote(ctx context.Context, s *config.Settings, chat string, messageID i
 	if err != nil {
 		return nil, err
 	}
-	if s.IsMAX() {
+	if !s.IsTelegram() {
 		return nil, &Bad{"Опросы пока только в Telegram."}
 	}
 	if retract {
