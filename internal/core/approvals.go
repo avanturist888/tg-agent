@@ -188,6 +188,43 @@ func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID i
 	shown := finishCard(ctx, s, cardID, d, title(s, d), status, d.Note)
 	if shown {
 		rememberCard(ctx, s, db, d.ID, cardID, status, ver, true)
+		if strings.HasPrefix(status, "✅") {
+			markCardShown(s, d.ID)
+		}
+	}
+}
+
+// markCardShown — «Отправлено» в карточке: снять у черновика CardDue.
+func markCardShown(s *config.Settings, id string) {
+	box := outbox.New(s.DataDir())
+	if d, err := box.Get(id); err == nil && d.CardDue {
+		if err := box.CardShown(id); err != nil {
+			_ = audit.Log(s.AuditPath(), "card_due_failed", "draft_id", id, "error", err.Error())
+		}
+	}
+}
+
+// showDueCards — «Отправлено» в карточки ушедших черновиков, чей итог так и
+// не показали (CardDue): процесс, отправивший их, умер между отметкой и
+// карточкой. Свежие (до recoverOrphansAfter) не трогаем — их карточку
+// сейчас показывает сам отправивший.
+func showDueCards(ctx context.Context, s *config.Settings) {
+	drafts, err := outbox.New(s.DataDir()).List(outbox.Sent)
+	if err != nil {
+		return
+	}
+	for _, d := range drafts {
+		if ctx.Err() != nil {
+			return
+		}
+		if !d.CardDue || d.BotMessageID == nil || d.MessageID == nil || d.SentAt == nil {
+			continue
+		}
+		if at, err := time.Parse(time.RFC3339, *d.SentAt); err == nil && time.Since(at) < recoverOrphansAfter {
+			continue
+		}
+		_ = audit.Log(s.AuditPath(), "card_due_shown", "draft_id", d.ID)
+		card(ctx, s, d.BotMessageID, d, sentSummary(s, d, *d.MessageID))
 	}
 }
 
@@ -941,6 +978,7 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 // законно ждёт агента или CLI.
 func RecoverInterrupted(ctx context.Context, s *config.Settings) {
 	refreshFailedCards(ctx, s)
+	showDueCards(ctx, s)
 	recoverApproved(ctx, s, processStarted, "дослано после перезапуска службы")
 }
 
@@ -1045,7 +1083,13 @@ func sentSummary(s *config.Settings, d *outbox.Draft, mid any) string {
 	if d.EditOf != 0 {
 		done = "Исправлено"
 	}
-	return fmt.Sprintf("✅ **%s** в «%s» в %s (id %v)", done, bot.MDEscape(title(s, d)), time.Now().Format("15:04"), mid)
+	at := time.Now()
+	if d.SentAt != nil { // итог мог показаться позже (уборка) — время отправки, а не показа
+		if t, err := time.Parse(time.RFC3339, *d.SentAt); err == nil {
+			at = t.Local()
+		}
+	}
+	return fmt.Sprintf("✅ **%s** в «%s» в %s (id %v)", done, bot.MDEscape(title(s, d)), at.Format("15:04"), mid)
 }
 
 // RunButtons — постоянный слушатель кнопок бота (часть службы): нажатие

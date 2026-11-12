@@ -118,8 +118,11 @@ func (db *DB) Write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	if err != nil {
 		return err
 	}
+	// и при панике в fn (её ловят выше, процесс живёт): незакрытая
+	// транзакция держала бы запись для всех процессов профиля. После
+	// Commit откат — пустой вызов
+	defer tx.Rollback()
 	if err := fn(tx); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	return tx.Commit()

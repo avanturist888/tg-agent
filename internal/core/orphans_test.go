@@ -753,3 +753,39 @@ func TestCardQueuedOnlyIfTrue(t *testing.T) {
 		t.Fatalf("в очереди: %+v", st)
 	}
 }
+
+// Ушло, а карточку отправивший не показал (умер между отметкой и карточкой):
+// уборка показывает «Отправлено» и снимает CardDue. «Протухло» поверх
+// ушедшего не ложится (уборка закреплённых — общим путём).
+func TestCardDueShown(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	if _, err := box.AttachCard(d.ID, 55); err != nil {
+		t.Fatal(err)
+	}
+	sent, err := box.MarkSent(d.ID, 7, "2026-11-12T10:00:00+00:00")
+	if err != nil || !sent.CardDue {
+		t.Fatalf("CardDue после отметки: %v %v", err, sent != nil && sent.CardDue)
+	}
+	var shown []string
+	old := finishCard
+	finishCard = func(_ context.Context, _ *config.Settings, _ int64, _ *outbox.Draft, _, status, _ string) bool {
+		shown = append(shown, status)
+		return true
+	}
+	t.Cleanup(func() { finishCard = old })
+	ctx := context.Background()
+	showCard(ctx, s, sent, 55, "⌛ **Протухло** — не нажато вовремя, сообщение не ушло.")
+	showDueCards(ctx, s)
+	if len(shown) != 1 || !strings.HasPrefix(shown[0], "✅") {
+		t.Fatalf("показано: %q", shown)
+	}
+	if got, _ := box.Get(d.ID); got.CardDue {
+		t.Fatal("CardDue не снят после показа")
+	}
+	showDueCards(ctx, s)
+	if len(shown) != 1 {
+		t.Fatalf("показано повторно: %q", shown)
+	}
+}

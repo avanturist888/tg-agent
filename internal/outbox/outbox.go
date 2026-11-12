@@ -117,6 +117,11 @@ type Draft struct {
 	Vote *VoteSpec
 	// Bot — не сообщение, а действие в BotFather
 	Bot *BotSpec
+	// CardDue — ушло, а итог «Отправлено» в карточке ещё не показан: ставит
+	// MarkSent в той же записи, снимает показ (CardShown). Процесс умер
+	// между ними — итог покажет уборка (core.showDueCards), а не оставит
+	// карточку на «Отправляю…».
+	CardDue bool
 
 	extra *omap.Map // поля от других версий — возвращаем при записи как есть
 }
@@ -126,7 +131,7 @@ var known = map[string]bool{
 	"status": true, "origin": true, "approved_at": true, "sent_at": true, "message_id": true,
 	"bot_message_id": true, "fmt": true, "files": true, "send_error": true, "note": true,
 	"history": true, "send_at": true, "topic": true, "topic_title": true, "edit_of": true, "edit_old": true,
-	"poll": true, "vote": true, "bot": true,
+	"poll": true, "vote": true, "bot": true, "card_due": true,
 }
 
 func (d *Draft) MarshalJSON() ([]byte, error) {
@@ -165,6 +170,9 @@ func (d *Draft) MarshalJSON() ([]byte, error) {
 	if d.Bot != nil {
 		m.Set("bot", d.Bot)
 	}
+	if d.CardDue {
+		m.Set("card_due", true)
+	}
 	return m.MarshalJSON()
 }
 
@@ -199,6 +207,7 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		Poll         *PollSpec         `json:"poll"`
 		Vote         *VoteSpec         `json:"vote"`
 		Bot          *BotSpec          `json:"bot"`
+		CardDue      bool              `json:"card_due"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
@@ -209,7 +218,7 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		SentAt: aux.SentAt, MessageID: aux.MessageID, BotMessageID: aux.BotMessageID, Fmt: aux.Fmt,
 		Files: aux.Files, SendError: aux.SendError, Note: aux.Note, History: aux.History, SendAt: aux.SendAt,
 		Topic: aux.Topic, TopicTitle: aux.TopicTitle, EditOf: aux.EditOf, EditOld: aux.EditOld, Poll: aux.Poll, Vote: aux.Vote,
-		Bot: aux.Bot,
+		Bot: aux.Bot, CardDue: aux.CardDue,
 	}
 	if d.Status == "" {
 		d.Status = Pending
@@ -409,12 +418,22 @@ func (o *Outbox) MarkSendError(id, msg string) (*Draft, error) {
 	})
 }
 
+// CardShown — итог «Отправлено» в карточке показан (снять CardDue).
+func (o *Outbox) CardShown(id string) error {
+	_, err := o.Update(id, func(d *Draft) error {
+		d.CardDue = false
+		return nil
+	})
+	return err
+}
+
 func (o *Outbox) MarkSent(id string, messageID int64, at string) (*Draft, error) {
 	return o.Update(id, func(d *Draft) error {
 		d.Status = Sent
 		d.SendError = nil
 		d.SentAt = &at
 		d.MessageID = &messageID
+		d.CardDue = d.BotMessageID != nil && *d.BotMessageID != 0
 		d.AddHistory("event", "sent", "at", at, "message_id", messageID)
 		return nil
 	})

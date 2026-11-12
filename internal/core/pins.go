@@ -81,7 +81,9 @@ func sweepPins(ctx context.Context, s *config.Settings) {
 		switch {
 		case err != nil: // черновика нет — карточку держать незачем
 		case d.Status == outbox.Pending && d.IsExpired(now), d.Status == outbox.Expired:
-			bot.FinishCard(ctx, s, cardID, d, title(s, d), "⌛ **Протухло** — не нажато вовремя, сообщение не ушло.", d.Note)
+			// общим путём: версия и сверка с черновиком под локом карточки —
+			// пока уборка шла, его могли отправить
+			showCard(ctx, s, d, cardID, "⌛ **Протухло** — не нажато вовремя, сообщение не ушло.")
 		case isFinal(d.Status):
 		default:
 			continue // ещё ждёт владельца
@@ -107,7 +109,8 @@ func maybeSweep(ctx context.Context, s *config.Settings, last *time.Time) {
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 		defer cancel()
 		if s.BotReady() {
-			retryCards(cctx, s) // итоги, которые Bot API не принял
+			retryCards(cctx, s)   // итоги, которые Bot API не принял
+			showDueCards(cctx, s) // «Отправлено», не показанное умершим отправителем
 			sweepPins(cctx, s)
 			publishOrphanAccess(cctx, s)
 		}

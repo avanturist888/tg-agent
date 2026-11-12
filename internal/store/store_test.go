@@ -733,3 +733,33 @@ func TestReimportAfterRollback(t *testing.T) {
 		t.Fatal("отметка выгрузки не снята после переноса")
 	}
 }
+
+// Паника внутри транзакции (её ловят выше) не оставляет базу запертой для
+// записи.
+func TestWritePanicReleases(t *testing.T) {
+	t.Cleanup(closeAll)
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() { _ = recover() }()
+		_ = db.Write(context.Background(), func(tx *sql.Tx) error {
+			if _, err := tx.Exec("INSERT INTO kv(key, value, updated) VALUES('a', '1', 0)"); err != nil {
+				t.Fatal(err)
+			}
+			panic("сбой")
+		})
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := db.Write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec("INSERT INTO kv(key, value, updated) VALUES('b', '2', 0)")
+		return err
+	}); err != nil {
+		t.Fatalf("после паники запись не идёт: %v", err)
+	}
+	if count(t, db, "SELECT count(*) FROM kv WHERE key = 'a'") != 0 {
+		t.Fatal("запись паникнувшей транзакции осталась")
+	}
+}
