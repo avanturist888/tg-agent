@@ -669,7 +669,53 @@ func TestExportLegacy(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "outbox.json")); err != nil || db.LegacyBlocked() == "" {
 		t.Fatalf("после отката перенос не ждёт: %v %q", err, db.LegacyBlocked())
 	}
+	// прерванную выгрузку можно повторить: свои файлы она перезапишет
+	if _, err := ExportLegacy(dir); err != nil {
+		t.Fatalf("повтор выгрузки: %v", err)
+	}
+	// а файл, который уже вела старая сборка, — нет
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "c", "status": "pending", "text": "исправлено"}]`)
 	if _, err := ExportLegacy(dir); err == nil {
-		t.Fatal("выгрузка поверх неперенесённого outbox.json")
+		t.Fatal("выгрузка поверх файла старой сборки")
+	}
+}
+
+// Повторное обновление после отката: выгруженные файлы, которые потом вела
+// старая сборка, главнее базы — исправленный текст ждущего черновика, снятый
+// блок группы. Одобренное ею без итога — попытка.
+func TestReimportAfterRollback(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "pending", "text": "старое"},
+		{"id": "b", "status": "scheduled", "send_at": "2099-01-01T00:00:00+00:00"}]`)
+	write(t, filepath.Join(dir, "chat_sets.json"), `{"sets": {}, "aliases": {}, "blocked": {"f1": [5, 6]}}`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportLegacy(dir); err != nil {
+		t.Fatal(err)
+	}
+	// старая сборка: исправила текст, одобрила b (и упала до итога), сняла блок 6
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "pending", "text": "исправлено"},
+		{"id": "b", "status": "approved"}]`)
+	write(t, filepath.Join(dir, "chat_sets.json"), `{"sets": {}, "aliases": {}, "blocked": {"f1": [5]}}`)
+	if err := ClearRollback(dir); err != nil { // tg cutover
+		t.Fatal(err)
+	}
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if count(t, db, "SELECT count(*) FROM drafts WHERE id = 'a' AND json_extract(body, '$.text') = 'исправлено'") != 1 {
+		t.Fatal("исправленный старой сборкой текст потерян")
+	}
+	if count(t, db, "SELECT count(*) FROM drafts WHERE id = 'b' AND status = 'approved' AND send_attempts = 1 AND send_at IS NULL") != 1 {
+		t.Fatal("одобренное старой сборкой — не попытка")
+	}
+	if count(t, db, "SELECT count(*) FROM chat_set_blocked") != 1 {
+		t.Fatal("группы чатов не взяты из файла")
+	}
+	if count(t, db, "SELECT count(*) FROM legacy_imports WHERE exported != 0") != 0 {
+		t.Fatal("отметка выгрузки не снята после переноса")
 	}
 }

@@ -125,6 +125,9 @@ UPDATE drafts SET send_attempts = 1 WHERE sender_pid IS NOT NULL;`,
 	// показан ли он: не показанный (Bot API не отвечал) уборка повторяет, а
 	// итог, опоздавший к локу, по номеру отвергается (core/approvals.go)
 	`CREATE TABLE card_states (key TEXT PRIMARY KEY, body TEXT NOT NULL CHECK (json_valid(body))) WITHOUT ROWID;`,
+	// 4: файл выгружен из базы для отката (tg rollback, rollback.go): при
+	// следующем переносе он главнее базы — его вела старая сборка
+	`ALTER TABLE legacy_imports ADD COLUMN exported INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // Version — версия схемы, которую знает эта сборка.

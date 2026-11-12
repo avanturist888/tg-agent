@@ -56,6 +56,10 @@ type Legacy struct {
 	Locked bool
 	// Import переносит содержимое (path — полный путь) и возвращает,
 	// сколько записей нашлось. Только добавлять: база главнее.
+	// Replace — перенос файла, который выгрузил tg rollback (rollback.go) и
+	// после которого его вела старая сборка: файл новее базы и главнее её.
+	// Нет — и после отката как Import.
+	Replace func(ctx context.Context, tx *sql.Tx, path string) (int, error)
 	// ErrCorrupt (обёрнутая) — файл испорчен: его откладывают как .broken.
 	// ErrRetry — перенести пока нельзя (не записался секрет, старая сборка
 	// ещё отправляет черновик): файл остаётся на месте, попытка — скоро снова.
@@ -267,19 +271,26 @@ func (db *DB) importFile(ctx context.Context, l Legacy, path string) (bool, erro
 		skipWrite bool
 	)
 	err = db.Write(ctx, func(tx *sql.Tx) error {
-		var pSize, pMtime int64
-		e := tx.QueryRowContext(ctx, "SELECT size, mtime FROM legacy_imports WHERE file = ?", l.File).Scan(&pSize, &pMtime)
+		var pSize, pMtime, exported int64
+		e := tx.QueryRowContext(ctx, "SELECT size, mtime, exported FROM legacy_imports WHERE file = ?", l.File).Scan(&pSize, &pMtime, &exported)
 		switch {
 		case e == nil:
 			if pSize == size && pMtime == mtime {
-				skipWrite = true // уже перенесён, не вышло только отложить файл
-				return nil
+				// уже перенесён (не вышло только отложить файл) или выгружен
+				// откатом и не тронут — база и так совпадает с ним
+				skipWrite = true
+				_, e = tx.ExecContext(ctx, "UPDATE legacy_imports SET exported = 0 WHERE file = ?", l.File)
+				return e
 			}
 			again = true
 		case !errors.Is(e, sql.ErrNoRows):
 			return e
 		}
-		n, e := l.Import(ctx, tx, path)
+		imp := l.Import
+		if exported != 0 && l.Replace != nil {
+			imp = l.Replace
+		}
+		n, e := imp(ctx, tx, path)
 		switch {
 		case errors.Is(e, ErrCorrupt):
 			corrupt = e
@@ -295,7 +306,7 @@ func (db *DB) importFile(ctx context.Context, l Legacy, path string) (bool, erro
 		}
 		rows = n
 		_, e = tx.ExecContext(ctx, `INSERT INTO legacy_imports(file, imported, size, mtime, rows) VALUES(?, ?, ?, ?, ?)
-			ON CONFLICT(file) DO UPDATE SET imported = excluded.imported, size = excluded.size, mtime = excluded.mtime, rows = excluded.rows`,
+			ON CONFLICT(file) DO UPDATE SET imported = excluded.imported, size = excluded.size, mtime = excluded.mtime, rows = excluded.rows, exported = 0`,
 			l.File, time.Now().Unix(), size, mtime, n)
 		return e
 	})
@@ -470,6 +481,20 @@ func liveSenders(dir string) string {
 	return strings.Join(ids, ", ")
 }
 
+// replacing — Replace для файла, который целиком описывает свои таблицы:
+// очистить их и перенести файл.
+func replacing(imp func(context.Context, *sql.Tx, string) (int, error), tables ...string) func(context.Context, *sql.Tx, string) (int, error) {
+	return func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+		for _, t := range tables {
+			// имена таблиц — из кода
+			if _, err := tx.ExecContext(ctx, "DELETE FROM "+t); err != nil {
+				return 0, err
+			}
+		}
+		return imp(ctx, tx, path)
+	}
+}
+
 func unixOf(s string) int64 {
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
@@ -479,20 +504,20 @@ func unixOf(s string) int64 {
 }
 
 var builtinLegacy = []Legacy{
-	{File: "outbox.json", Locked: true, Import: importOutbox},
+	{File: "outbox.json", Locked: true, Import: importOutbox, Replace: replaceOutbox},
 	{File: "feeds", Dir: true, Import: importFeeds},
 	{File: "transcripts.json", Locked: true, Import: importTranscripts},
 	{File: "peers.json", Locked: true, Import: importPeers},
 	{File: "edit_dates.json", Import: importEditDates},
 	{File: "updates_state.json", Import: importUpdates},
 	{File: "routes.json", Import: importRoutes},
-	{File: "chat_sets.json", Import: importSets},
-	{File: "agent_folders.json", Locked: true, Import: importAgentFolders},
+	{File: "chat_sets.json", Import: importSets, Replace: replacing(importSets, "chat_sets", "chat_set_aliases", "chat_set_blocked")},
+	{File: "agent_folders.json", Locked: true, Import: importAgentFolders, Replace: replacing(importAgentFolders, "agent_folders")},
 	docFile("bot_ops.json", TBotOps),
 	docFile("pinned_drafts.json", TPinnedDrafts),
 	{File: "t3-threads.json", Locked: true, Import: docImport(TT3Threads)},
 	docFile("upstream_cards.json", TUpstreamCards),
-	{File: "account_notes.json", Locked: true, Import: importNotes},
+	{File: "account_notes.json", Locked: true, Import: importNotes, Replace: replacing(importNotes, TAccountNotes)},
 	{File: "upstream.json", Import: importUpstream},
 	kvFile("bot_offset.json", KeyBotOffset),
 	kvFile("upstream_thread.json", KeyUpstreamThread),
@@ -513,6 +538,17 @@ func draftFinal(status string) bool {
 }
 
 func importOutbox(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+	return mergeOutbox(ctx, tx, path, false)
+}
+
+// replaceOutbox — после tg rollback: нерешённое в файле главнее
+// нерешённого в базе (его вела старая сборка: исправленный текст, новый
+// срок, одобрение).
+func replaceOutbox(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+	return mergeOutbox(ctx, tx, path, true)
+}
+
+func mergeOutbox(ctx context.Context, tx *sql.Tx, path string, fileWins bool) (int, error) {
 	// черновик, который старая сборка сейчас отправляет, перенести нельзя:
 	// в базе у него не было бы отметки захвата, и новая служба отправила бы
 	// его второй раз — ждём, пока старая закончит (её итог будет в файле)
@@ -562,6 +598,16 @@ func importOutbox(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 			}
 		case err != nil:
 			return 0, err
+		case fileWins && !draftFinal(d.Status) && !draftFinal(cur):
+			// approved в файле — уже взятое старой сборкой в отправку: попытка
+			attempts := 0
+			if d.Status == "approved" {
+				attempts = 1
+			}
+			if _, err := tx.ExecContext(ctx, "UPDATE drafts SET status = ?, expires = ?, send_at = ?, body = ?, send_attempts = MAX(send_attempts, ?) WHERE id = ?",
+				d.Status, unixOf(d.ExpiresAt), sendAt, compact(raw), attempts, d.ID); err != nil {
+				return 0, err
+			}
 		case d.Status == "approved" && !draftFinal(cur):
 			// старая сборка (откат) взяла его в отправку, а итога в файле
 			// нет — могло уйти. Попытка — и для черновика, который в базе ещё

@@ -167,7 +167,13 @@ func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID i
 	}
 	unlock, ok := lockCard(ctx, s, d.ID)
 	if !ok {
-		rememberCard(ctx, s, db, d.ID, cardID, status, ver, false)
+		// и в очередь — только правда о черновике: проверка после выдачи
+		// номера, так что итог, собранный по старому снимку, либо уже видит
+		// новое состояние и отвергается, либо старше номером того, кто его
+		// создал
+		if stillTrue(s, d.ID, status) {
+			rememberCard(ctx, s, db, d.ID, cardID, status, ver, false)
+		}
 		return
 	}
 	defer unlock()
@@ -243,8 +249,9 @@ func lockCard(ctx context.Context, s *config.Settings, draftID string) (func(), 
 	return l.Release, true
 }
 
-// cardLockWait — сколько ждать, пока другой путь покажет итог той же карточки.
-const cardLockWait = 30 * time.Second
+// cardLockWait — сколько ждать, пока другой путь покажет итог той же карточки
+// (тесты сокращают).
+var cardLockWait = 30 * time.Second
 
 // intermediate — промежуточный итог («Отправляю…»): за ним всегда идёт
 // окончательный, повторять его незачем.

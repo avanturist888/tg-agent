@@ -716,3 +716,40 @@ func TestUnsavedSentAfterExpiry(t *testing.T) {
 		t.Fatalf("протухшее ушедшее: %s, квитанция осталась %v", got.Status, ok)
 	}
 }
+
+// Итог, не дождавшийся лока карточки, встаёт в очередь, только если он
+// правда о черновике: «Не отправлено» по старому снимку не вытесняет
+// ждущее «Отправлено».
+func TestCardQueuedOnlyIfTrue(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	snap, err := box.MarkSendError(d.ID, "нет связи")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent, err := box.MarkSent(d.ID, 7, "2026-11-12T10:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := stateDB(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	was := cardLockWait
+	cardLockWait = 100 * time.Millisecond
+	t.Cleanup(func() { cardLockWait = was })
+	other := lock.New(filepath.Join(s.DataDir(), "cards", d.ID), time.Second)
+	os.MkdirAll(filepath.Join(s.DataDir(), "cards"), 0o700)
+	if err := other.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer other.Release()
+	cardID := int64(55)
+	card(ctx, s, &cardID, sent, "✅ **Отправлено**")
+	card(ctx, s, &cardID, snap, "⚠️ **Не отправлено** — "+bot.MDEscape(*snap.SendError))
+	if st, _, _ := cardStates.Get(ctx, db.Q(), d.ID); !st.pending() || !strings.HasPrefix(st.Status, "✅") {
+		t.Fatalf("в очереди: %+v", st)
+	}
+}
