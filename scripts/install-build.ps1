@@ -8,6 +8,7 @@ Push-Location $Root
 try {
     $manifest = Get-Content -Raw -LiteralPath (Join-Path $Artifacts 'manifest.json') | ConvertFrom-Json
     if ($manifest.schema -ne 1 -or $manifest.commit -ne (git rev-parse HEAD)) { throw 'Wrong revision or manifest schema.' }
+    if ($manifest.build -cnotmatch ('^' + [regex]::Escape($manifest.commit.Substring(0, 12)) + '-[0-9]{8}\.[0-9]{6}$')) { throw 'Missing or invalid build ID.' }
     $files = @($manifest.files)
     $expected = @('tg.exe', 'tgw.exe', 'tgstt.exe', 'sherpa-onnx-c-api.dll', 'sherpa-onnx-cxx-api.dll', 'onnxruntime.dll')
     $actual = @($files | ForEach-Object { $_.name })
@@ -16,6 +17,12 @@ try {
         $path = Join-Path $Artifacts $f.name
         if ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Artifact is a link.' }
         if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $f.sha256) { throw "Hash mismatch: $($f.name)" }
+    }
+    foreach ($exe in @('tg.exe', 'tgw.exe')) {
+        $metadata = & go version -m (Join-Path $Artifacts $exe) 2>&1
+        if ($LASTEXITCODE -ne 0 -or (($metadata -join "`n") -notmatch ('tgagent/internal/config\.Build=' + [regex]::Escape($manifest.build) + '(?=\s|"|$)'))) {
+            throw "Embedded build ID does not match manifest: $exe"
+        }
     }
     if ($ValidateOnly) { return }
     $build = $manifest.build
@@ -39,11 +46,17 @@ try {
     } catch {
         # No migration has started. Restore the previous executable/library set.
         $failure = $_
+        $restoreErrors = @()
         [array]::Reverse($changed)
         foreach ($entry in $changed) {
-            if (Test-Path -LiteralPath $entry.current) { Move-Item -LiteralPath $entry.current -Destination "$($entry.current).failed-$stamp" }
-            if ($entry.existed) { Move-Item -LiteralPath $entry.old -Destination $entry.current }
+            try {
+                if (Test-Path -LiteralPath $entry.current) { Move-Item -LiteralPath $entry.current -Destination "$($entry.current).failed-$stamp" }
+                if ($entry.existed) { Move-Item -LiteralPath $entry.old -Destination $entry.current }
+            } catch {
+                $restoreErrors += "$($entry.current): $($_.Exception.Message); saved file: $($entry.old)"
+            }
         }
+        if ($restoreErrors.Count) { throw ("Installation failed: $failure`nRestore failures:`n" + ($restoreErrors -join "`n")) }
         throw $failure
     }
     Write-Host "Готово: $(Join-Path $Root 'bin'), сборка $build"

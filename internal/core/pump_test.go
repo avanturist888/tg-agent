@@ -327,14 +327,56 @@ func TestSendDueLoopWaitsForLegacy(t *testing.T) {
 	old := store.RequireCutover
 	store.RequireCutover = true
 	t.Cleanup(func() { store.RequireCutover = old })
+	if err := os.MkdirAll(s.DataDir(), 0700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(s.DataDir(), "outbox.json"), []byte(`[]`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	calls := 0
-	_ = SendDueLoop(ctx, func() (*config.Settings, error) { calls++; return s, nil })
-	if calls > 1 {
-		t.Fatalf("busy loop during pending import: %d loader calls", calls)
+	started := time.Now()
+	err := SendDueLoop(ctx, func() (*config.Settings, error) { calls++; return s, nil })
+	if !errors.Is(err, context.DeadlineExceeded) || calls != 1 || time.Since(started) < 100*time.Millisecond {
+		t.Fatalf("pending import: err %v, loader calls %d, elapsed %s", err, calls, time.Since(started))
+	}
+}
+
+func TestSendDueLoopResumesLegacy(t *testing.T) {
+	s := watchEnv(t)
+	old := store.RequireCutover
+	store.RequireCutover = true
+	t.Cleanup(func() { store.RequireCutover = old })
+	if err := os.MkdirAll(s.DataDir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.DataDir(), "outbox.json"), []byte(`[]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	calls := 0
+	err := SendDueLoop(ctx, func() (*config.Settings, error) {
+		calls++
+		if calls == 2 {
+			if err := store.MarkCutover(s.DataDir(), "test"); err != nil {
+				return nil, err
+			}
+		}
+		return s, nil
+	})
+	if err != nil || calls != 2 {
+		t.Fatalf("resume import: err %v, loader calls %d", err, calls)
+	}
+	db, err := stateDB(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.LegacyPending() {
+		t.Fatal("import still pending after cutover")
+	}
+	if _, err := os.Stat(filepath.Join(s.DataDir(), "outbox.json.migrated")); err != nil {
+		t.Fatal(err)
 	}
 }
