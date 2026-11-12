@@ -56,6 +56,26 @@ func RolledBack(dir string) bool {
 
 // ClearRollback — снять отметку отката (tg cutover: процессов старой
 // сборки больше нет, её файлы снова переносятся в базу).
+// rollbackEpisode — номер этого отката (из отметки): повтор выгрузки до
+// tg cutover — тот же откат, следующий после cutover — новый.
+func rollbackEpisode(dir string) string {
+	raw, err := os.ReadFile(filepath.Join(dir, RollbackFile))
+	if err != nil {
+		return ""
+	}
+	var v struct {
+		Episode string `json:"episode"`
+		At      string `json:"at"`
+	}
+	if json.Unmarshal(raw, &v) != nil {
+		return ""
+	}
+	if v.Episode != "" {
+		return v.Episode
+	}
+	return v.At
+}
+
 func ClearRollback(dir string) error {
 	err := os.Remove(filepath.Join(dir, RollbackFile))
 	if errors.Is(err, os.ErrNotExist) {
@@ -129,9 +149,14 @@ func ExportLegacy(dir string) ([]string, error) {
 	// никто не поменяет базу, пока её читаем, и намерения (хеши) ложатся до
 	// записи файлов
 	err = db.write(ctx, true, func(tx *sql.Tx) error {
-		raw, _ := json.Marshal(map[string]any{"at": time.Now().Format(time.RFC3339)})
-		if err := fsx.WriteFile(filepath.Join(dir, RollbackFile), raw, 0o600); err != nil {
-			return err
+		// повтор выгрузки (прошлая сорвалась) — тот же откат: отметку с его
+		// номером не переписываем
+		if rollbackEpisode(dir) == "" {
+			now := time.Now()
+			raw, _ := json.Marshal(map[string]any{"at": now.Format(time.RFC3339), "episode": now.Format(time.RFC3339Nano)})
+			if err := fsx.WriteFile(filepath.Join(dir, RollbackFile), raw, 0o600); err != nil {
+				return err
+			}
 		}
 		exps = nil
 		for _, l := range list {
@@ -311,6 +336,10 @@ func jsonOut(v any) ([]byte, error) { return json.MarshalIndent(v, "", "  ") }
 func exportOutbox(ctx context.Context, tx *sql.Tx, dir string) ([]byte, error) {
 	drafts := []map[string]json.RawMessage{}
 	var handed []string // одобренные без попытки: их досылает старая сборка
+	episode := rollbackEpisode(dir)
+	if episode == "" {
+		return nil, errors.New("нет отметки отката")
+	}
 	err := eachRow(ctx, tx, "SELECT id, status, body, send_attempts, sender_pid, sender_since FROM drafts ORDER BY seq", func(r *sql.Rows) error {
 		var (
 			id, status, body string
@@ -329,6 +358,14 @@ func exportOutbox(ctx context.Context, tx *sql.Tx, dir string) ([]byte, error) {
 			return fmt.Errorf("черновик %s: %w", id, err)
 		}
 		m["status"] = jsonString(status)
+		// отдан на досылку этим же откатом (повтор выгрузки) — попытки не
+		// было, её отметила сама выгрузка; отдан прошлым — настоящая
+		var mark string
+		_ = json.Unmarshal(m[handoffKey], &mark)
+		delete(m, handoffKey) // старой сборке пометка не нужна, а повтор даст тот же файл
+		if mark == episode {
+			attempts = 0
+		}
 		noError := len(m["send_error"]) == 0 || string(m["send_error"]) == "null"
 		if mid, at, ok := unsavedReceipt(dir, id); ok && status != "sent" {
 			// ушло, отметка не легла (могло и протухнуть, пока ждали)
@@ -352,13 +389,20 @@ func exportOutbox(ctx context.Context, tx *sql.Tx, dir string) ([]byte, error) {
 	// здесь же, в транзакции выгрузки, оно становится попыткой: в базе —
 	// «могло уйти», повтор только явный (как approved из файла старой
 	// сборки при переносе).
+	// Пометка (номер отката) отличает эту попытку от настоящей при повторе
+	// выгрузки того же отката: иначе он отдал бы черновик со сбоем «могло
+	// уйти», и старая сборка его не дослала бы.
 	for _, id := range handed {
-		if _, err := tx.ExecContext(ctx, "UPDATE drafts SET send_attempts = 1 WHERE id = ? AND send_attempts = 0", id); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE drafts SET send_attempts = 1, body = json_set(body, '$."+handoffKey+"', ?) WHERE id = ?", episode, id); err != nil {
 			return nil, err
 		}
 	}
 	return jsonOut(drafts)
 }
+
+// handoffKey — поле тела черновика: каким откатом (номер из отметки) он
+// отдан старой сборке на досылку.
+const handoffKey = "legacy_handoff"
 
 func jsonString(s string) json.RawMessage {
 	b, _ := json.Marshal(s)

@@ -868,6 +868,17 @@ func TestExportHandsApprovedOnce(t *testing.T) {
 	if err != nil || !strings.Contains(string(raw), `"approved"`) || strings.Contains(string(raw), "send_error") {
 		t.Fatalf("старой сборке — не на досылку: %v %s", err, raw)
 	}
+	// повтор выгрузки того же отката (прошлая сорвалась на другом файле) —
+	// тот же файл: пометка выгрузки — не попытка
+	if _, err := db.Q().Exec("UPDATE legacy_imports SET size = 0, mtime = 0 WHERE exported != 0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportLegacy(dir); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := os.ReadFile(filepath.Join(dir, "outbox.json")); err != nil || string(again) != string(raw) {
+		t.Fatalf("повтор выгрузки дал другой файл: %v\n%s\n%s", err, raw, again)
+	}
 	if err := ClearRollback(dir); err != nil { // файл не тронут
 		t.Fatal(err)
 	}
@@ -876,5 +887,12 @@ func TestExportHandsApprovedOnce(t *testing.T) {
 	}
 	if count(t, db, "SELECT count(*) FROM drafts WHERE id = 'c' AND status = 'approved' AND send_attempts = 1") != 1 {
 		t.Fatal("после повторного переноса черновик снова отдаётся в отправку")
+	}
+	// следующий откат: попытка прошлого — уже настоящая, «могло уйти»
+	if _, err := ExportLegacy(dir); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(dir, "outbox.json")); err != nil || !strings.Contains(string(raw), "send_error") {
+		t.Fatalf("попытка прошлого отката отдана на досылку: %v %s", err, raw)
 	}
 }
