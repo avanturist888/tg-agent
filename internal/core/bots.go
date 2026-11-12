@@ -396,7 +396,7 @@ func importVault(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 		return 0, fmt.Errorf("%w: %v", store.ErrCorrupt, err)
 	}
 	moved := false
-	err = lock.With(ctx, vaultLockPath(filepath.Dir(path)), vaultLockWait, func() error {
+	err = lock.With(ctx, vaultLockPath(), vaultLockWait, func() error {
 		for key, e := range m {
 			if e == nil || e.Token == "" {
 				continue
@@ -439,9 +439,19 @@ func importVault(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 }
 
 // vaultLockPath — лок «прочитать токен в диспетчере → записать» между
-// процессами (перенос и сохранение токена). Под ним — только диспетчер, без
+// процессами (перенос и сохранение токена). Записи диспетчера общие для
+// всех профилей и установок этого пользователя Windows, поэтому и лок — в
+// его каталоге, а не в data/ профиля. Под ним — только диспетчер, без
 // транзакций базы: перенос берёт его внутри своей транзакции.
-func vaultLockPath(dataDir string) string { return filepath.Join(dataDir, "bot-vault") }
+func vaultLockPath() string {
+	dir, err := os.UserCacheDir() // %LocalAppData%
+	if err != nil {
+		dir = os.TempDir()
+	}
+	dir = filepath.Join(dir, "tg-agent")
+	_ = os.MkdirAll(dir, 0o700)
+	return filepath.Join(dir, "bot-vault")
+}
 
 const vaultLockWait = 30 * time.Second
 
@@ -546,7 +556,7 @@ func saveBotToken(ctx context.Context, s *config.Settings, tok, source string) (
 	defer vaultMu.Unlock()
 	key := strings.ToLower(me.Username)
 	var cur string
-	err = lock.With(ctx, vaultLockPath(config.DataPath()), vaultLockWait, func() error {
+	err = lock.With(ctx, vaultLockPath(), vaultLockWait, func() error {
 		cur, _ = vaultToken(key)
 		if err := credSet(botCredTarget(key), tok); err != nil {
 			return fmt.Errorf("токен не записан в диспетчер учётных данных Windows: %w", err)

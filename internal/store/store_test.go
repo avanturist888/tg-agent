@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -600,5 +602,74 @@ func TestLegacyMalformedSendLock(t *testing.T) {
 	}
 	if n := count(t, db, "SELECT send_attempts FROM drafts WHERE id = 'a'"); n != 1 || db.LegacyPending() {
 		t.Fatalf("попыток %d, pending %v", n, db.LegacyPending())
+	}
+}
+
+// Выгрузка для отката: очередь — из базы (не из устаревшего снимка), попытка
+// без итога — со сбоем (старая сборка её не дошлёт), ушедшее без отметки —
+// отправленным; прочие снимки — на место; после выгрузки перенос ждёт.
+func TestExportLegacy(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "outbox.json"), `[
+		{"id": "a", "status": "scheduled", "send_at": "2099-01-01T00:00:00+00:00"},
+		{"id": "b", "status": "pending"}, {"id": "c", "status": "pending"},
+		{"id": "d", "status": "pending"}, {"id": "e", "status": "pending"}]`)
+	write(t, filepath.Join(dir, "pinned_drafts.json"), `{"a": 5}`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		"UPDATE drafts SET status = 'sent', body = json_set(body, '$.status', 'sent', '$.message_id', 9) WHERE id = 'a'",
+		"UPDATE drafts SET status = 'approved', send_attempts = 1 WHERE id = 'b'",
+		"UPDATE drafts SET status = 'approved' WHERE id = 'c'",
+		"UPDATE drafts SET status = 'approved', send_attempts = 1 WHERE id = 'd'",
+		"UPDATE drafts SET status = 'cancelled' WHERE id = 'e'",
+	} {
+		if _, err := db.Q().Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(t, filepath.Join(dir, UnsavedDir, "d"), `{"message_id": 77, "at": "2026-11-12T10:00:00Z"}`)
+	restored, err := ExportLegacy(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(restored, "pinned_drafts.json") {
+		t.Fatalf("вернулось: %v", restored)
+	}
+	var got []map[string]any
+	raw, err := os.ReadFile(filepath.Join(dir, "outbox.json"))
+	if err != nil || json.Unmarshal(raw, &got) != nil {
+		t.Fatalf("outbox.json: %v", err)
+	}
+	by := map[string]map[string]any{}
+	for _, d := range got {
+		by[d["id"].(string)] = d
+	}
+	if by["a"]["status"] != "sent" || by["e"]["status"] != "cancelled" {
+		t.Fatalf("решённые из базы: a %v, e %v", by["a"]["status"], by["e"]["status"])
+	}
+	if by["b"]["status"] != "approved" || by["b"]["send_error"] == nil {
+		t.Fatalf("попытка без итога: %v", by["b"])
+	}
+	if by["c"]["status"] != "approved" || by["c"]["send_error"] != nil {
+		t.Fatalf("одобренное без попытки: %v", by["c"])
+	}
+	if by["d"]["status"] != "sent" || by["d"]["message_id"] != float64(77) {
+		t.Fatalf("ушедшее без отметки: %v", by["d"])
+	}
+	if !RolledBack(dir) {
+		t.Fatal("нет отметки отката")
+	}
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "outbox.json")); err != nil || db.LegacyBlocked() == "" {
+		t.Fatalf("после отката перенос не ждёт: %v %q", err, db.LegacyBlocked())
+	}
+	if _, err := ExportLegacy(dir); err == nil {
+		t.Fatal("выгрузка поверх неперенесённого outbox.json")
 	}
 }

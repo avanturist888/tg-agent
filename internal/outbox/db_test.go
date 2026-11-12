@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -165,5 +166,18 @@ func TestExpiry(t *testing.T) {
 	}
 	if _, err := o.Approve(d.ID, "t"); err == nil {
 		t.Fatal("протухший одобрен")
+	}
+}
+
+// После tg rollback (отметка в data/) эта сборка ничего не берёт в отправку.
+func TestClaimSendRefusedAfterRollback(t *testing.T) {
+	dir := t.TempDir()
+	o := New(dir)
+	d := approvedDraft(t, o)
+	if err := os.WriteFile(filepath.Join(dir, store.RollbackFile), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c, _, err := o.ClaimSend(d.ID); c != nil || !errors.Is(err, ErrRolledBack) {
+		t.Fatalf("захват после отката: %v %v", c, err)
 	}
 }

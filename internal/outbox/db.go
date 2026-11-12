@@ -410,6 +410,10 @@ var pidAlive = lock.PIDAlive
 // ClaimSend — взять одобренный черновик в отправку. Черновик не approved —
 // (nil, черновик, nil): отправлять нечего, статус — в черновике. Его уже
 // отправляет живой путь — ErrSending.
+// ErrRolledBack — состояние выгружено для отката на старую сборку
+// (tg rollback): отправлять может только она.
+var ErrRolledBack = errors.New("состояние выгружено для отката на старую сборку (tg rollback) — эта сборка не отправляет; вернуться — обновление через scripts\\build.ps1")
+
 func (o *Outbox) ClaimSend(id string) (*Claim, *Draft, error) {
 	db, err := o.db()
 	if err != nil {
@@ -425,6 +429,11 @@ func (o *Outbox) ClaimSend(id string) (*Claim, *Draft, error) {
 	)
 	err = db.Write(ctx, func(tx *sql.Tx) error {
 		claim, draft = nil, nil
+		// состояние выгружено для старой сборки (tg rollback): отправленное
+		// после выгрузки она бы не увидела и отправила снова
+		if store.RolledBack(o.Dir) {
+			return ErrRolledBack
+		}
 		now := time.Now()
 		if err := expire(ctx, tx, now); err != nil {
 			return err

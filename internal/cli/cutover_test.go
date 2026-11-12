@@ -56,6 +56,10 @@ func legacyDir(t *testing.T) string {
 // инструмента дожидаются; потом — отметка.
 func TestCutoverWaitsAndMarks(t *testing.T) {
 	dir := legacyDir(t)
+	// после tg rollback: обновление снимает отметку отката
+	if err := os.WriteFile(filepath.Join(dir, store.RollbackFile), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	f := &fakeProcs{alive: map[int]procs.Proc{
 		1: proc(1, "mcp"),
 		2: proc(2, "gui"),
@@ -78,6 +82,9 @@ func TestCutoverWaitsAndMarks(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, store.CutoverFile)); err != nil {
 		t.Fatal("нет отметки")
+	}
+	if store.RolledBack(dir) {
+		t.Fatal("отметка отката не снята")
 	}
 	if !strings.Contains(out.String(), "Жду, пока закончит: 4") || !strings.Contains(out.String(), "окно управления закрыто") {
 		t.Fatalf("вывод: %s", out.String())
@@ -127,5 +134,14 @@ func TestCutoverNothingToDo(t *testing.T) {
 	}
 	if len(f.stopped) != 0 || f.polls != 0 {
 		t.Fatalf("тронуты процессы: %v", f.stopped)
+	}
+}
+
+// Выгрузке для отката мешает любой процесс установки, кроме прослоек агентов
+// и самого tg rollback.
+func TestRollbackBlockers(t *testing.T) {
+	got := rollbackBlockers([]procs.Proc{proc(1, "mcp"), proc(2, "rollback"), proc(3, "serve"), proc(4, "tool-call", "tg_read_chat")}, 2)
+	if len(got) != 2 || !strings.Contains(got[0], "3") || !strings.Contains(got[1], "4") {
+		t.Fatalf("мешают: %q", got)
 	}
 }

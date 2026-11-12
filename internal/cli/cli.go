@@ -102,6 +102,7 @@ func init() {
 		{name: "updates", help: "карточки обновлений MAX: что ждёт разбора, ack — разобрано (tg updates help)", run: cmdUpdates},
 		{name: "agents", help: "агенты из контейнеров: MCP по HTTP (--new-token — токен для .env)", run: cmdAgents},
 		{name: "gui", help: "окно управления: чаты, черновики, настройки", run: cmdGUI},
+		{name: "rollback", help: "откат на сборку до state.db: выгрузить состояние в её файлы (службы и окно — остановить)", run: cmdRollback},
 		{name: "cutover", help: "после обновления: дождаться процессов прежней сборки, чтобы перенести её состояние (зовёт scripts\\build.ps1)", run: cmdCutover},
 		// служебные: их запускает сама программа
 		{name: "tool-list", run: cmdToolList},

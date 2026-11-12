@@ -105,6 +105,11 @@ func (c cutover) run(ctx context.Context) error {
 		}
 	}
 	if len(todo) == 0 {
+		for _, d := range c.dirs {
+			if err := store.ClearRollback(d); err != nil {
+				return fmt.Errorf("%s: отметка отката: %w", d, err)
+			}
+		}
 		fmt.Fprintln(c.out, "Состояние уже в state.db — переносить нечего.")
 		return nil
 	}
@@ -159,6 +164,11 @@ func (c cutover) run(ctx context.Context) error {
 			"\nОстанови их и повтори tg cutover — до тех пор старые файлы не переносятся")
 	}
 	for _, d := range todo {
+		// после tg rollback: старой сборки больше нет — её файлы снова в базу,
+		// и эта сборка снова отправляет
+		if err := store.ClearRollback(d); err != nil {
+			return fmt.Errorf("%s: отметка отката: %w", d, err)
+		}
 		if err := store.MarkCutover(d, config.Build); err != nil {
 			return fmt.Errorf("%s: отметка обновления: %w", d, err)
 		}

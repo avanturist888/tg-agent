@@ -1373,19 +1373,23 @@ func finishUnsaved(ctx context.Context, s *config.Settings) {
 			_ = os.Remove(unsavedPath(s, id))
 			continue
 		}
-		if err == nil && d.Status == outbox.Approved {
-			var done *outbox.Draft
-			if done, err = box.MarkSent(id, v.MessageID, v.At); err != nil {
+		if err != nil {
+			continue
+		}
+		// квитанция главнее статуса: ушедшее, пока отметка не ложилась,
+		// могло успеть протухнуть (TTL идёт и у approved) — оно всё равно
+		// отправлено. Файл снимается, только когда отметка с message_id легла
+		if d.Status != outbox.Sent || d.MessageID == nil {
+			done, err := box.MarkSent(id, v.MessageID, v.At)
+			if err != nil {
 				continue
 			}
-			_ = audit.Log(s.AuditPath(), "mark_sent_recovered", "draft_id", id, "message_id", v.MessageID)
+			_ = audit.Log(s.AuditPath(), "mark_sent_recovered", "draft_id", id, "message_id", v.MessageID, "was", d.Status)
 			if s.BotReady() {
 				card(ctx, s, done.BotMessageID, done, sentSummary(s, done, v.MessageID))
 			}
 		}
-		if err == nil {
-			_ = os.Remove(unsavedPath(s, id))
-		}
+		_ = os.Remove(unsavedPath(s, id))
 	}
 }
 

@@ -4,9 +4,10 @@ package store
 //
 // Open (и служба по расписанию — ImportLegacy) ищет в data/ старые файлы,
 // переносит каждый в базу одной транзакцией, отмечает в legacy_imports и
-// откладывает рядом как <файл>.migrated — не удаляет: откат на старую
-// сборку — переименовать обратно. Так обновление у пользователя проходит
-// само: служба после перезапуска открывает базу, и всё на месте.
+// откладывает рядом как <файл>.migrated — не удаляет (откат на старую
+// сборку — tg rollback, rollback.go: снимки устарели, очередь выгружается
+// из базы). Так обновление у пользователя проходит само: служба после
+// перезапуска открывает базу, и всё на месте.
 //
 // Переносить можно, только когда старая сборка больше ничего не пишет и не
 // отправляет: её процессы (служба, окно, tg tool-call без службы, send-due)
@@ -107,6 +108,9 @@ func LegacyPresent(dir string) []string {
 // waitingCutover — почему перенос ждёт ("" — не ждёт).
 const waitingCutover = "старая сборка могла ещё работать — перенос ждёт tg cutover (его делает scripts\\build.ps1)"
 
+// waitingRollback — почему перенос ждёт после tg rollback.
+const waitingRollback = "состояние выгружено для отката на старую сборку (tg rollback) — перенос ждёт обновления (tg cutover из scripts\\build.ps1)"
+
 // RegisterLegacy — перенос файла, формат которого знает другой пакет
 // (например, где по пути нужен диспетчер учётных данных). Вызывать из init.
 func RegisterLegacy(l Legacy) {
@@ -134,6 +138,14 @@ func (db *DB) ImportLegacy() error {
 		db.setBlocked("")
 		consumeCutover(db.Dir)
 		return nil // переносить нечего — лок не нужен
+	}
+	if RolledBack(db.Dir) {
+		// состояние выгружено для старой сборки: её файлы — снова её
+		db.pending.Store(true)
+		if db.setBlocked(waitingRollback) {
+			db.auditLog("legacy_import_waiting", "files", strings.Join(present, ", "), "reason", waitingRollback)
+		}
+		return nil
 	}
 	if RequireCutover {
 		if _, err := os.Stat(filepath.Join(db.Dir, CutoverFile)); err != nil {

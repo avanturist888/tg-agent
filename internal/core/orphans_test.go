@@ -686,3 +686,33 @@ func TestCardUnsavedSent(t *testing.T) {
 		t.Fatalf("показано: %q", shown)
 	}
 }
+
+// Квитанция sent-unsaved главнее срока: ушедшее, пока отметка не ложилась,
+// успело протухнуть — уборка всё равно отмечает его отправленным и только
+// потом снимает квитанцию.
+func TestUnsavedSentAfterExpiry(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	db, err := stateDB(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Q().Exec(`UPDATE drafts SET expires = 1, body = json_set(body, '$.expires_at', '2000-01-01T00:00:00Z') WHERE id = ?`, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUnsaved(s, d.ID, 77, "2026-11-12T10:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if pre, err := box.Get(d.ID); err != nil || pre.Status != outbox.Expired {
+		t.Fatalf("черновик не протух: %v", err)
+	}
+	finishUnsaved(context.Background(), s)
+	got, err := box.Get(d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := unsavedSent(s, d.ID); ok || got.Status != outbox.Sent || got.MessageID == nil || *got.MessageID != 77 {
+		t.Fatalf("протухшее ушедшее: %s, квитанция осталась %v", got.Status, ok)
+	}
+}
