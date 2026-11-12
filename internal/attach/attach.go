@@ -6,6 +6,7 @@
 package attach
 
 import (
+	"errors"
 	"fmt"
 	"image"
 	_ "image/jpeg"
@@ -113,11 +114,7 @@ func Snapshot(s *config.Settings, draftID string, paths []string, asFiles bool) 
 		return nil, &Bad{"Не больше 10 файлов в одном сообщении (так группирует Telegram)."}
 	}
 	limit := int64(s.MaxFileMB) * 1024 * 1024
-	type checked struct {
-		path string
-		size int64
-	}
-	var ok []checked
+	var ok []checkedFile
 	for _, raw := range paths {
 		abs, err := filepath.Abs(expandHome(raw))
 		if err == nil {
@@ -138,10 +135,39 @@ func Snapshot(s *config.Settings, draftID string, paths []string, asFiles bool) 
 		if st.Size() > limit {
 			return nil, &Bad{fmt.Sprintf("%s: %d МБ, предел %d МБ.", filepath.Base(abs), st.Size()/(1024*1024), s.MaxFileMB)}
 		}
-		ok = append(ok, checked{abs, st.Size()})
+		ok = append(ok, checkedFile{abs, st.Size()})
 	}
 
+	// каталог снимков — на черновик, и создаётся исключительно: он же
+	// закрепляет id за этим вызовом (у параллельного с тем же id — ErrTaken),
+	// и чистить его вправе только создавший
+	if err := os.MkdirAll(s.OutboxFilesDir(), 0o700); err != nil {
+		return nil, err
+	}
 	target := filepath.Join(s.OutboxFilesDir(), draftID)
+	if err := os.Mkdir(target, 0o700); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, ErrTaken
+		}
+		return nil, err
+	}
+	result, err := snapshotInto(target, ok, asFiles)
+	if err != nil {
+		_ = os.RemoveAll(target)
+		return nil, err
+	}
+	return result, nil
+}
+
+// ErrTaken — под этим id уже лежат снимки другого черновика: нужен другой id.
+var ErrTaken = errors.New("attach: id черновика уже занят")
+
+type checkedFile struct {
+	path string
+	size int64
+}
+
+func snapshotInto(target string, ok []checkedFile, asFiles bool) ([]outbox.FileSnap, error) {
 	var result []outbox.FileSnap
 	for i, c := range ok {
 		// своя подпапка на файл: имя остаётся исходным — Telegram берёт его

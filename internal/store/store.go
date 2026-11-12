@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,8 +45,9 @@ const busyTimeout = 15 * time.Second
 
 // DB — база одного профиля.
 type DB struct {
-	Dir string // data/ профиля
-	sql *sql.DB
+	Dir     string // data/ профиля
+	sql     *sql.DB
+	pending atomic.Bool // перенос старых файлов отложен (LegacyPending)
 }
 
 var (

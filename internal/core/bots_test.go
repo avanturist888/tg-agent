@@ -111,6 +111,11 @@ func TestVaultKeepsTokensOutOfFile(t *testing.T) {
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
 		t.Fatalf("старый файл с токеном не отложен: %v", err)
 	}
+	// и в отложенной копии токена нет: он уже в диспетчере
+	if raw, err := os.ReadFile(legacy + ".migrated"); err != nil || strings.Contains(string(raw), "AAH") ||
+		!strings.Contains(string(raw), "old_bot") {
+		t.Fatalf("отложенная копия: %v %s", err, raw)
+	}
 }
 
 func TestRunBotOpRevoke(t *testing.T) {

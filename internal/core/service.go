@@ -913,28 +913,45 @@ func DraftMessage(ctx context.Context, s *config.Settings, chat, text string, re
 			return nil, err
 		}
 	}
-	id, err := outbox.New(s.DataDir()).FreshID() // до вложений: их снимок лежит под id черновика
-	if err != nil {
-		return nil, err
-	}
-	var snaps []outbox.FileSnap
-	if len(files) > 0 {
-		snaps, err = attach.Snapshot(s, id, files, asFiles)
+	box := outbox.New(s.DataDir())
+	auto := rule.AutoSend()
+	var (
+		d     *outbox.Draft
+		snaps []outbox.FileSnap
+	)
+	// id нужен до вложений: их снимок лежит под ним. Занят (параллельный
+	// вызов взял тот же) — берём другой; чистит снимки только их хозяин.
+	for attempt := 0; ; attempt++ {
+		id, err := box.FreshID()
 		if err != nil {
 			return nil, err
 		}
-	}
-	opts := outbox.CreateOpts{ID: id, Chat: rule.Alias, Text: text, ReplyTo: replyTo, TTLMin: s.DraftTTLMin,
-		Note: note, Fmt: format, Files: snaps, Origin: draftOrigin(s), Topic: topic, TopicTitle: topicName}
-	auto := rule.AutoSend()
-	if auto {
-		at := time.Now().Add(time.Duration(s.AutoSendDelaySec) * time.Second)
-		opts.SendAt = &at
-	}
-	d, err := outbox.New(s.DataDir()).Create(opts)
-	if err != nil {
-		attach.Drop(s, id)
-		return nil, err
+		snaps = nil
+		if len(files) > 0 {
+			snaps, err = attach.Snapshot(s, id, files, asFiles)
+			if errors.Is(err, attach.ErrTaken) && attempt < 5 {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+		opts := outbox.CreateOpts{ID: id, Chat: rule.Alias, Text: text, ReplyTo: replyTo, TTLMin: s.DraftTTLMin,
+			Note: note, Fmt: format, Files: snaps, Origin: draftOrigin(s), Topic: topic, TopicTitle: topicName}
+		if auto {
+			at := time.Now().Add(time.Duration(s.AutoSendDelaySec) * time.Second)
+			opts.SendAt = &at
+		}
+		d, err = box.Create(opts)
+		if err == nil {
+			break
+		}
+		if len(snaps) > 0 {
+			attach.Drop(s, id) // снимки этого вызова: каталог создал он сам
+		}
+		if !errors.Is(err, outbox.ErrDuplicateID) || attempt >= 5 {
+			return nil, err
+		}
 	}
 	fileLog := make([]*omap.Map, 0, len(snaps))
 	for _, f := range snaps {

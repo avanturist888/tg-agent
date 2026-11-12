@@ -319,18 +319,7 @@ func RequestAccess(ctx context.Context, s *config.Settings, chatID int64, read, 
 	if existing != nil {
 		req.Alias = existing.Alias
 	}
-	card, err := sendAccessCard(ctx, s, req, existing)
-	if err != nil {
-		return nil, fmt.Errorf("карточка в бот не ушла: %w", err)
-	}
-	req.CardID = card
-	if err := editAccess(s, func(m map[string]*accessRequest) bool {
-		for m[req.ID] != nil { // id случайный: совпадение не должно затереть чужой запрос
-			req.ID = outbox.NewID()
-		}
-		m[req.ID] = req
-		return true
-	}); err != nil {
+	if err := publishAccess(ctx, s, req, existing); err != nil {
 		return nil, err
 	}
 	logEvent(s, "access_requested", "request_id", req.ID, "chat_id", chatID, "title", info.Title,
@@ -394,6 +383,34 @@ func accessKeyboard(s *config.Settings, r *accessRequest) map[string]any {
 	}
 	rows = append(rows, []map[string]string{{"text": "✋ Отказать", "callback_data": p + "no"}})
 	return map[string]any{"inline_keyboard": rows}
+}
+
+// publishAccess — записать запрос и отправить владельцу карточку. Id
+// запроса закрепляется в базе до карточки: он уходит в её кнопки, и
+// совпадение со старым запросом после этого направило бы нажатие не туда.
+func publishAccess(ctx context.Context, s *config.Settings, req *accessRequest, existing *config.ChatRule) error {
+	if err := editAccess(s, func(m map[string]*accessRequest) bool {
+		for m[req.ID] != nil { // id случайный: не занять чужой
+			req.ID = outbox.NewID()
+		}
+		m[req.ID] = req
+		return true
+	}); err != nil {
+		return err
+	}
+	card, err := sendAccessCard(ctx, s, req, existing)
+	if err != nil {
+		_ = editAccess(s, func(m map[string]*accessRequest) bool { delete(m, req.ID); return true })
+		return fmt.Errorf("карточка в бот не ушла: %w", err)
+	}
+	req.CardID = card
+	return editAccess(s, func(m map[string]*accessRequest) bool {
+		if r := m[req.ID]; r != nil {
+			r.CardID = card
+			return true
+		}
+		return false
+	})
 }
 
 func sendAccessCard(ctx context.Context, s *config.Settings, r *accessRequest, existing *config.ChatRule) (int64, error) {

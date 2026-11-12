@@ -1,6 +1,7 @@
 package attach
 
 import (
+	"errors"
 	"image"
 	"image/png"
 	"os"
@@ -72,6 +73,14 @@ func TestSnapshotKinds(t *testing.T) {
 	}
 	if snaps[0].Kind != outbox.KindPhoto || snaps[1].Kind != "" {
 		t.Fatalf("картинка — фото, pdf — документ: %+v", snaps)
+	}
+	// тот же id у параллельного вызова — не его каталог: ErrTaken, а
+	// снимки первого целы
+	if _, err := Snapshot(s, "d1", []string{pdf}, false); !errors.Is(err, ErrTaken) {
+		t.Fatalf("занятый id: %v", err)
+	}
+	if _, err := os.Stat(snaps[0].Path); err != nil {
+		t.Fatal("снимки первого пропали:", err)
 	}
 	snaps, err = Snapshot(s, "d2", []string{img}, true)
 	if err != nil {

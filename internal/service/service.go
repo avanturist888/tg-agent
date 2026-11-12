@@ -77,9 +77,14 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 	go func() {
 		defer func() { done <- struct{}{} }()
 		// старая сборка, ещё живая после обновления (открытое окно управления),
-		// может снова записать JSON-файл — влить и его
+		// может снова записать JSON-файл — влить и его. Отложенный перенос
+		// (старая сборка держит файл или ещё отправляет черновик) — скоро снова
 		for ctx.Err() == nil {
-			sleep(ctx, legacySweepEvery)
+			wait := legacySweepEvery
+			if db.LegacyPending() {
+				wait = legacyRetryEvery
+			}
+			sleep(ctx, wait)
 			if err := db.ImportLegacy(); err != nil {
 				_ = audit.Log(s.AuditPath(), "legacy_import_failed", "error", err.Error())
 			}
@@ -136,6 +141,9 @@ var repairOnce sync.Once
 
 // legacySweepEvery — как часто служба ищет старые JSON-файлы в data/.
 const legacySweepEvery = 10 * time.Minute
+
+// legacyRetryEvery — как скоро повторить отложенный перенос.
+const legacyRetryEvery = 5 * time.Second
 
 func reconcile(ctx context.Context, loader func() (*config.Settings, error)) {
 	s, err := loader()

@@ -38,11 +38,15 @@ import (
 type Legacy struct {
 	File string // путь относительно data/
 	Dir  bool   // каталог (ленты)
+	// Locked — старая сборка меняла файл под его локом (<файл>.lock):
+	// перенос берёт тот же лок, и старый процесс не перепишет файл между
+	// чтением и тем, как его отложат.
+	Locked bool
 	// Import переносит содержимое (path — полный путь) и возвращает,
-	// сколько записей нашлось. Только INSERT OR IGNORE: база главнее.
+	// сколько записей нашлось. Только добавлять: база главнее.
 	// ErrCorrupt (обёрнутая) — файл испорчен: его откладывают как .broken.
-	// ErrRetry — перенести пока нельзя (например, не записался секрет):
-	// файл остаётся на месте, попытка — при следующем ImportLegacy.
+	// ErrRetry — перенести пока нельзя (не записался секрет, старая сборка
+	// ещё отправляет черновик): файл остаётся на месте, попытка — скоро снова.
 	Import func(ctx context.Context, tx *sql.Tx, path string) (int, error)
 }
 
@@ -51,6 +55,10 @@ var ErrCorrupt = errors.New("файл испорчен")
 
 // ErrRetry — перенос отложен.
 var ErrRetry = errors.New("перенос отложен")
+
+// legacyLockWait — сколько ждать лок старого файла у старой сборки (её
+// операции с очередью короткие) и лок переноса у соседнего процесса.
+const legacyLockWait = 3 * time.Second
 
 var (
 	legacyMu sync.Mutex
@@ -72,32 +80,83 @@ func legacyList() []Legacy {
 }
 
 // ImportLegacy — перенести старые файлы, которые есть в data/. Ошибка —
-// только у самой базы; испорченный файл откладывается и не мешает остальным.
+// только у самой базы; испорченный файл откладывается и не мешает
+// остальным. Переносы всех процессов идут по одному (лок legacy-import):
+// иначе один отложил бы файл, пока второй его читает.
 func (db *DB) ImportLegacy() error {
 	ctx := context.Background()
-	for _, l := range legacyList() {
-		if err := db.importOne(ctx, l); err != nil {
-			return fmt.Errorf("%s: %w", l.File, err)
+	list := legacyList()
+	present := false
+	for _, l := range list {
+		if _, err := os.Stat(filepath.Join(db.Dir, filepath.FromSlash(l.File))); err == nil {
+			present = true
+			break
 		}
 	}
-	return nil
+	if !present {
+		db.pending.Store(false)
+		return nil // переносить нечего — лок не нужен
+	}
+	pending := false
+	err := lock.With(ctx, filepath.Join(db.Dir, "legacy-import"), legacyLockWait, func() error {
+		for _, l := range list {
+			deferred, err := db.importOne(ctx, l)
+			if err != nil {
+				return fmt.Errorf("%s: %w", l.File, err)
+			}
+			pending = pending || deferred
+		}
+		return nil
+	})
+	if lock.IsBusy(err) {
+		// переносит другой процесс; это не сбой базы — посмотрим снова
+		db.pending.Store(true)
+		return nil
+	}
+	db.pending.Store(pending)
+	return err
 }
+
+// LegacyPending — что-то отложено (ErrRetry, занятый лок): службе стоит
+// заглянуть скоро, а не через обычный интервал.
+func (db *DB) LegacyPending() bool { return db.pending.Load() }
 
 func (db *DB) auditLog(action string, kv ...any) {
 	_ = audit.Log(filepath.Join(db.Dir, "audit.jsonl"), action, kv...)
 }
 
-func (db *DB) importOne(ctx context.Context, l Legacy) error {
+// importOne — перенести один файл; true — отложено, попробовать снова.
+func (db *DB) importOne(ctx context.Context, l Legacy) (bool, error) {
 	path := filepath.Join(db.Dir, filepath.FromSlash(l.File))
-	st, err := os.Stat(path)
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if !l.Locked {
+		return db.importFile(ctx, l, path)
+	}
+	var deferred bool
+	err := lock.With(ctx, path, legacyLockWait, func() error {
+		var err error
+		deferred, err = db.importFile(ctx, l, path)
+		return err
+	})
+	if lock.IsBusy(err) {
+		db.auditLog("legacy_import_deferred", "file", l.File, "error", "файл держит старая сборка")
+		return true, nil
+	}
+	return deferred, err
+}
+
+func (db *DB) importFile(ctx context.Context, l Legacy, path string) (bool, error) {
+	st, err := os.Stat(path) // заново: пока ждали лок, файл могли отложить
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if st.IsDir() != l.Dir {
-		return nil
+		return false, nil
 	}
 	size, mtime := st.Size(), st.ModTime().UnixNano()
 	if l.Dir {
@@ -108,6 +167,7 @@ func (db *DB) importOne(ctx context.Context, l Legacy) error {
 		again     bool
 		corrupt   error
 		deferred  error
+		vanished  bool
 		skipWrite bool
 	)
 	err = db.Write(ctx, func(tx *sql.Tx) error {
@@ -124,15 +184,17 @@ func (db *DB) importOne(ctx context.Context, l Legacy) error {
 			return e
 		}
 		n, e := l.Import(ctx, tx, path)
-		if errors.Is(e, ErrCorrupt) {
+		switch {
+		case errors.Is(e, ErrCorrupt):
 			corrupt = e
 			return nil
-		}
-		if errors.Is(e, ErrRetry) {
+		case errors.Is(e, ErrRetry):
 			deferred = e
 			return e // откатить всё, что успели
-		}
-		if e != nil {
+		case errors.Is(e, os.ErrNotExist):
+			vanished = true // файл отложил процесс без нашего лока
+			return e
+		case e != nil:
 			return e
 		}
 		rows = n
@@ -141,38 +203,36 @@ func (db *DB) importOne(ctx context.Context, l Legacy) error {
 			l.File, time.Now().Unix(), size, mtime, n)
 		return e
 	})
-	if deferred != nil {
+	switch {
+	case deferred != nil:
 		db.auditLog("legacy_import_deferred", "file", l.File, "error", deferred.Error())
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if corrupt != nil {
+		return true, nil
+	case vanished:
+		return false, nil
+	case err != nil:
+		return false, err
+	case corrupt != nil:
 		moved, qerr := fsx.Quarantine(path)
 		db.auditLog("legacy_import_failed", "file", l.File, "error", corrupt.Error(), "moved_to", moved,
 			"move_error", errString(qerr))
-		return nil
+		return false, nil
 	}
 	moved := movedName(path)
 	if err := os.Rename(path, moved); err != nil {
 		// файл держит другой процесс — перенос уже в базе, отложим в следующий раз
 		db.auditLog("legacy_move_failed", "file", l.File, "error", err.Error())
-		return nil
+		return true, nil
 	}
 	_, _ = db.sql.ExecContext(ctx, "UPDATE legacy_imports SET moved_to = ? WHERE file = ?", filepath.Base(moved), l.File)
-	if !l.Dir && !lock.Held(path) {
-		_ = os.Remove(path + ".lock") // лок старого файла больше никому не нужен
-	}
 	if skipWrite {
-		return nil
+		return false, nil
 	}
 	action := "legacy_imported"
 	if again {
 		action = "legacy_reappeared" // старая сборка ещё пишет файл
 	}
 	db.auditLog(action, "file", l.File, "rows", rows, "moved_to", filepath.Base(moved))
-	return nil
+	return false, nil
 }
 
 func errString(err error) string {
@@ -265,9 +325,49 @@ func kvFile(file, key string) Legacy {
 }
 
 func docFile(file, table string) Legacy {
-	return Legacy{File: file, Import: func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+	return Legacy{File: file, Import: docImport(table)}
+}
+
+func docImport(table string) func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+	return func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 		return insertDocs(ctx, tx, table, path)
+	}
+}
+
+// TypedDocs — перенос map[ключ]V через тип V (его MarshalJSON): для
+// записей, которые на диске должны лежать иначе, чем в старом файле
+// (например, с зашифрованным токеном). Регистрирует пакет, знающий V.
+func TypedDocs[V any](file, table string, locked bool) Legacy {
+	tab := NewTable[V](table)
+	return Legacy{File: file, Locked: locked, Import: func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+		var m map[string]V
+		if ok, err := readJSON(path, &m); !ok {
+			return 0, err
+		}
+		for k, v := range m {
+			if _, err := tab.Insert(ctx, tx, k, v); err != nil {
+				return 0, err
+			}
+		}
+		return len(m), nil
 	}}
+}
+
+// liveSenders — черновики, которые старая сборка держит в отправке прямо
+// сейчас (её лок в data/sending жив); "" — таких нет.
+func liveSenders(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var ids []string
+	for _, e := range entries {
+		id, ok := strings.CutSuffix(e.Name(), ".lock")
+		if ok && lock.Held(filepath.Join(dir, id)) {
+			ids = append(ids, id)
+		}
+	}
+	return strings.Join(ids, ", ")
 }
 
 func unixOf(s string) int64 {
@@ -279,32 +379,46 @@ func unixOf(s string) int64 {
 }
 
 var builtinLegacy = []Legacy{
-	{File: "outbox.json", Import: importOutbox},
+	{File: "outbox.json", Locked: true, Import: importOutbox},
 	{File: "feeds", Dir: true, Import: importFeeds},
-	{File: "transcripts.json", Import: importTranscripts},
-	{File: "peers.json", Import: importPeers},
+	{File: "transcripts.json", Locked: true, Import: importTranscripts},
+	{File: "peers.json", Locked: true, Import: importPeers},
 	{File: "edit_dates.json", Import: importEditDates},
 	{File: "updates_state.json", Import: importUpdates},
 	{File: "routes.json", Import: importRoutes},
 	{File: "chat_sets.json", Import: importSets},
-	{File: "agent_folders.json", Import: importAgentFolders},
-	docFile("subscriptions.json", TSubscriptions),
-	docFile("access_requests.json", TAccessRequests),
+	{File: "agent_folders.json", Locked: true, Import: importAgentFolders},
 	docFile("bot_ops.json", TBotOps),
 	docFile("pinned_drafts.json", TPinnedDrafts),
-	docFile("t3-threads.json", TT3Threads),
+	{File: "t3-threads.json", Locked: true, Import: docImport(TT3Threads)},
 	docFile("upstream_cards.json", TUpstreamCards),
-	docFile("account_notes.json", TAccountNotes),
+	{File: "account_notes.json", Locked: true, Import: docImport(TAccountNotes)},
 	{File: "upstream.json", Import: importUpstream},
 	kvFile("bot_offset.json", KeyBotOffset),
 	kvFile("upstream_thread.json", KeyUpstreamThread),
 	kvFile("account.json", KeyAccount),
-	{File: "sending", Dir: true, Import: func(context.Context, *sql.Tx, string) (int, error) {
-		return 0, nil // локи отправки до переезда: захват теперь в drafts
+	// локи отправки до переезда: захват теперь в drafts. Живых здесь уже
+	// нет — пока они были, importOutbox откладывал перенос очереди
+	{File: "sending", Dir: true, Import: func(ctx context.Context, tx *sql.Tx, dir string) (int, error) {
+		if who := liveSenders(dir); who != "" {
+			return 0, fmt.Errorf("%w: старая сборка ещё отправляет черновик %s", ErrRetry, who)
+		}
+		return 0, nil
 	}},
 }
 
+// draftFinal — решённый черновик: дальше его статус не меняется.
+func draftFinal(status string) bool {
+	return status == "sent" || status == "cancelled" || status == "expired"
+}
+
 func importOutbox(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+	// черновик, который старая сборка сейчас отправляет, перенести нельзя:
+	// в базе у него не было бы отметки захвата, и новая служба отправила бы
+	// его второй раз — ждём, пока старая закончит (её итог будет в файле)
+	if who := liveSenders(filepath.Join(filepath.Dir(path), "sending")); who != "" {
+		return 0, fmt.Errorf("%w: старая сборка ещё отправляет черновик %s", ErrRetry, who)
+	}
 	var drafts []json.RawMessage
 	if ok, err := readJSON(path, &drafts); !ok {
 		return 0, err
@@ -326,9 +440,24 @@ func importOutbox(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 		if d.SendAt != nil {
 			sendAt = unixOf(*d.SendAt)
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO drafts(id, status, expires, send_at, body) VALUES(?, ?, ?, ?, ?)",
-			d.ID, d.Status, unixOf(d.ExpiresAt), sendAt, compact(raw)); err != nil {
+		var cur string
+		err := tx.QueryRowContext(ctx, "SELECT status FROM drafts WHERE id = ?", d.ID).Scan(&cur)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err := tx.ExecContext(ctx, "INSERT INTO drafts(id, status, expires, send_at, body) VALUES(?, ?, ?, ?, ?)",
+				d.ID, d.Status, unixOf(d.ExpiresAt), sendAt, compact(raw)); err != nil {
+				return 0, err
+			}
+		case err != nil:
 			return 0, err
+		case draftFinal(d.Status) && !draftFinal(cur):
+			// файл снова записала старая сборка, и черновик в нём уже решён
+			// (отправлен, отменён): итог главнее — иначе база отправила бы
+			// его ещё раз или отправила отменённое
+			if _, err := tx.ExecContext(ctx, "UPDATE drafts SET status = ?, expires = ?, send_at = NULL, body = ? WHERE id = ?",
+				d.Status, unixOf(d.ExpiresAt), compact(raw), d.ID); err != nil {
+				return 0, err
+			}
 		}
 	}
 	return len(drafts), nil

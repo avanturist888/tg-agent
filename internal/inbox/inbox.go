@@ -22,6 +22,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"tgagent/internal/dpapi"
 )
 
 // ErrNoSocket — у сессии нет входящего канала (тред Codex).
@@ -36,6 +38,41 @@ type Addr struct {
 	// один общий процесс на все треды, переменных сессии у его MCP нет), а
 	// Session — номер его треда из _meta вызова; будят его только через T3.
 	Kind string `json:"kind,omitempty"`
+}
+
+// addrJSON — Addr на диске и в трубе службы.
+type addrJSON struct {
+	Session string `json:"session,omitempty"`
+	Socket  string `json:"socket"`
+	Token   string `json:"token"`
+	Kind    string `json:"kind,omitempty"`
+}
+
+// MarshalJSON — токен канала (им можно писать в живую сессию) только
+// зашифрованным DPAPI: подписки и запросы доступа лежат в data/state.db, а
+// в ней секретов нет. Не зашифровался — без токена: разбудить такую сессию
+// можно будет только через T3, а не через её канал.
+func (a Addr) MarshalJSON() ([]byte, error) {
+	tok, err := dpapi.Seal(a.Token)
+	if err != nil {
+		tok = ""
+	}
+	return json.Marshal(addrJSON{Session: a.Session, Socket: a.Socket, Token: tok, Kind: a.Kind})
+}
+
+// UnmarshalJSON принимает и зашифрованный токен, и открытый (запись до
+// шифрования, прослойка старой сборки).
+func (a *Addr) UnmarshalJSON(b []byte) error {
+	var j addrJSON
+	if err := json.Unmarshal(b, &j); err != nil {
+		return err
+	}
+	tok, err := dpapi.Open(j.Token)
+	if err != nil {
+		tok = "" // зашифровано не нами (другой пользователь или компьютер)
+	}
+	*a = Addr{Session: j.Session, Socket: j.Socket, Token: tok, Kind: j.Kind}
+	return nil
 }
 
 // Codex — тред Codex: будить только через T3 Code.

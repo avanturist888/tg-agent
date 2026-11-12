@@ -109,18 +109,7 @@ func submitSetRequest(ctx context.Context, s *config.Settings, req *accessReques
 				"Такой запрос уже ждёт владельца. Дождись: tg_wait_access(request_id)."), nil
 		}
 	}
-	card, err := sendAccessCard(ctx, s, req, nil)
-	if err != nil {
-		return nil, fmt.Errorf("карточка в бот не ушла: %w", err)
-	}
-	req.CardID = card
-	if err := editAccess(s, func(m map[string]*accessRequest) bool {
-		for m[req.ID] != nil { // id случайный: совпадение не должно затереть чужой запрос
-			req.ID = outbox.NewID()
-		}
-		m[req.ID] = req
-		return true
-	}); err != nil {
+	if err := publishAccess(ctx, s, req, nil); err != nil {
 		return nil, err
 	}
 	logEvent(s, "access_requested", "request_id", req.ID, "scope", req.Scope, "folder", req.Folder, "title", req.Title,

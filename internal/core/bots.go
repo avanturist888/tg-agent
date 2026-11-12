@@ -389,6 +389,7 @@ func importVault(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return 0, fmt.Errorf("%w: %v", store.ErrCorrupt, err)
 	}
+	moved := false
 	for key, e := range m {
 		if e == nil {
 			continue
@@ -397,10 +398,21 @@ func importVault(ctx context.Context, tx *sql.Tx, path string) (int, error) {
 			if err := credSet(botCredTarget(key), e.Token); err != nil {
 				return 0, fmt.Errorf("%w: токен @%s не записался в диспетчер: %v", store.ErrRetry, key, err)
 			}
-			e.Token = ""
+			e.Token, moved = "", true
 		}
 		if _, err := botsTab.Insert(ctx, tx, key, e); err != nil {
 			return 0, err
+		}
+	}
+	if moved {
+		// файл отложат как .migrated — токенов в нём оставаться не должно:
+		// все уже в диспетчере
+		clean, err := json.MarshalIndent(m, "", "  ")
+		if err != nil {
+			return 0, err
+		}
+		if err := fsx.WriteFile(path, clean, 0o600); err != nil {
+			return 0, fmt.Errorf("%w: не вычистить токены из %s: %v", store.ErrRetry, filepath.Base(path), err)
 		}
 	}
 	return len(m), nil

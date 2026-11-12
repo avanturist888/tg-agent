@@ -202,7 +202,7 @@ func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
 				break
 			}
 			if !generated {
-				return &BadState{fmt.Sprintf("Черновик %s уже есть", d.ID)}
+				return fmt.Errorf("%w: %s", ErrDuplicateID, d.ID)
 			}
 			d.ID = NewID()
 		}
@@ -378,6 +378,9 @@ func (o *Outbox) NextDue() (*time.Time, error) {
 // держит; проверка и отметка — одной транзакцией, поэтому взять его может
 // только один путь любого процесса. Отметка умершего процесса (pid мёртв
 // или занят процессом, запущенным позже захвата) — не держит.
+
+// ErrDuplicateID — заданный id черновика уже занят.
+var ErrDuplicateID = errors.New("черновик с таким id уже есть")
 
 // ErrSending — черновик уже отправляет другой путь (этот или другой процесс).
 var ErrSending = errors.New("черновик уже отправляется")

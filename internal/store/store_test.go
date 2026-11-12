@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"tgagent/internal/lock"
 )
 
 func openTemp(t *testing.T) *DB {
@@ -149,7 +151,7 @@ func TestLegacyImport(t *testing.T) {
 	]`)
 	write(t, filepath.Join(dir, "feeds", "saved.ids"), "5\n7\n\x00\x00")
 	write(t, filepath.Join(dir, "transcripts.json"), `{"c:1": "привет", "c:2": {"text": "т", "engine": "gigaam", "language": "ru"}}`)
-	write(t, filepath.Join(dir, "subscriptions.json"), `{"s1": {"session": "x", "chats": {"saved": 5}}}`)
+	write(t, filepath.Join(dir, "upstream_cards.json"), `{"s1": {"id": 5, "text": "x"}}`)
 	write(t, filepath.Join(dir, "bot_offset.json"), `{"offset": 12, "bot": "77"}`)
 	write(t, filepath.Join(dir, "chat_sets.json"), `{"updated": "2026-11-12T10:00:00Z", "sets": {"folder:1": {"members": []}}, "aliases": {"-100": "chan"}, "blocked": {"folder:1": [5, 6]}}`)
 	write(t, filepath.Join(dir, "routes.json"), `{"saved": {"5": {"chain": ["s1"], "pos": 0, "at": "2026-11-12T10:00:00Z"}}}`)
@@ -202,7 +204,7 @@ func TestLegacyImport(t *testing.T) {
 	if ok, err := GetKV(context.Background(), db.Q(), KeyBotOffset, &off); !ok || err != nil || off.Offset != 12 {
 		t.Fatal(ok, err, off)
 	}
-	for _, f := range []string{"outbox.json", "feeds", "transcripts.json", "subscriptions.json", "bot_offset.json"} {
+	for _, f := range []string{"outbox.json", "feeds", "transcripts.json", "upstream_cards.json", "bot_offset.json"} {
 		if _, err := os.Stat(filepath.Join(dir, f)); !os.IsNotExist(err) {
 			t.Errorf("%s not moved: %v", f, err)
 		}
@@ -221,17 +223,17 @@ func TestLegacyImport(t *testing.T) {
 func TestLegacyReappeared(t *testing.T) {
 	dir := t.TempDir()
 	t.Cleanup(closeAll)
-	write(t, filepath.Join(dir, "subscriptions.json"), `{"s1": {"n": 1}}`)
+	write(t, filepath.Join(dir, "upstream_cards.json"), `{"s1": {"n": 1}}`)
 	db, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tab := NewTable[*rec](TSubscriptions)
+	tab := NewTable[*rec](TUpstreamCards)
 	ctx := context.Background()
 	if err := tab.Put(ctx, db.Q(), "s1", &rec{N: 100}); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(dir, "subscriptions.json"), `{"s1": {"n": 1}, "s2": {"n": 2}}`)
+	write(t, filepath.Join(dir, "upstream_cards.json"), `{"s1": {"n": 1}, "s2": {"n": 2}}`)
 	if err := db.ImportLegacy(); err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +245,7 @@ func TestLegacyReappeared(t *testing.T) {
 	if !strings.Contains(string(audit), "legacy_reappeared") {
 		t.Fatalf("audit: %s", audit)
 	}
-	matches, _ := filepath.Glob(filepath.Join(dir, "subscriptions.json.migrated*"))
+	matches, _ := filepath.Glob(filepath.Join(dir, "upstream_cards.json.migrated*"))
 	if len(matches) != 2 {
 		t.Fatalf("moved copies: %v", matches)
 	}
@@ -295,5 +297,118 @@ func TestLegacyMoveRetry(t *testing.T) {
 	}
 	if _, err := os.Stat(path + ".migrated"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Старая сборка держит лок файла (пишет очередь): перенос не читает файл
+// под ней, а откладывается и проходит, как только лок свободен.
+func TestLegacyWaitsOldWriter(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	path := filepath.Join(dir, "outbox.json")
+	write(t, path, `[{"id": "a", "status": "pending"}]`)
+	old := lock.New(path, 0)
+	if err := old.Acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !db.LegacyPending() || count(t, db, "SELECT count(*) FROM drafts") != 0 {
+		t.Fatal("перенос не отложен, пока старая сборка держит файл")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("файл старой сборки тронут:", err)
+	}
+	old.Release()
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if db.LegacyPending() || count(t, db, "SELECT count(*) FROM drafts") != 1 {
+		t.Fatal("после лока не перенесено")
+	}
+}
+
+// Старая сборка ещё отправляет черновик (её лок в data/sending жив): очередь
+// не переносится — иначе новая служба отправила бы его второй раз.
+func TestLegacyWaitsOldSender(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "approved"}]`)
+	sending := filepath.Join(dir, "sending")
+	os.MkdirAll(sending, 0o700)
+	sender := lock.New(filepath.Join(sending, "a"), 0)
+	if err := sender.Acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count(t, db, "SELECT count(*) FROM drafts") != 0 || !db.LegacyPending() {
+		t.Fatal("очередь перенесена при живой старой отправке")
+	}
+	// старая сборка отправила и записала итог
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "sent", "message_id": 5}]`)
+	sender.Release()
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if count(t, db, "SELECT count(*) FROM drafts WHERE id = 'a' AND status = 'sent'") != 1 {
+		t.Fatal("итог старой отправки не перенесён")
+	}
+	if _, err := os.Stat(sending); !os.IsNotExist(err) {
+		t.Fatal("каталог старых локов не отложен")
+	}
+}
+
+// Файл снова записала старая сборка, и черновик в нём уже решён: итог
+// главнее нерешённого в базе (иначе — повторная отправка или отправка
+// отменённого); нерешённое в файле базу не откатывает.
+func TestLegacyFinalWins(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "scheduled", "send_at": "2099-01-01T00:00:00+00:00"},
+		{"id": "b", "status": "pending"}, {"id": "c", "status": "sent"}]`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "cancelled"},
+		{"id": "b", "status": "pending", "text": "старое"}, {"id": "c", "status": "pending"}]`)
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if count(t, db, "SELECT count(*) FROM drafts WHERE id = 'a' AND status = 'cancelled' AND send_at IS NULL") != 1 {
+		t.Fatal("отмена старой сборки не перенесена")
+	}
+	if count(t, db, "SELECT count(*) FROM drafts WHERE id = 'c' AND status = 'sent'") != 1 {
+		t.Fatal("решённое в базе откатилось")
+	}
+}
+
+// Два процесса открывают базу одновременно: перенос — один раз, оба без ошибки.
+func TestLegacyConcurrentOpen(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "pinned_drafts.json"), `{"a": 5}`)
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "a", "status": "pending"}]`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// «второй процесс» — та же процедура параллельно
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			if err := db.ImportLegacy(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	if count(t, db, "SELECT count(*) FROM drafts") != 1 || count(t, db, "SELECT count(*) FROM pinned_drafts") != 1 {
+		t.Fatal("перенос задвоен или потерян")
 	}
 }
