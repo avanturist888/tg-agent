@@ -77,7 +77,7 @@ func ListFolders(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 			item.Set("emoji", f.Emoticon)
 		}
 		if f.Shared {
-			item.Set("shared", true)
+			item.Set("shared", true).Set("shared_by_owner", f.MyInvites)
 		}
 		item.Set("pinned_and_included", len(f.Pinned)+len(f.Include))
 		if len(f.Exclude) > 0 {
@@ -182,7 +182,8 @@ func FolderChats(ctx context.Context, s *config.Settings, folder string) (*omap.
 
 type accessRequest struct {
 	ID string `json:"id"`
-	// Scope — о чём просят: "" — один чат, иначе scopeFolder, scopePublic, scopeManage
+	// Scope — о чём просят: "" — один чат, иначе scopeFolder, scopePublic,
+	// scopeManage или scopeLeave (покинуть чужую папку-ссылку)
 	Scope    string      `json:"scope,omitempty"`
 	Folder   string      `json:"folder,omitempty"` // id папки (scopeFolder)
 	Count    int         `json:"count,omitempty"`  // сколько чатов в группе на момент запроса
@@ -370,7 +371,7 @@ func accessCardMarkdown(r *accessRequest, existing *config.ChatRule, status stri
 func accessKeyboard(s *config.Settings, r *accessRequest) map[string]any {
 	p := s.CallbackPrefix() + "a:" + r.ID + ":"
 	var rows [][]map[string]string
-	if r.Scope == scopePublic || r.Scope == scopeManage {
+	if r.Scope == scopePublic || r.Scope == scopeManage || r.Scope == scopeLeave {
 		rows = append(rows, []map[string]string{{"text": "✅ Разрешить", "callback_data": p + "r"}})
 	} else if r.Send {
 		// автоотправку владелец решает здесь же, при допуске: в допущенном чате агент действует сам
@@ -443,7 +444,7 @@ func handleAccessCallback(ctx context.Context, s *config.Settings, q *bot.Callba
 			return
 		}
 		if r.Scope != "" {
-			if err := grantSet(fresh, r, read, send, auto); err != nil {
+			if err := grantSet(ctx, fresh, r, read, send, auto); err != nil {
 				bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
 				logEvent(s, "access_grant_failed", "request_id", id, "error", err.Error())
 				return
@@ -539,7 +540,7 @@ func afterAccess(ctx context.Context, r *accessRequest) {
 			return
 		}
 	}
-	if r.Status == accessGranted && r.CanRead && r.Scope != scopeManage {
+	if r.Status == accessGranted && r.CanRead && r.Scope != scopeManage && r.Scope != scopeLeave {
 		if n := netOf(s); n != nil {
 			n.catchup(ctx, s)
 		} else {

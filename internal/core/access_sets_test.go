@@ -29,7 +29,7 @@ func TestGrantSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	folder := &accessRequest{ID: "f", Scope: scopeFolder, Folder: "3", Title: "Новости", Reason: "сводка"}
-	if err := grantSet(load(), folder, true, false, false); err != nil {
+	if err := grantSet(context.Background(), load(), folder, true, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if st := config.LoadSetsState(); st.IsBlocked("folder:3", -1005) {
@@ -37,17 +37,17 @@ func TestGrantSet(t *testing.T) {
 	}
 	// повторное решение с отправкой — права расширяются у той же папки
 	folder.Send = true
-	if err := grantSet(load(), folder, true, true, true); err != nil {
+	if err := grantSet(context.Background(), load(), folder, true, true, true); err != nil {
 		t.Fatal(err)
 	}
 	s := load()
 	if len(s.Sets) != 1 || !s.Sets[0].AutoSend() || s.Sets[0].Name != "Новости" || !strings.Contains(s.Sets[0].Note, "сводка") {
 		t.Fatalf("папка: %+v", s.Sets)
 	}
-	if err := grantSet(s, &accessRequest{Scope: scopePublic, Reason: "каналы"}, true, false, false); err != nil {
+	if err := grantSet(context.Background(), s, &accessRequest{Scope: scopePublic, Reason: "каналы"}, true, false, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := grantSet(s, &accessRequest{Scope: scopeManage}, true, false, false); err != nil {
+	if err := grantSet(context.Background(), s, &accessRequest{Scope: scopeManage}, true, false, false); err != nil {
 		t.Fatal(err)
 	}
 	s = load()

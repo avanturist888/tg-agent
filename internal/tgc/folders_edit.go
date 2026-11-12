@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/gotd/td/tg"
 )
@@ -71,6 +72,19 @@ func (e *NotEditable) Error() string { return e.Msg }
 
 // filterOf — папка как её хранит Telegram; папку-ссылку и чужую — нельзя.
 func (c *Conn) filterOf(ctx context.Context, folderID int) (*tg.DialogFilter, error) {
+	f, err := c.anyFilter(ctx, folderID)
+	if err != nil {
+		return nil, err
+	}
+	if v, ok := f.(*tg.DialogFilter); ok {
+		return v, nil
+	}
+	return nil, &NotEditable{"Это папка-ссылка: её название и правила так не меняются. Состав своей " +
+		"папки-ссылки — tg_move_chat; чужую можно только покинуть — tg_delete_folder (кнопкой владельца)."}
+}
+
+// anyFilter — папка с номером folderID: обычная или папка-ссылка.
+func (c *Conn) anyFilter(ctx context.Context, folderID int) (tg.DialogFilterClass, error) {
 	res, err := c.API.MessagesGetDialogFilters(ctx)
 	if err != nil {
 		return nil, err
@@ -83,11 +97,20 @@ func (c *Conn) filterOf(ctx context.Context, folderID int) (*tg.DialogFilter, er
 			}
 		case *tg.DialogFilterChatlist:
 			if v.ID == folderID {
-				return nil, &NotEditable{"Это папка-ссылка: её состав раздаётся по приглашению, менять его может только владелец."}
+				return v, nil
 			}
 		}
 	}
 	return nil, &NotEditable{fmt.Sprintf("Папки %d нет — список: tg_list_folders.", folderID)}
+}
+
+// LeaveChatlist — покинуть папку-ссылку, полученную по чужой ссылке. Чаты
+// папки остаются: выходить из них Telegram здесь не заставляет (peers пуст).
+func (c *Conn) LeaveChatlist(ctx context.Context, folderID int) error {
+	_, err := c.API.ChatlistsLeaveChatlist(ctx, &tg.ChatlistsLeaveChatlistRequest{
+		Chatlist: tg.InputChatlistDialogFilter{FilterID: folderID}, Peers: []tg.InputPeerClass{}})
+	ForgetDialogs()
+	return err
 }
 
 // inputOf — чат (id формата Bot API) для списков папки.
@@ -114,7 +137,7 @@ func (c *Conn) putFilter(ctx context.Context, filter *tg.DialogFilter) error {
 // Telegram: вынуть чат, который попадает в папку по её правилам («все
 // каналы»), — значит добавить его в исключения.
 func (c *Conn) MoveChat(ctx context.Context, folderID int, marked int64, add bool) error {
-	filter, err := c.filterOf(ctx, folderID)
+	got, err := c.anyFilter(ctx, folderID)
 	if err != nil {
 		return err
 	}
@@ -127,6 +150,10 @@ func (c *Conn) MoveChat(ctx context.Context, folderID int, marked int64, add boo
 	drop := func(list []tg.InputPeerClass) []tg.InputPeerClass {
 		return slices.DeleteFunc(slices.Clone(list), same)
 	}
+	if list, ok := got.(*tg.DialogFilterChatlist); ok {
+		return c.moveInChatlist(ctx, list, input, same, drop, add)
+	}
+	filter := got.(*tg.DialogFilter)
 	page, err := c.dialogsFresh(ctx, 0)
 	if err != nil {
 		return err
@@ -145,6 +172,31 @@ func (c *Conn) MoveChat(ctx context.Context, folderID int, marked int64, add boo
 		}
 	}
 	return c.putFilter(ctx, filter)
+}
+
+// moveInChatlist — состав папки-ссылки: правил и исключений у неё нет, только
+// явные чаты. Менять можно только свою (её раздаёт владелец, HasMyInvites):
+// у чужой состав задаёт автор. Ссылки-приглашения при этом не меняются —
+// раздать новые чаты другим владелец решает сам в Telegram.
+func (c *Conn) moveInChatlist(ctx context.Context, list *tg.DialogFilterChatlist, input tg.InputPeerClass,
+	same func(tg.InputPeerClass) bool, drop func([]tg.InputPeerClass) []tg.InputPeerClass, add bool) error {
+	if !list.HasMyInvites {
+		return &NotEditable{fmt.Sprintf("«%s» — папка-ссылка по чужому приглашению: её состав задаёт автор. "+
+			"Покинуть её — tg_delete_folder (кнопкой владельца).", strings.TrimSpace(list.Title.Text))}
+	}
+	if add {
+		if !slices.ContainsFunc(list.IncludePeers, same) && !slices.ContainsFunc(list.PinnedPeers, same) {
+			list.IncludePeers = append(list.IncludePeers, input)
+		}
+	} else {
+		list.IncludePeers = drop(list.IncludePeers)
+		list.PinnedPeers = drop(list.PinnedPeers)
+	}
+	req := &tg.MessagesUpdateDialogFilterRequest{ID: list.ID}
+	req.SetFilter(list)
+	_, err := c.API.MessagesUpdateDialogFilter(ctx, req)
+	ForgetDialogs()
+	return err
 }
 
 func rulesOf(f *tg.DialogFilter) Folder {

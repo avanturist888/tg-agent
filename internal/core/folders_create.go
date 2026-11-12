@@ -448,14 +448,18 @@ func EditFolder(ctx context.Context, s *config.Settings, ref string, o FolderOpt
 }
 
 // DeleteFolder — tg_delete_folder.
-func DeleteFolder(ctx context.Context, s *config.Settings, ref string) (*omap.Map, error) {
+func DeleteFolder(ctx context.Context, s *config.Settings, ref, reason string) (*omap.Map, error) {
 	if err := canManage(s); err != nil {
 		return nil, err
 	}
 	if strings.TrimSpace(ref) == "" {
 		return nil, &Bad{Msg: "Укажи folder — id или название из tg_list_folders."}
 	}
-	var f tgc.Folder
+	var (
+		f     tgc.Folder
+		leave []tgc.DialogRow // чужая папка-ссылка: её чаты для карточки
+		ask   bool
+	)
 	err := withFolders(ctx, s, func(b *agentBook) error {
 		return tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "delete_folder"}, func(ctx context.Context, c *tgc.Conn) error {
 			folders, err := c.Folders(ctx)
@@ -466,11 +470,22 @@ func DeleteFolder(ctx context.Context, s *config.Settings, ref string) (*omap.Ma
 			if f, err = pickFolder(folders, ref); err != nil {
 				return err
 			}
-			if f.Shared {
-				return denied("«%s» — папка-ссылка: удалить её может только владелец.", f.Title)
-			}
 			if ownerFolder(s, f) {
 				return denied("Папка «%s» открыта агентам решением владельца: удалить её может только он.", f.Title)
+			}
+			if f.Shared {
+				if f.MyInvites {
+					return denied("«%s» — папка-ссылка, которую раздаёт владелец: если её удалить, его ссылки-"+
+						"приглашения перестанут работать у тех, кому он их дал. Удалить её может только он.", f.Title)
+				}
+				// чужая папка-ссылка: покинуть — кнопкой владельца
+				tgc.ForgetDialogs()
+				page, err := c.Dialogs(ctx)
+				if err != nil {
+					return err
+				}
+				leave, ask = c.FolderRows(page, f), true
+				return nil
 			}
 			if !b.mine(f) {
 				// папка владельца: только если в ней не осталось ни правил
@@ -504,6 +519,13 @@ func DeleteFolder(ctx context.Context, s *config.Settings, ref string) (*omap.Ma
 	})
 	if err != nil {
 		return nil, folderErr(err)
+	}
+	if ask {
+		out, err := requestLeaveChatlist(ctx, s, f, leave, reason)
+		if out != nil {
+			out.Set("folder", f.Title)
+		}
+		return out, err
 	}
 	logEvent(s, "folder_deleted", "folder", f.ID, "title", f.Title)
 	afterManage(ctx, s)

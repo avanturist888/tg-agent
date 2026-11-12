@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"tgagent/internal/config"
@@ -23,7 +24,7 @@ func TestFolderToolsNeedRight(t *testing.T) {
 		if _, err := EditFolder(ctx, s, "A", FolderOpts{Title: "B"}); !errors.As(err, &d) {
 			t.Errorf("%s: tg_edit_folder: %v", name, err)
 		}
-		if _, err := DeleteFolder(ctx, s, "A"); !errors.As(err, &d) {
+		if _, err := DeleteFolder(ctx, s, "A", ""); !errors.As(err, &d) {
 			t.Errorf("%s: tg_delete_folder: %v", name, err)
 		}
 	}
@@ -164,5 +165,31 @@ func TestAgentBookUnsaved(t *testing.T) {
 	}
 	if got := mine([]tgc.Folder{{ID: 5, Title: "A"}}); got[5] {
 		t.Fatal("вернувшееся название вернуло папку агенту")
+	}
+}
+
+// Покинуть чужую папку-ссылку — карточка с «Разрешить» / «Отказать», в
+// ней сказано, что вернуть папку можно только по той же ссылке.
+func TestLeaveChatlistCard(t *testing.T) {
+	r := &accessRequest{ID: "l", Scope: scopeLeave, Folder: "2", Title: "Neiro", Count: 3, Sample: []string{"A", "B"},
+		Reason: "владелец попросил перенести каналы в AI"}
+	card := setCardMarkdown(r, "")
+	for _, want := range []string{"покинуть папку-ссылку «Neiro»", "по той же ссылке", "сейчас 3: A, B, …", "перенести каналы"} {
+		if !strings.Contains(card, want) {
+			t.Fatalf("в карточке нет %q:\n%s", want, card)
+		}
+	}
+	kb := accessKeyboard(&config.Settings{}, r)["inline_keyboard"].([][]map[string]string)
+	if len(kb) != 2 || kb[0][0]["callback_data"] != "a:l:r" || kb[1][0]["callback_data"] != "a:l:no" {
+		t.Fatalf("кнопки %v", kb)
+	}
+	r.Status = accessGranted
+	if txt := setDecisionText(&config.Settings{}, r); !strings.Contains(txt, "покинута") {
+		t.Fatalf("итог агенту: %s", txt)
+	}
+	var b *Bad
+	s := &config.Settings{Manage: config.Manage{Folders: true}}
+	if _, err := requestLeaveChatlist(context.Background(), s, tgc.Folder{ID: 2, Title: "Neiro", Shared: true}, nil, " "); !errors.As(err, &b) {
+		t.Fatalf("без reason: %v", err)
 	}
 }

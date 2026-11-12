@@ -143,6 +143,18 @@ func MoveChat(ctx context.Context, s *config.Settings, chatID int64, from, to st
 			if fromOK && toOK && fromF.ID == toF.ID {
 				return &Bad{Msg: "from_folder и to_folder — одна папка."}
 			}
+			// чужую папку-ссылку менять нельзя — сказать до любых изменений,
+			// а не положить в to и упасть на from
+			for _, f := range []struct {
+				ok bool
+				f  tgc.Folder
+			}{{fromOK, fromF}, {toOK, toF}} {
+				if f.ok && f.f.Shared && !f.f.MyInvites {
+					return &Bad{Msg: fmt.Sprintf("«%s» — папка-ссылка по чужому приглашению: её состав задаёт автор, "+
+						"ничего не менял. Положить чат в другую папку — tg_move_chat(to_folder) без from_folder; "+
+						"покинуть эту — tg_delete_folder (кнопкой владельца).", f.f.Title)}
+				}
+			}
 			page, err := c.Dialogs(ctx)
 			if err != nil {
 				return err
@@ -249,7 +261,10 @@ func folderErr(err error) error {
 		return &Bad{Msg: ne.Msg}
 	}
 	switch tgc.RPCMessage(err) {
-	case "FILTER_INCLUDE_TOO_MUCH", "DIALOG_FILTERS_TOO_MUCH", "CHATLIST_INCLUDE_INVALID":
+	case "CHATLIST_INCLUDE_INVALID":
+		return &Bad{Msg: "Telegram не принял этот чат в папку-ссылку (CHATLIST_INCLUDE_INVALID): в папку-ссылку " +
+			"кладут только группы и каналы, которые можно раздать по ссылке."}
+	case "FILTER_INCLUDE_TOO_MUCH", "DIALOG_FILTERS_TOO_MUCH":
 		return &Bad{Msg: "Telegram не принял: в папке уже предел явно добавленных чатов (100, с Premium — 200)."}
 	case "FILTER_INCLUDE_EMPTY":
 		return &Bad{Msg: "Telegram не оставляет папку пустой: в ней не останется ни чатов, ни правил. " +

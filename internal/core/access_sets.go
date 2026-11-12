@@ -7,6 +7,8 @@ package core
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,9 @@ const (
 	scopeFolder = "folder"
 	scopePublic = "public_channels"
 	scopeManage = "manage_folders"
+	// scopeLeave — покинуть папку-ссылку, полученную по чужой ссылке: вернуть
+	// её можно только по той же ссылке, поэтому — кнопкой владельца
+	scopeLeave = "leave_chatlist"
 )
 
 // SetAccessOpts — о чём просит агент, кроме одного чата.
@@ -92,6 +97,12 @@ func RequestSetAccess(ctx context.Context, s *config.Settings, o SetAccessOpts) 
 				Set("can_send", set.Send).Set("hint", "Папка уже открыта: её чаты в tg_list_chats с via «"+set.Label()+"»."), nil
 		}
 	}
+	return submitSetRequest(ctx, s, req, out)
+}
+
+// submitSetRequest — запрос на группу или действие: не задвоить, карточка
+// владельцу, запись, ответ агенту.
+func submitSetRequest(ctx context.Context, s *config.Settings, req *accessRequest, out *omap.Map) (*omap.Map, error) {
 	for _, r := range loadAccess(accessPath(s)) {
 		if r.Status == accessPending && r.Scope == req.Scope && r.Folder == req.Folder && (r.Send || !req.Send) {
 			return out.Set("request_id", r.ID).Set("status", accessPending).Set("next_step",
@@ -202,9 +213,68 @@ func tgFolderSample(ctx context.Context, s *config.Settings, r *accessRequest, f
 	})
 }
 
+// requestLeaveChatlist — tg_delete_folder на чужой папке-ссылке: карточка
+// владельцу, покинет её служба по его нажатию (grantSet).
+func requestLeaveChatlist(ctx context.Context, s *config.Settings, f tgc.Folder, rows []tgc.DialogRow, reason string) (*omap.Map, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return nil, &Bad{Msg: "«" + f.Title + "» — папка-ссылка по чужому приглашению: покинуть её можно только " +
+			"с подтверждения владельца. Укажи reason — зачем, по нему он решает."}
+	}
+	if !s.BotReady() {
+		return nil, &Bad{Msg: "Бот подтверждений не настроен — спросить владельца кнопкой нельзя."}
+	}
+	req := &accessRequest{ID: outbox.NewID(), Scope: scopeLeave, Folder: strconv.Itoa(f.ID), Title: f.Title,
+		Reason: reason, Status: accessPending, Agent: agentFrom(ctx), Created: time.Now()}
+	sample(req, rows)
+	return submitSetRequest(ctx, s, req, omap.New())
+}
+
+// leaveChatlist — владелец нажал «Разрешить»: покинуть ту же папку-ссылку.
+// Пока карточка висела, папку могли удалить или подменить — тогда ничего.
+func leaveChatlist(ctx context.Context, s *config.Settings, r *accessRequest) error {
+	id, err := strconv.Atoi(r.Folder)
+	if err != nil {
+		return err
+	}
+	err = withFolders(ctx, s, func(b *agentBook) error {
+		return tgc.Run(ctx, s, tgc.Opts{Wait: 30 * time.Second, Caller: "leave_chatlist"}, func(ctx context.Context, c *tgc.Conn) error {
+			folders, err := c.Folders(ctx)
+			if err != nil {
+				return err
+			}
+			b.sync(folders)
+			i := slices.IndexFunc(folders, func(f tgc.Folder) bool { return f.ID == id })
+			if i < 0 {
+				return nil // папки уже нет — делать нечего
+			}
+			if f := folders[i]; !f.Shared || f.MyInvites || f.Title != r.Title {
+				return fmt.Errorf("папка %d — уже не та чужая папка-ссылка «%s»: ничего не менял", id, r.Title)
+			}
+			return c.LeaveChatlist(ctx, id)
+		})
+	})
+	if err == nil {
+		afterManage(ctx, s)
+	}
+	return err
+}
+
 func setCardMarkdown(r *accessRequest, status string) string {
 	var b strings.Builder
 	switch r.Scope {
+	case scopeLeave:
+		fmt.Fprintf(&b, "🚪 **Агент просит покинуть папку-ссылку «%s»**\n\n", bot.MDEscape(r.Title))
+		b.WriteString("Ты вступил в неё по чужой ссылке. Папка пропадёт у тебя; вернуть её — только " +
+			"по той же ссылке-приглашению. Каналы и группы из неё останутся в твоих подписках")
+		fmt.Fprintf(&b, " (сейчас %d", r.Count)
+		if len(r.Sample) > 0 {
+			b.WriteString(": " + bot.MDEscape(strings.Join(r.Sample, ", ")))
+			if r.Count > len(r.Sample) {
+				b.WriteString(", …")
+			}
+		}
+		b.WriteString(").\n")
 	case scopeManage:
 		b.WriteString("🗂 **Агент просит право раскладывать чаты по папкам**\n\n")
 		b.WriteString("Сможет: видеть чаты вне папок (только названия), класть чаты в папки и вынимать, " +
@@ -241,9 +311,11 @@ func setCardMarkdown(r *accessRequest, status string) string {
 }
 
 // grantSet — записать решение владельца в chats.toml.
-func grantSet(s *config.Settings, r *accessRequest, read, send, auto bool) error {
+func grantSet(ctx context.Context, s *config.Settings, r *accessRequest, read, send, auto bool) error {
 	note := fmt.Sprintf("Открыто по запросу агента %s: %s", time.Now().Format("02.01.2006"), r.Reason)
 	switch r.Scope {
+	case scopeLeave:
+		return leaveChatlist(ctx, s, r)
 	case scopeManage:
 		return chatsfile.SetManageFolders(true)
 	case scopePublic:
@@ -260,6 +332,8 @@ func grantSet(s *config.Settings, r *accessRequest, read, send, auto bool) error
 
 func setGranted(r *accessRequest) string {
 	switch r.Scope {
+	case scopeLeave:
+		return "папка-ссылка «" + r.Title + "» покинута, её чаты остались в подписках"
 	case scopeManage:
 		return "агент раскладывает чаты по папкам и архиву"
 	case scopePublic:
@@ -273,6 +347,8 @@ func setDecisionText(s *config.Settings, r *accessRequest) string {
 		return fmt.Sprintf("tg-agent: владелец отказал (%s, запрос %s). Не проси снова без новой просьбы владельца.", r.Title, r.ID)
 	}
 	switch r.Scope {
+	case scopeLeave:
+		return fmt.Sprintf("tg-agent: владелец разрешил (запрос %s): %s.", r.ID, setGranted(r))
 	case scopeManage:
 		return fmt.Sprintf("tg-agent: владелец дал право раскладывать чаты (запрос %s): tg_unfiled_chats, tg_move_chat, tg_archive_chat, tg_create_folder, tg_edit_folder, tg_delete_folder.", r.ID)
 	}
@@ -300,6 +376,8 @@ func setWaitResult(s *config.Settings, r *accessRequest) *omap.Map {
 		out.Set("granted", setGranted(r))
 		if r.Scope == scopeManage {
 			out.Set("hint", "tg_unfiled_chats, tg_move_chat, tg_archive_chat, tg_create_folder, tg_edit_folder, tg_delete_folder.")
+		} else if r.Scope == scopeLeave {
+			out.Set("hint", "Папки больше нет; её чаты — в подписках владельца, как были.")
 		} else {
 			out.Set("hint", "Чаты группы — в tg_list_chats (поле via).")
 		}

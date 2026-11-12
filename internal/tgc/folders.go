@@ -18,6 +18,9 @@ type Folder struct {
 	Title    string
 	Emoticon string
 	Shared   bool // папка-ссылка (chatlist): только явные чаты, без правил
+	// MyInvites — у папки-ссылки есть ссылки-приглашения владельца: её
+	// раздаёт он сам (не вступил по чужой ссылке)
+	MyInvites bool
 
 	Pinned, Include, Exclude []int64 // id чатов в формате Bot API
 
@@ -72,7 +75,7 @@ func (c *Conn) Folders(ctx context.Context) ([]Folder, error) {
 			})
 		case *tg.DialogFilterChatlist:
 			out = append(out, Folder{
-				ID: v.ID, Title: strings.TrimSpace(v.Title.Text), Emoticon: v.Emoticon, Shared: true,
+				ID: v.ID, Title: strings.TrimSpace(v.Title.Text), Emoticon: v.Emoticon, Shared: true, MyInvites: v.HasMyInvites,
 				Pinned: ids(v.PinnedPeers), Include: ids(v.IncludePeers),
 			})
 		}

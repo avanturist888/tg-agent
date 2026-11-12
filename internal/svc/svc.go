@@ -206,7 +206,10 @@ func CallAt(ctx context.Context, addr, op string, args, out any) (string, error)
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		return "", fmt.Errorf("служба оборвала соединение: %w", err)
+		// обычно это перезапуск службы (новая сборка) посреди вызова
+		return "", fmt.Errorf("служба оборвала соединение посреди вызова (%w) — обычно это её перезапуск "+
+			"после новой сборки. Чтение и раскладку можно просто повторить; черновик, отправку или "+
+			"голос сначала проверь (tg_list_drafts), чтобы не задвоить", err)
 	}
 	var resp response
 	if err := json.Unmarshal(line, &resp); err != nil {

@@ -210,6 +210,7 @@ type editFolderIn struct {
 type deleteFolderIn struct {
 	Account string `json:"account,omitempty" jsonschema:"аккаунт (по умолчанию основной)"`
 	Folder  string `json:"folder" jsonschema:"папка: id или название из tg_list_folders"`
+	Reason  string `json:"reason,omitempty" jsonschema:"зачем — для чужой папки-ссылки обязательно: владелец решает по карточке"`
 }
 
 type waitAccessIn struct {
@@ -509,7 +510,9 @@ to_folder — положить в эту папку, from_folder — вынут�
 одно из двух или оба (перенос). Папка — id или название из
 tg_list_folders. Чат, попадающий в папку по её правилам («все каналы»),
 при выносе попадает в её исключения — как в клиентах Telegram. Папку-ссылку
-менять нельзя. Нужно право раскладывать чаты
+владельца (shared_by_owner в tg_list_folders) менять можно — его
+ссылки-приглашения при этом не меняются; в чужую папку-ссылку чаты не
+кладутся и из неё не вынимаются. Нужно право раскладывать чаты
 (tg_request_access(manage_folders=true)).
 
 Если папка открыта агентам (via в tg_list_chats), положенный тобой чат
@@ -582,14 +585,18 @@ hide_chats — чаты в «Не показывать» (папка их не �
 
 Можно только папку, которую завёл агент (made_by_agent в tg_list_folders),
 или папку владельца, в которой не осталось ни правил, ни чатов. Остальные
-папки владельца, папку-ссылку и папку, открытую агентам, удаляет только он. Нужно право раскладывать чаты
+папки владельца, его папку-ссылку (shared_by_owner: её ссылки перестали бы
+работать) и папку, открытую агентам, удаляет только он.
+Чужую папку-ссылку (shared, shared_by_owner = false) можно покинуть с его
+подтверждения: нужен reason, владельцу уходит карточка, ответ — request_id;
+итог — tg_wait_access(request_id). Её чаты остаются в подписках. Нужно право раскладывать чаты
 (tg_request_access(manage_folders=true)).`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in deleteFolderIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 2*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 				if err := checkAccount(in.Account); err != nil {
 					return nil, err
 				}
-				return core.DeleteFolder(ctx, s, in.Folder)
+				return core.DeleteFolder(ctx, s, in.Folder, in.Reason)
 			})
 		})
 
