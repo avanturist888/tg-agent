@@ -763,3 +763,31 @@ func TestWritePanicReleases(t *testing.T) {
 		t.Fatal("запись паникнувшей транзакции осталась")
 	}
 }
+
+// Испорченный выгруженный файл при повторном переносе базу не трогает:
+// Replace очищает таблицы в той же транзакции, и сбой откатывает очистку.
+func TestReimportCorruptKeepsDB(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "chat_sets.json"), `{"sets": {}, "aliases": {}, "blocked": {"f1": [5, 6]}}`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportLegacy(dir); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "chat_sets.json"), `{"sets": `)
+	if err := ClearRollback(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, db, "SELECT count(*) FROM chat_set_blocked"); n != 2 {
+		t.Fatalf("блоки после испорченного файла: %d", n)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "chat_sets.json")); !os.IsNotExist(err) {
+		t.Fatal("испорченный файл не отложен")
+	}
+}

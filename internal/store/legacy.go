@@ -306,8 +306,10 @@ func (db *DB) importFile(ctx context.Context, l Legacy, path string) (bool, erro
 		n, e := imp(ctx, tx, path)
 		switch {
 		case errors.Is(e, ErrCorrupt):
+			// откатить всё, что успели: и вставленное до сбоя, и очистку
+			// таблиц у Replace — испорченный файл базу не трогает
 			corrupt = e
-			return nil
+			return e
 		case errors.Is(e, ErrRetry):
 			deferred = e
 			return e // откатить всё, что успели
@@ -329,13 +331,13 @@ func (db *DB) importFile(ctx context.Context, l Legacy, path string) (bool, erro
 		return true, nil
 	case vanished:
 		return false, nil
-	case err != nil:
-		return false, err
 	case corrupt != nil:
 		moved, qerr := fsx.Quarantine(path)
 		db.auditLog("legacy_import_failed", "file", l.File, "error", corrupt.Error(), "moved_to", moved,
 			"move_error", errString(qerr))
 		return false, nil
+	case err != nil:
+		return false, err
 	}
 	moved := movedName(path)
 	if err := os.Rename(path, moved); err != nil {
