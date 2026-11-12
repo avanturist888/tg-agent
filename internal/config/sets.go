@@ -288,9 +288,10 @@ func BlockSetChat(key string, peer int64) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Q().ExecContext(context.Background(),
-		"INSERT OR IGNORE INTO chat_set_blocked(set_key, chat_id) VALUES(?, ?)", key, peer)
-	return err
+	return db.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec("INSERT OR IGNORE INTO chat_set_blocked(set_key, chat_id) VALUES(?, ?)", key, peer)
+		return err
+	})
 }
 
 // ClearSetBlocked — снять все блоки группы (владелец заново открыл её целиком).
@@ -299,8 +300,10 @@ func ClearSetBlocked(key string) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Q().ExecContext(context.Background(), "DELETE FROM chat_set_blocked WHERE set_key = ?", key)
-	return err
+	return db.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec("DELETE FROM chat_set_blocked WHERE set_key = ?", key)
+		return err
+	})
 }
 
 // IsBlocked — чат попал в группу из-за агента.

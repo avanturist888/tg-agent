@@ -509,6 +509,17 @@ func liveSenders(dir string) string {
 // значения kv: очистить их и перенести файл.
 func replacing(imp func(context.Context, *sql.Tx, string) (int, error), tables, kvKeys []string) func(context.Context, *sql.Tx, string) (int, error) {
 	return func(ctx context.Context, tx *sql.Tx, path string) (int, error) {
+		// пустой файл — не «пустой набор» (его выгрузка пишет как {} или []):
+		// очистить по нему таблицы значило бы потерять их
+		if st, err := os.Stat(path); err == nil && !st.IsDir() {
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return 0, err
+			}
+			if len(bytes.TrimSpace(raw)) == 0 {
+				return 0, fmt.Errorf("%w: пустой файл", ErrCorrupt)
+			}
+		}
 		for _, t := range tables {
 			// имена таблиц — из кода
 			if _, err := tx.ExecContext(ctx, "DELETE FROM "+t); err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -789,5 +790,58 @@ func TestReimportCorruptKeepsDB(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "chat_sets.json")); !os.IsNotExist(err) {
 		t.Fatal("испорченный файл не отложен")
+	}
+}
+
+// После выгрузки (tg rollback) запись в базу закрыта, после tg cutover —
+// снова открыта.
+func TestWriteRefusedAfterRollback(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportLegacy(dir); err != nil {
+		t.Fatal(err)
+	}
+	put := func() error {
+		return db.Write(context.Background(), func(tx *sql.Tx) error {
+			return PutKV(context.Background(), tx, "x", 1)
+		})
+	}
+	if err := put(); !errors.Is(err, ErrRolledBack) {
+		t.Fatalf("запись после отката: %v", err)
+	}
+	if err := ClearRollback(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := put(); err != nil {
+		t.Fatalf("запись после cutover: %v", err)
+	}
+}
+
+// Пустой выгруженный файл при повторном переносе — испорченный: таблицы базы
+// по нему не очищаются.
+func TestReimportEmptyKeepsDB(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "chat_sets.json"), `{"sets": {}, "aliases": {}, "blocked": {"f1": [5, 6]}}`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportLegacy(dir); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "chat_sets.json"), "  \n")
+	if err := ClearRollback(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, db, "SELECT count(*) FROM chat_set_blocked"); n != 2 {
+		t.Fatalf("блоки после пустого файла: %d", n)
 	}
 }

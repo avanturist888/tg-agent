@@ -181,3 +181,61 @@ func TestClaimSendRefusedAfterRollback(t *testing.T) {
 		t.Fatalf("захват после отката: %v %v", c, err)
 	}
 }
+
+// Уборка старых решённых не выбрасывает черновики, чей итог ещё не показан в
+// карточке: ушедший с CardDue и с ждущим итогом в card_states.
+func TestPruneKeepsUnshownCards(t *testing.T) {
+	dir := t.TempDir()
+	o := New(dir)
+	bm := int64(7)
+	sent := func() *Draft {
+		d := approvedDraft(t, o)
+		if _, err := o.Update(d.ID, func(d *Draft) error { d.BotMessageID = &bm; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		d, err := o.MarkSent(d.ID, 1, time.Now().Format(time.RFC3339))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	due := sent()
+	if !due.CardDue {
+		t.Fatal("MarkSent не поставил CardDue")
+	}
+	queued := sent()
+	if err := o.CardShown(queued.ID); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec("INSERT INTO "+store.TCardStates+"(key, body) VALUES(?, ?)", queued.ID, `{"card": 7, "status": "✅ ушло", "ver": 1, "shown": false}`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gone := sent()
+	if err := o.CardShown(gone.ID); err != nil {
+		t.Fatal(err)
+	}
+	for range keep + 5 {
+		d, err := o.Create(CreateOpts{Chat: "c", Text: "x", TTLMin: 60})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := o.Cancel(d.ID, "t"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{due.ID, queued.ID} {
+		if _, err := o.Get(id); err != nil {
+			t.Fatalf("черновик с непоказанным итогом выброшен: %v", err)
+		}
+	}
+	if _, err := o.Get(gone.ID); err == nil {
+		t.Fatal("показанный итог не убран — проверка ничего не проверяет")
+	}
+}

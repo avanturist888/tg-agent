@@ -138,7 +138,7 @@ func Version() int { return len(migrations) }
 
 func (db *DB) migrate() error {
 	ctx := context.Background()
-	return db.Write(ctx, func(tx *sql.Tx) error {
+	return db.write(ctx, true, func(tx *sql.Tx) error {
 		var v int
 		if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
 			return err

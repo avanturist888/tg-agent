@@ -120,18 +120,19 @@ func ExportLegacy(dir string) ([]string, error) {
 			return nil, fmt.Errorf("%s уже лежит, и выгружала его не эта выгрузка (ещё не перенесён или его вела старая сборка) — поверх него нельзя", p)
 		}
 	}
-	// сначала отметка: с ней эта сборка уже ничего не берёт в отправку
-	raw, _ := json.Marshal(map[string]any{"at": time.Now().Format(time.RFC3339)})
-	if err := fsx.WriteFile(filepath.Join(dir, RollbackFile), raw, 0o600); err != nil {
-		return nil, err
-	}
 	if err := RevokeCutover(dir); err != nil {
 		return nil, err
 	}
 	var exps []*export
-	// одна транзакция записи: никто не поменяет базу, пока её читаем, и
-	// намерения (хеши) ложатся до записи файлов
-	err = db.Write(ctx, func(tx *sql.Tx) error {
+	// одна транзакция записи: отметка отката — под ней (запись других
+	// процессов, начатая после, видит отметку и отказывает, см. DB.Write),
+	// никто не поменяет базу, пока её читаем, и намерения (хеши) ложатся до
+	// записи файлов
+	err = db.write(ctx, true, func(tx *sql.Tx) error {
+		raw, _ := json.Marshal(map[string]any{"at": time.Now().Format(time.RFC3339)})
+		if err := fsx.WriteFile(filepath.Join(dir, RollbackFile), raw, 0o600); err != nil {
+			return err
+		}
 		exps = nil
 		for _, l := range list {
 			e := &export{l: l}

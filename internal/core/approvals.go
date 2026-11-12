@@ -85,7 +85,9 @@ func writeOffset(s *config.Settings, offset int64) {
 		_ = audit.Log(s.AuditPath(), "bot_offset_failed", "error", err.Error())
 		return
 	}
-	if err := store.PutKV(context.Background(), db.Q(), store.KeyBotOffset, botOffset{Offset: offset, Bot: botID(s)}); err != nil {
+	if err := db.Write(context.Background(), func(tx *sql.Tx) error {
+		return store.PutKV(context.Background(), tx, store.KeyBotOffset, botOffset{Offset: offset, Bot: botID(s)})
+	}); err != nil {
 		_ = audit.Log(s.AuditPath(), "bot_offset_failed", "error", err.Error())
 	}
 }
@@ -407,7 +409,7 @@ func retryCard(ctx context.Context, s *config.Settings, db *store.DB, box *outbo
 	d, err := box.Get(id)
 	var nf *outbox.NotFound
 	if errors.As(err, &nf) {
-		_ = cardStates.Delete(ctx, db.Q(), id) // черновика нет — и карточку держать незачем
+		_ = db.Write(ctx, func(tx *sql.Tx) error { return cardStates.Delete(ctx, tx, id) }) // черновика нет — и карточку держать незачем
 		return
 	}
 	if err != nil {

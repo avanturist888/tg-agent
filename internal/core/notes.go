@@ -249,7 +249,7 @@ func selfLabel(ctx context.Context, s *config.Settings) string {
 		return ""
 	}
 	if db, err := accountDB(config.AccountName()); err == nil {
-		_ = store.PutKV(ctx, db.Q(), store.KeyAccount, u)
+		_ = db.Write(ctx, func(tx *sql.Tx) error { return store.PutKV(ctx, tx, store.KeyAccount, u) })
 	}
 	return u.label()
 }

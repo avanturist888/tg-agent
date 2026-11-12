@@ -110,13 +110,32 @@ func open(dir string) (*DB, error) {
 	return db, nil
 }
 
+// ErrRolledBack — состояние профиля выгружено для старой сборки
+// (tg rollback): эта сборка его больше не меняет.
+var ErrRolledBack = errors.New("состояние выгружено для отката на старую сборку (tg rollback) — эта сборка его больше не меняет; вернуться — обновление через scripts\\build.ps1")
+
 // Write — транзакция записи. fn видит базу целиком и меняет её атомарно:
 // другой процесс не вклинится между чтением и записью. Внутри fn — никаких
 // сетевых вызовов: транзакция держит запись для всех процессов профиля.
+//
+// После tg rollback (RolledBack) запись закрыта — ErrRolledBack: всё, что
+// эта сборка записала бы после выгрузки, старая не увидела бы (новый
+// черновик, отмена выгруженного). Отметку ставит выгрузка внутри своей
+// транзакции записи, а проверка здесь — уже под BEGIN IMMEDIATE: запись,
+// начатая до отметки, попала в выгрузку, начатая после — видит отметку.
 func (db *DB) Write(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	return db.write(ctx, false, fn)
+}
+
+// write — Write; always — и после отката (миграция схемы, сама выгрузка).
+func (db *DB) write(ctx context.Context, always bool, fn func(tx *sql.Tx) error) error {
 	tx, err := db.sql.BeginTx(ctx, nil) // _txlock=immediate → BEGIN IMMEDIATE
 	if err != nil {
 		return err
+	}
+	if !always && RolledBack(db.Dir) {
+		_ = tx.Rollback()
+		return ErrRolledBack
 	}
 	// и при панике в fn (её ловят выше, процесс живёт): незакрытая
 	// транзакция держала бы запись для всех процессов профиля. После

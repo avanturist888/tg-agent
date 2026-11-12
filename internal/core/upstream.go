@@ -17,6 +17,7 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"html"
@@ -582,10 +583,12 @@ func SetUpstreamThread(thread string) error {
 	}
 	ctx := context.Background()
 	thread = strings.TrimSpace(thread)
-	if thread == "" {
-		return store.DelKV(ctx, db.Q(), store.KeyUpstreamThread)
-	}
-	return store.PutKV(ctx, db.Q(), store.KeyUpstreamThread, UpstreamThread{Thread: thread, Set: time.Now()})
+	return db.Write(ctx, func(tx *sql.Tx) error {
+		if thread == "" {
+			return store.DelKV(ctx, tx, store.KeyUpstreamThread)
+		}
+		return store.PutKV(ctx, tx, store.KeyUpstreamThread, UpstreamThread{Thread: thread, Set: time.Now()})
+	})
 }
 
 var nestorSend = func(ctx context.Context, exe, text string, args ...string) error {

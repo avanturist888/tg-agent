@@ -210,8 +210,15 @@ func (o *Outbox) Create(opts CreateOpts) (*Draft, error) {
 			return err
 		}
 		// старые решённые — за пределами keep новейших
+		// кроме тех, чей итог ещё не показан в карточке (CardDue, ждущий
+		// итог в card_states): без черновика уборка его уже не покажет
 		_, err := tx.ExecContext(ctx, `DELETE FROM drafts WHERE status IN (?, ?, ?) AND sender_pid IS NULL AND seq <=
-			(SELECT seq FROM drafts ORDER BY seq DESC LIMIT 1 OFFSET ?)`, Sent, Cancelled, Expired, keep)
+			(SELECT seq FROM drafts ORDER BY seq DESC LIMIT 1 OFFSET ?)
+			AND coalesce(json_extract(body, '$.card_due'), 0) = 0
+			AND NOT EXISTS (SELECT 1 FROM `+store.TCardStates+` c WHERE c.key = drafts.id
+				AND coalesce(json_extract(c.body, '$.shown'), 0) = 0
+				AND coalesce(json_extract(c.body, '$.status'), '') != ''
+				AND json_extract(c.body, '$.status') NOT LIKE '⏳%')`, Sent, Cancelled, Expired, keep)
 		return err
 	})
 	if err != nil {
@@ -412,7 +419,7 @@ var pidAlive = lock.PIDAlive
 // отправляет живой путь — ErrSending.
 // ErrRolledBack — состояние выгружено для отката на старую сборку
 // (tg rollback): отправлять может только она.
-var ErrRolledBack = errors.New("состояние выгружено для отката на старую сборку (tg rollback) — эта сборка не отправляет; вернуться — обновление через scripts\\build.ps1")
+var ErrRolledBack = store.ErrRolledBack
 
 func (o *Outbox) ClaimSend(id string) (*Claim, *Draft, error) {
 	db, err := o.db()
