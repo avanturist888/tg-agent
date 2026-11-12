@@ -858,3 +858,32 @@ func TestCardDueCancelled(t *testing.T) {
 		t.Fatal("CardDue не снят после показа")
 	}
 }
+
+// Показ старого итога («Протухло») не снимает CardDue нового
+// («Отправлено»), поставленного, пока шёл показ.
+func TestCardShownKeepsNewerDue(t *testing.T) {
+	s := watchEnv(t)
+	box := outbox.New(s.DataDir())
+	d := approved(t, box, "test")
+	if _, err := box.AttachCard(d.ID, 55); err != nil {
+		t.Fatal(err)
+	}
+	c, err := box.Cancel(d.ID, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, _ := box.Get(c.ID)
+	time.Sleep(1100 * time.Millisecond) // новая отметка — с другим временем
+	if _, err := box.MarkSent(d.ID, 7, time.Now().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	markCardShown(s, snap) // показ «Отменено», сверенный до отметки
+	if got, _ := box.Get(d.ID); !got.CardDue {
+		t.Fatal("снят CardDue нового итога")
+	}
+	fresh, _ := box.Get(d.ID)
+	markCardShown(s, fresh)
+	if got, _ := box.Get(d.ID); got.CardDue {
+		t.Fatal("CardDue показанного итога не снят")
+	}
+}

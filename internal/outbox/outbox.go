@@ -426,10 +426,14 @@ func (o *Outbox) MarkSendError(id, msg string) (*Draft, error) {
 	})
 }
 
-// CardShown — окончательный итог в карточке показан (снять CardDue).
-func (o *Outbox) CardShown(id string) error {
+// CardShownIf — показан окончательный итог черновика в статусе status, чей
+// CardDue поставлен в dueAt: снять отметку, только если она всё та же (в
+// той же транзакции). Статус с тех пор сменился — новый итог ещё ждёт.
+func (o *Outbox) CardShownIf(id, status, dueAt string) error {
 	_, err := o.Update(id, func(d *Draft) error {
-		d.CardDue, d.CardDueAt = false, ""
+		if d.CardDue && d.Status == status && d.CardDueAt == dueAt {
+			d.CardDue, d.CardDueAt = false, ""
+		}
 		return nil
 	})
 	return err

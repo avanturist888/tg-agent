@@ -242,8 +242,10 @@ func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID i
 		_ = audit.Log(s.AuditPath(), "card_version_failed", "draft_id", d.ID, "error", err.Error())
 		if unlock, ok := lockCard(ctx, s, d.ID); ok {
 			defer unlock()
-			if fits, known := freshFits(s, d.ID, status); fits && known {
-				finishCard(ctx, s, cardID, d, title(s, d), status, d.Note)
+			if fits, known, snap := freshFits(s, d.ID, status); fits && known {
+				if finishCard(ctx, s, cardID, d, title(s, d), status, d.Note) && finalOutcome(status) {
+					markCardShown(s, snap)
+				}
 			}
 		}
 		return
@@ -255,7 +257,7 @@ func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID i
 		// новое состояние и отвергается, либо старше номером того, кто его
 		// создал
 		// (не прочитался черновик — тоже в очередь: уборка сверит его сама)
-		if fits, known := freshFits(s, d.ID, status); fits || !known {
+		if fits, known, _ := freshFits(s, d.ID, status); fits || !known {
 			rememberCard(ctx, s, db, d.ID, cardID, status, ver, false)
 		}
 		return
@@ -264,7 +266,7 @@ func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID i
 	if cur, ok, err := cardStates.Get(ctx, db.Q(), d.ID); err == nil && ok && cur.Ver > ver {
 		return // уже принят итог новее — этот устарел, пока ждал
 	}
-	fits, known := freshFits(s, d.ID, status)
+	fits, known, snap := freshFits(s, d.ID, status)
 	if !known {
 		// не сверить — не показывать вслепую, а ждать: уборка (retryCard)
 		// сверит итог с черновиком и покажет, если он ещё правда
@@ -280,7 +282,7 @@ func showCard(ctx context.Context, s *config.Settings, d *outbox.Draft, cardID i
 	if shown {
 		rememberCard(ctx, s, db, d.ID, cardID, status, ver, true)
 		if finalOutcome(status) {
-			markCardShown(s, d.ID)
+			markCardShown(s, snap)
 		}
 	}
 }
@@ -291,13 +293,16 @@ func finalOutcome(status string) bool {
 	return strings.HasPrefix(status, "✅") || strings.HasPrefix(status, "✋") || strings.HasPrefix(status, "⌛")
 }
 
-// markCardShown — окончательный итог в карточке: снять у черновика CardDue.
-func markCardShown(s *config.Settings, id string) {
-	box := outbox.New(s.DataDir())
-	if d, err := box.Get(id); err == nil && d.CardDue {
-		if err := box.CardShown(id); err != nil {
-			_ = audit.Log(s.AuditPath(), "card_due_failed", "draft_id", id, "error", err.Error())
-		}
+// markCardShown — окончательный итог в карточке: снять у черновика CardDue,
+// но только тот, что был при сверке (snap — черновик, с которым итог
+// сверен): пока шёл показ, статус мог смениться (протухшее ушло — MarkSent
+// поставил новый CardDue), и новый итог тогда ещё ждёт показа.
+func markCardShown(s *config.Settings, snap *outbox.Draft) {
+	if snap == nil {
+		return
+	}
+	if err := outbox.New(s.DataDir()).CardShownIf(snap.ID, snap.Status, snap.CardDueAt); err != nil {
+		_ = audit.Log(s.AuditPath(), "card_due_failed", "draft_id", snap.ID, "error", err.Error())
 	}
 }
 
@@ -333,16 +338,17 @@ func showDueCards(ctx context.Context, s *config.Settings) {
 // freshFits — итог status всё ещё правда о черновике id (по базе): fits.
 // known — удалось ли это узнать (черновика нет — узнали: показывать некуда;
 // базу не прочесть — не узнали, и показывать вслепую нельзя).
-func freshFits(s *config.Settings, id, status string) (fits, known bool) {
+// snap — черновик, с которым сверено.
+func freshFits(s *config.Settings, id, status string) (fits, known bool, snap *outbox.Draft) {
 	d, err := outbox.New(s.DataDir()).Get(id)
 	var nf *outbox.NotFound
 	if errors.As(err, &nf) {
-		return false, true // черновика нет — итог не о чем показывать
+		return false, true, nil // черновика нет — итог не о чем показывать
 	}
 	if err != nil {
-		return false, false
+		return false, false, nil
 	}
-	return outcomeFits(s, status, d), true
+	return outcomeFits(s, status, d), true, d
 }
 
 // outcomeFits — подходит ли итог status (по его значку) к состоянию

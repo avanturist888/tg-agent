@@ -204,7 +204,7 @@ func TestPruneKeepsUnshownCards(t *testing.T) {
 		t.Fatal("MarkSent не поставил CardDue")
 	}
 	queued := sent()
-	if err := o.CardShown(queued.ID); err != nil {
+	if err := o.CardShownIf(queued.ID, Sent, queued.CardDueAt); err != nil {
 		t.Fatal(err)
 	}
 	db, err := store.Open(dir)
@@ -218,7 +218,7 @@ func TestPruneKeepsUnshownCards(t *testing.T) {
 		t.Fatal(err)
 	}
 	gone := sent()
-	if err := o.CardShown(gone.ID); err != nil {
+	if err := o.CardShownIf(gone.ID, Sent, gone.CardDueAt); err != nil {
 		t.Fatal(err)
 	}
 	for range keep + 5 {
