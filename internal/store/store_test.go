@@ -845,3 +845,36 @@ func TestReimportEmptyKeepsDB(t *testing.T) {
 		t.Fatalf("блоки после пустого файла: %d", n)
 	}
 }
+
+// Одобренное без попытки выгрузка отдаёт старой сборке на досылку и в базе
+// делает попыткой: старая сборка могла отправить и умереть до отметки, не
+// тронув outbox.json, — повторный перенос пропустит файл, а база не должна
+// снова отдать черновик в отправку.
+func TestExportHandsApprovedOnce(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(closeAll)
+	write(t, filepath.Join(dir, "outbox.json"), `[{"id": "c", "status": "pending"}]`)
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Q().Exec("UPDATE drafts SET status = 'approved' WHERE id = 'c'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportLegacy(dir); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "outbox.json"))
+	if err != nil || !strings.Contains(string(raw), `"approved"`) || strings.Contains(string(raw), "send_error") {
+		t.Fatalf("старой сборке — не на досылку: %v %s", err, raw)
+	}
+	if err := ClearRollback(dir); err != nil { // файл не тронут
+		t.Fatal(err)
+	}
+	if err := db.ImportLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	if count(t, db, "SELECT count(*) FROM drafts WHERE id = 'c' AND status = 'approved' AND send_attempts = 1") != 1 {
+		t.Fatal("после повторного переноса черновик снова отдаётся в отправку")
+	}
+}

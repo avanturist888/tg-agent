@@ -310,6 +310,7 @@ func jsonOut(v any) ([]byte, error) { return json.MarshalIndent(v, "", "  ") }
 // разбора чисел (id сообщений MAX больше 2⁵³ в float64 исказились бы).
 func exportOutbox(ctx context.Context, tx *sql.Tx, dir string) ([]byte, error) {
 	drafts := []map[string]json.RawMessage{}
+	var handed []string // одобренные без попытки: их досылает старая сборка
 	err := eachRow(ctx, tx, "SELECT id, status, body, send_attempts, sender_pid, sender_since FROM drafts ORDER BY seq", func(r *sql.Rows) error {
 		var (
 			id, status, body string
@@ -335,12 +336,26 @@ func exportOutbox(ctx context.Context, tx *sql.Tx, dir string) ([]byte, error) {
 			delete(m, "send_error")
 		} else if status == "approved" && attempts > 0 && noError {
 			m["send_error"] = jsonString(uncertainSend)
+		} else if status == "approved" && attempts == 0 {
+			handed = append(handed, id)
 		}
 		drafts = append(drafts, m)
 		return nil
 	})
 	if err != nil {
 		return nil, err
+	}
+	// Одобренное без попытки старая сборка дошлёт сама — и могла умереть
+	// после отправки до отметки, не тронув outbox.json (её захват — в
+	// отдельном локе): тогда повторный перенос пропустит файл как
+	// неизменённый, и база снова отдала бы черновик в отправку. Поэтому
+	// здесь же, в транзакции выгрузки, оно становится попыткой: в базе —
+	// «могло уйти», повтор только явный (как approved из файла старой
+	// сборки при переносе).
+	for _, id := range handed {
+		if _, err := tx.ExecContext(ctx, "UPDATE drafts SET send_attempts = 1 WHERE id = ? AND send_attempts = 0", id); err != nil {
+			return nil, err
+		}
 	}
 	return jsonOut(drafts)
 }
