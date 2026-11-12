@@ -48,6 +48,9 @@ var (
 	ErrLoggedOut = errors.New("WhatsApp отвязал устройство шлюза (выход на телефоне) — нужен новый вход.")
 	// ErrReplaced — то же устройство подключилось из другого процесса.
 	ErrReplaced = errors.New("WhatsApp: то же устройство подключилось из другого процесса.")
+	// ErrClientOutdated — сервер отверг версию веб-клиента, которой
+	// представляется whatsmeow (405): нужна свежая whatsmeow. Вход при этом цел.
+	ErrClientOutdated = errors.New("WhatsApp отверг клиент шлюза как устаревший (405): нужна свежая whatsmeow.")
 )
 
 func devicePath(dir string) string { return filepath.Join(dir, "device.db") }
@@ -299,6 +302,9 @@ func (c *Client) handle(ctx context.Context, evt any) {
 		c.fail(ErrLoggedOut)
 	case *events.StreamReplaced:
 		c.fail(ErrReplaced)
+	case *events.ClientOutdated:
+		c.log("wa_client_outdated", "version", store.GetWAVersion().String())
+		c.fail(ErrClientOutdated)
 	case *events.TemporaryBan:
 		c.log("wa_temporary_ban", "code", v.Code.String(), "expire", v.Expire.String())
 	case *events.Message:
@@ -690,3 +696,6 @@ func (c *Client) SyncGroups(ctx context.Context) (int, error) {
 	}
 	return len(groups), nil
 }
+
+// Version — версия веб-клиента WhatsApp, которой представляется шлюз.
+func Version() string { return store.GetWAVersion().String() }

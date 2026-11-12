@@ -268,3 +268,47 @@ func TestUpstreamCardLimit(t *testing.T) {
 		t.Fatalf("карточка %d символов:\n%s", n, card)
 	}
 }
+
+// WhatsApp отверг клиент шлюза: служба профиля передаёт разбор основной
+// (карточка и «Разобрано» — у неё), агенту — задание по whatsmeow. Основная
+// не ответила — карточка владельцу, закреплённая.
+func TestWAOutdatedToAgent(t *testing.T) {
+	f := &fakeUpstream{value: "1"}
+	s := f.install(t)
+	upstreamSources = upstream.Sources // открытые карточки — по настоящим источникам
+	var woke string
+	upstreamWake = func(_ context.Context, _ *config.Settings, title, text string) error {
+		woke = title + "|" + text
+		return nil
+	}
+	var got UpstreamIncident
+	oldReport := reportIncident
+	t.Cleanup(func() { reportIncident = oldReport })
+	reportIncident = func(_ context.Context, in UpstreamIncident) error { got = in; return nil }
+	if !reportWAOutdated(context.Background(), s) || got.Source != "whatsmeow-main" {
+		t.Fatalf("передано: %+v", got)
+	}
+	if _, err := ReportIncident(context.Background(), s, got); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"405", "go get go.mau.fi/whatsmeow", "updates ack whatsmeow-main"} {
+		if !strings.Contains(woke, want) {
+			t.Fatalf("агенту нет %q: %s", want, woke)
+		}
+	}
+	if cards, _ := PinnedUpstream(s); len(cards) != 1 || cards[0].Source != "whatsmeow-main" || !cards[0].Agent {
+		t.Fatalf("карточка: %+v", cards)
+	}
+	if _, err := ReportIncident(context.Background(), s, UpstreamIncident{Source: "nope", Card: "x"}); err == nil {
+		t.Fatal("принят неизвестный источник")
+	}
+	// основная служба не ответила — владельцу здесь
+	f.take()
+	reportIncident = func(context.Context, UpstreamIncident) error { return errors.New("нет службы") }
+	if !reportWAOutdated(context.Background(), s) {
+		t.Fatal("владельцу не сказано")
+	}
+	if calls := f.take(); len(calls) < 2 || !strings.HasPrefix(calls[0], "send:") || !strings.Contains(strings.Join(calls, "|"), "pinChatMessage") {
+		t.Fatalf("владельцу: %q", calls)
+	}
+}

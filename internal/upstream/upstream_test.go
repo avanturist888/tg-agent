@@ -62,12 +62,12 @@ func (f *fake) server(t *testing.T) *Client {
 	mux.HandleFunc("GET /gh/repos/MaxApiTeam/PyMax/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"tag_name":"v2.4.1","name":"PyMax 2.4.1","html_url":"https://x/rel","body":"- one\r\n- two"}`)
 	})
-	mux.HandleFunc("GET /gh/repos/MaxApiTeam/PyMax/commits", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /gh/repos/{owner}/{repo}/commits", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		fmt.Fprintf(w, `[{"sha":%q,"html_url":"https://x/c","commit":{"message":"fix: twine bump\n\nbody"}}]`, f.head)
 	})
-	mux.HandleFunc("GET /gh/repos/MaxApiTeam/PyMax/compare/{spec}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /gh/repos/{owner}/{repo}/compare/{spec}", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		if f.compare == "" {
@@ -207,5 +207,22 @@ func TestApplyAndFailures(t *testing.T) {
 	}
 	if empty, err := Load(t.TempDir()); err != nil || len(empty.Sources) != 0 {
 		t.Fatalf("нет состояния: %+v %v", empty, err)
+	}
+}
+
+// whatsmeow: новые коммиты, правка версии веб-клиента и входа отмечена.
+func TestWhatsmeowCommits(t *testing.T) {
+	f := &fake{head: "1111111aaaa"}
+	c, st := f.server(t), &State{Sources: map[string]*SourceState{}}
+	one(t, c, st, WhatsmeowCommits)
+	f.head = "2222222bbbb"
+	f.compare = `{"total_commits":1,"commits":[{"commit":{"message":"Bump version"}}],` +
+		`"files":[{"filename":"store/clientpayload.go"},{"filename":"send.go"},{"filename":"socket/noisesocket.go"}]}`
+	r := one(t, c, st, WhatsmeowCommits)
+	if !r.Changed() || r.Details[len(r.Details)-1] != "⚠️ Затронуты протокол или вход: store/clientpayload.go, socket/noisesocket.go." {
+		t.Fatalf("детали: %q", r.Details)
+	}
+	if WhatsmeowCommits.Task == "" {
+		t.Fatal("нет задания агенту")
 	}
 }

@@ -200,6 +200,8 @@ func init() {
 		"upstream_escalate": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, a UpstreamAckArgs) (any, error) {
 			return core.EscalateUpstream(ctx, s, a.Source, a.Note)
 		})},
+		// сбой у источника, замеченный службой профиля (WhatsApp отверг клиент)
+		"upstream_incident": {local: true, fn: withSettings(core.ReportIncident)},
 		"max_status": {local: true, fn: func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return core.MaxState(ctx)
 		}},

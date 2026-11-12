@@ -1,8 +1,10 @@
 package core
 
-// Слежение за обновлениями того, от чего зависят клиенты MAX и Telegram
+// Слежение за обновлениями того, от чего зависят клиенты MAX, Telegram и WhatsApp
 // (internal/upstream): служба основного профиля раз в час проверяет веб-клиент
-// MAX, каталог сборок Android-клиента, PyMax и релизы gotd. Изменение сначала разбирает агент, а не владелец
+// MAX, каталог сборок Android-клиента, PyMax, релизы gotd и ветку whatsmeow;
+// служба WhatsApp сама зовёт разбор, если сервер отверг её клиент как
+// устаревший (core/wa.go). Изменение сначала разбирает агент, а не владелец
 // (он не передатчик): карточка уходит в бот без звука и закрепления, а агент
 // проекта просыпается в назначенном треде (tg updates thread) или в новом
 // (через Нестора) — проверяет, чинит сам и
@@ -115,7 +117,7 @@ func CheckUpstream(ctx context.Context, s *config.Settings) (*upstream.State, er
 				text := fmt.Sprintf("⚠️ <b>Не удаётся проверить: %s</b>\n\n%d проверок подряд с ошибкой:\n<code>%s</code>\n\n"+
 					"Если источник переехал или поменял формат — слежение за ним нужно поправить.",
 					html.EscapeString(r.Source.Title), upstreamFailNotice, html.EscapeString(r.Err.Error()))
-				brief := fmt.Sprintf("Слежение за обновлениями MAX не может проверить источник «%s» (%s): "+
+				brief := fmt.Sprintf("Слежение за обновлениями не может проверить источник «%s» (%s): "+
 					"%d проверок подряд с ошибкой: %s\nИсточник мог переехать или поменять формат — "+
 					"почини проверку в internal/upstream.", r.Source.Title, id, upstreamFailNotice, r.Err.Error())
 				_ = sendPinned(ctx, s, text, id, "Не удаётся проверить: "+r.Source.Title, brief)
@@ -138,7 +140,7 @@ func CheckUpstream(ctx context.Context, s *config.Settings) (*upstream.State, er
 		return st, err
 	}
 	if first && s.BotReady() {
-		upstreamSay(ctx, s, upstreamSummary(st, "🔭 <b>Слежение за обновлениями MAX включено</b>"))
+		upstreamSay(ctx, s, upstreamSummary(st, "🔭 <b>Слежение за обновлениями включено</b>"))
 	}
 	return st, nil
 }
@@ -526,6 +528,37 @@ type UpstreamThread struct {
 }
 
 func upstreamDB() (*store.DB, error) { return store.Open(config.DataPath()) }
+
+// UpstreamIncident — сбой, который служба другого профиля заметила у того,
+// за чем следит слежение (WhatsApp отверг клиент — устарела whatsmeow):
+// карточка и разбор — у основного профиля, как у любого изменения
+// источника (tg updates — без --profile, «Разобрано» нажимает владелец в
+// боте основного).
+type UpstreamIncident struct {
+	Source string `json:"source"` // id источника (upstream.Sources)
+	Card   string `json:"card"`   // карточка, HTML
+	Title  string `json:"title"`
+	Brief  string `json:"brief"` // агенту: что случилось
+}
+
+// ReportIncident — op upstream_incident в основной службе.
+func ReportIncident(ctx context.Context, s *config.Settings, in UpstreamIncident) (any, error) {
+	if config.Profile() != "" {
+		return nil, &Bad{Msg: "карточки обновлений — у основного профиля"}
+	}
+	known := false
+	for _, src := range upstream.Sources() {
+		known = known || src.ID == in.Source
+	}
+	if !known || in.Card == "" {
+		return nil, &Bad{Msg: "неизвестный источник: " + in.Source}
+	}
+	if !s.BotReady() {
+		return nil, &Bad{Msg: "бот подтверждений не настроен"}
+	}
+	logEvent(s, "upstream_incident", "source", in.Source, "title", in.Title)
+	return map[string]bool{"ok": true}, sendPinned(ctx, s, in.Card, in.Source, in.Title, in.Brief)
+}
 
 // ReadUpstreamThread — назначенный тред; nil — каждый раз новый.
 func ReadUpstreamThread() *UpstreamThread {

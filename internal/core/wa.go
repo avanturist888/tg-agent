@@ -18,13 +18,16 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"tgagent/internal/accounts"
 	"tgagent/internal/config"
 	"tgagent/internal/fsx"
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
 	"tgagent/internal/tgc"
+	"tgagent/internal/upstream"
 	"tgagent/internal/wac"
 )
 
@@ -208,6 +211,7 @@ func (waNet) run(ctx context.Context, loader func() (*config.Settings, error)) {
 		waRT.Unlock()
 	}()
 	warned := false
+	var outdated atomic.Bool // о версии клиента сказано — до следующего удачного входа
 	backoff := 5 * time.Second
 	for ctx.Err() == nil {
 		linked := wac.HasSession(ctx, WADir())
@@ -247,6 +251,7 @@ func (waNet) run(ctx context.Context, loader func() (*config.Settings, error)) {
 		cl.OnLog = func(event string, kv ...any) {
 			log(event, kv...)
 			if event == "wa_connected" {
+				outdated.Store(false) // пустили — о следующем отказе снова скажем
 				go waConnected(cctx, cl, loader)
 			}
 		}
@@ -291,6 +296,13 @@ func (waNet) run(ctx context.Context, loader func() (*config.Settings, error)) {
 					"Связать заново: <code>tg --profile "+config.Profile()+" wa login</code>", "wa-session", "", "")
 			}
 		case errors.Is(err, wac.ErrNoSession):
+		case errors.Is(err, wac.ErrClientOutdated):
+			// чинит агент проекта (свежая whatsmeow), не владелец: вход цел
+			if !outdated.Load() {
+				if s, lerr := loader(); lerr == nil {
+					outdated.Store(reportWAOutdated(ctx, s))
+				}
+			}
 		case err != nil:
 			log("wa_run_failed", "error", err.Error())
 		}
@@ -1068,4 +1080,46 @@ func phoneTail(p string) string {
 		return p
 	}
 	return "…" + p[len(p)-4:]
+}
+
+// waOutdatedCard — карточка в бот: WhatsApp не пускает клиент шлюза.
+func waOutdatedCard() string {
+	return "⚠️ <b>WhatsApp отверг клиент шлюза как устаревший</b>\n\nСервер не пускает версию веб-клиента, " +
+		"которой представляется whatsmeow (" + waVersion() + "). Вход цел — нужна свежая whatsmeow. " +
+		"Пока её нет, агентам WhatsApp недоступен."
+}
+
+// waOutdatedBrief — то же для агента проекта: что случилось и что делать.
+func waOutdatedBrief() string {
+	return "Служба профиля " + config.ProfileName() + " (WhatsApp): сервер отверг подключение кодом 405 — " +
+		"версия веб-клиента в whatsmeow (" + waVersion() + ", store/clientpayload.go) устарела. " +
+		"Обнови whatsmeow до свежего коммита основной ветки; если и там версия старая — " +
+		"store.SetWAVersion в internal/wac до подключения (текущую версию веб-клиента WhatsApp " +
+		"проверь сам) и отметь это в выводе."
+}
+
+func waVersion() string { return wac.Version() }
+
+// reportIncident — передать сбой основной службе (тесты подменяют).
+var reportIncident = func(ctx context.Context, in UpstreamIncident) error {
+	return accounts.Call(ctx, config.MainAccount, "upstream_incident", in, nil)
+}
+
+// reportWAOutdated — разбор отказа у агента проекта через слежение
+// основного профиля; не дошло — карточка владельцу здесь, закреплённая
+// (без разбора агентом). true — кто-то узнал.
+func reportWAOutdated(ctx context.Context, s *config.Settings) bool {
+	in := UpstreamIncident{Source: upstream.WhatsmeowCommits.ID, Card: waOutdatedCard(),
+		Title: "WhatsApp отверг клиент как устаревший", Brief: waOutdatedBrief()}
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	err := reportIncident(cctx, in)
+	if err == nil {
+		return true
+	}
+	logEvent(s, "wa_outdated_report_failed", "error", err.Error())
+	if !s.BotReady() {
+		return false
+	}
+	return sendPinned(cctx, s, in.Card, in.Source, in.Title, "") == nil
 }

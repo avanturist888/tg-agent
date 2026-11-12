@@ -13,7 +13,7 @@ import (
 
 // Sources — что проверяем, в порядке карточек.
 func Sources() []*Source {
-	return []*Source{MaxWeb, AndroidBuilds, PyMaxRelease, PyMaxCommits, GotdRelease}
+	return []*Source{MaxWeb, AndroidBuilds, PyMaxRelease, PyMaxCommits, GotdRelease, WhatsmeowCommits}
 }
 
 const pymaxRepo = "MaxApiTeam/PyMax"
@@ -203,7 +203,34 @@ var GotdRelease = &Source{
 var PyMaxCommits = &Source{
 	ID: "pymax-main", Title: "PyMax: основная ветка", URL: "https://github.com/" + pymaxRepo + "/commits",
 	Labels: []Label{{"head", "последний коммит"}},
-	Check:  checkCommits,
+	Check:  pymaxBranch.check,
+}
+
+// ── whatsmeow (клиент WhatsApp) ─────────────────────────────────────────
+
+const whatsmeowRepo = "tulir/whatsmeow"
+
+// whatsmeowBranch — релизов у whatsmeow нет, go.mod стоит на коммите основной
+// ветки. Отдельно отмечаем правки протокола, входа и версии веб-клиента,
+// которой шлюз представляется серверу (store/clientpayload.go): устаревшую
+// WhatsApp отвергает (405, events.ClientOutdated).
+var whatsmeowBranch = branch{repo: whatsmeowRepo, sensitive: []string{
+	"store/clientpayload.go", "socket/", "binary/", "handshake.go", "pair.go", "pair-code.go",
+	"connectionevents.go", "keepalive.go", "prekeys.go", "store/sqlstore/upgrades/",
+}}
+
+// WhatsmeowCommits — новые коммиты whatsmeow: на ней стоит аккаунт WhatsApp
+// (internal/wac). С 12.11.2026 go.mod на коммите c88388f983b4 (10.11.2026).
+var WhatsmeowCommits = &Source{
+	ID: "whatsmeow-main", Title: "whatsmeow (клиент WhatsApp): основная ветка", URL: "https://github.com/" + whatsmeowRepo + "/commits",
+	Labels: []Label{{"head", "последний коммит"}},
+	Check:  whatsmeowBranch.check,
+	Task: "Это библиотека, на которой стоит аккаунт WhatsApp (internal/wac, core/wa.go). Что у нас сейчас — " +
+		"go list -m go.mau.fi/whatsmeow. Затронута версия веб-клиента (store/clientpayload.go), протокол или вход — " +
+		"обнови сразу: go get go.mau.fi/whatsmeow@<коммит>, scripts\\build.ps1, живая проверка в " +
+		"whatsapp/ya-zametki-sebe (чтение и черновик), коммит и пуш; устаревший клиент WhatsApp отвергает, и аккаунт " +
+		"агентам недоступен. Иначе посмотри, что нового (типы сообщений, события, вызовы) и стоит ли дать это " +
+		"агентам (принцип 4 философии): нужное доделай сам или отметь в выводе.",
 }
 
 var ghHeaders = map[string]string{"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
@@ -239,16 +266,24 @@ func checkRelease(ctx context.Context, c *Client, repo string) (Values, []string
 	return cur, details, nil
 }
 
-// sensitive — файлы PyMax, правка которых затрагивает протокол или вход:
-// их стоит сверить с нашим клиентом.
-var sensitive = []string{
+// branch — основная ветка репозитория: новые коммиты и какие из них
+// затрагивают протокол или вход (sensitive: префиксы путей; "/x" — файл x
+// в любом каталоге), их стоит сверить с нашим клиентом.
+type branch struct {
+	repo      string
+	sensitive []string
+	trim      string // общий префикс путей — в карточке без него
+}
+
+// pymaxBranch — файлы PyMax, правка которых затрагивает протокол или вход.
+var pymaxBranch = branch{repo: pymaxRepo, trim: "src/pymax/", sensitive: []string{
 	"src/pymax/protocol/", "src/pymax/transport/", "src/pymax/connection/",
 	"src/pymax/auth/", "src/pymax/api/session/", "src/pymax/api/auth/",
 	"src/pymax/config.py", "src/pymax/_data/", "/payloads.py",
-}
+}}
 
-func isSensitive(name string) bool {
-	for _, p := range sensitive {
+func (b branch) isSensitive(name string) bool {
+	for _, p := range b.sensitive {
 		if strings.HasPrefix(name, p) || (strings.HasPrefix(p, "/") && strings.HasSuffix(name, p)) {
 			return true
 		}
@@ -258,8 +293,8 @@ func isSensitive(name string) bool {
 
 const maxSubjects = 10
 
-func checkCommits(ctx context.Context, c *Client, prev Values) (Values, []string, error) {
-	raw, err := c.get(ctx, c.GitHub+"/repos/"+pymaxRepo+"/commits?per_page=1", ghHeaders)
+func (b branch) check(ctx context.Context, c *Client, prev Values) (Values, []string, error) {
+	raw, err := c.get(ctx, c.GitHub+"/repos/"+b.repo+"/commits?per_page=1", ghHeaders)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -271,14 +306,14 @@ func checkCommits(ctx context.Context, c *Client, prev Values) (Values, []string
 		} `json:"commit"`
 	}
 	if err := json.Unmarshal(raw, &head); err != nil || len(head) == 0 || len(head[0].SHA) < 7 {
-		return nil, nil, fmt.Errorf("коммиты PyMax: пустой ответ")
+		return nil, nil, fmt.Errorf("коммиты %s: пустой ответ", b.repo)
 	}
 	h := head[0]
 	cur := Values{"head": h.SHA[:7] + " · " + subject(h.Commit.Message), "sha": h.SHA, "url": h.URL}
 	if prev == nil || prev["sha"] == "" || prev["sha"] == h.SHA {
 		return cur, nil, nil
 	}
-	raw, err = c.get(ctx, c.GitHub+"/repos/"+pymaxRepo+"/compare/"+prev["sha"]+"..."+h.SHA, ghHeaders)
+	raw, err = c.get(ctx, c.GitHub+"/repos/"+b.repo+"/compare/"+prev["sha"]+"..."+h.SHA, ghHeaders)
 	var he *HTTPError
 	if errors.As(err, &he) && he.Status == 404 {
 		return cur, []string{"Прежнего коммита в истории нет — ветку переписали (force-push)."}, nil
@@ -314,8 +349,8 @@ func checkCommits(ctx context.Context, c *Client, prev Values) (Values, []string
 	}
 	var touched []string
 	for _, f := range cmpr.Files {
-		if isSensitive(f.Name) {
-			touched = append(touched, strings.TrimPrefix(f.Name, "src/pymax/"))
+		if b.isSensitive(f.Name) {
+			touched = append(touched, strings.TrimPrefix(f.Name, b.trim))
 		}
 	}
 	if len(touched) > 0 {
