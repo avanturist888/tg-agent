@@ -38,7 +38,12 @@ func TestServiceEventToolRole(t *testing.T) {
 	if err := json.Unmarshal([]byte(input.ToolOutput.Output), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["text"] != event.Text || payload["trust"] != "untrusted" || payload["sourceEventID"] != event.SourceEventID {
+	fingerprint, err := event.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload["text"] != event.Text || payload["trust"] != "untrusted" || payload["sourceEventID"] != event.SourceEventID ||
+		payload["threadID"] != event.ThreadID || payload["fingerprint"] != fingerprint {
 		t.Fatalf("untrusted envelope changed: %+v", payload)
 	}
 }
@@ -114,7 +119,7 @@ func (m *mockServiceIngress) EnqueueServiceEvent(_ context.Context, e ServiceEve
 		return r, nil
 	}
 	m.accepted = &ServiceEventReceipt{Source: e.Source, SourceEventID: e.SourceEventID, ThreadID: e.ThreadID,
-		Fingerprint: hash, State: "pending", HistoryItemID: "service-history-1"}
+		Fingerprint: hash, Accepted: true, State: "pending", HistoryItemID: "service-history-1"}
 	if m.lostAck {
 		return ServiceEventReceipt{}, errors.New("ack lost after acceptance")
 	}
@@ -161,16 +166,45 @@ func TestServiceEventReceiptBoundToHistory(t *testing.T) {
 		}
 	}
 	for _, change := range []func(*ServiceEventReceipt){
+		func(r *ServiceEventReceipt) { r.Accepted = false },
 		func(r *ServiceEventReceipt) { r.ThreadID = "other-thread" },
 		func(r *ServiceEventReceipt) { r.SourceEventID = "other-event" },
 		func(r *ServiceEventReceipt) { r.Fingerprint = "wrong" },
 		func(r *ServiceEventReceipt) { r.HistoryItemID = "" },
 		func(r *ServiceEventReceipt) { r.State = "rejected" },
+		func(r *ServiceEventReceipt) { r.Reason = "unexpected" },
 	} {
 		changed := receipt
 		change(&changed)
 		if err := event.ValidateReceipt(changed); err == nil {
 			t.Fatal("receipt with wrong identity/history/state accepted")
 		}
+	}
+}
+
+func TestServiceEventTerminalReceiptAfterLostAck(t *testing.T) {
+	event := exampleServiceEvent()
+	backend := &mockServiceIngress{lostAck: true}
+	if _, err := SubmitServiceEvent(context.Background(), backend, event); err == nil {
+		t.Fatal("expected lost acknowledgement")
+	}
+	// The mock retains only identity/fingerprint/outcome as a tombstone. The
+	// producer never saw acceptance; a terminal outcome still confirms storage.
+	for _, reason := range []string{"target_archived", "target_deleted", "provider_unsupported"} {
+		backend.accepted.State = "not_delivered"
+		backend.accepted.Reason = reason
+		receipt, err := SubmitServiceEvent(context.Background(), backend, event)
+		if err != nil || !receipt.Accepted || !receipt.Duplicate || receipt.State != "not_delivered" || receipt.Reason != reason {
+			t.Fatalf("terminal acceptance lost: %+v %v", receipt, err)
+		}
+	}
+	bad := *backend.accepted
+	bad.Reason = ""
+	if err := event.ValidateReceipt(bad); err == nil {
+		t.Fatal("terminal outcome without reason accepted")
+	}
+	bad.Reason = "unknown"
+	if err := event.ValidateReceipt(bad); err == nil {
+		t.Fatal("unknown terminal outcome accepted")
 	}
 }

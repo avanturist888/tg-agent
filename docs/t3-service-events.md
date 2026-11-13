@@ -77,6 +77,7 @@ user bootstrap и прямой доступ к shared app-server не являю
   "sourceEventID": "notification-immutable-id",
   "threadID": "mcp:logical-t3-thread",
   "fingerprint": "sha256-canonical-envelope",
+  "accepted": true,
   "state": "pending",
   "duplicate": false,
   "historyItemID": "t3-service-event-item"
@@ -95,18 +96,36 @@ thread и принятый native functionCallOutput item, когда они и�
 fingerprint и непустой history item; без реализованного ingress возвращает
 `ErrServiceEventsUnsupported`. Автоматического fallback нет.
 
-Состояния квитанции: `pending`, `provider_uncertain`, `provider_accepted`.
+`accepted=true` подтверждает, что T3 принял обязательство хранения, независимо
+от последующего исхода доставки. Состояния квитанции: `pending`,
+`provider_uncertain`, `provider_accepted`, `not_delivered`. Последнее — сохранённый
+терминальный исход с обязательным `reason`: `target_archived`, `target_deleted`
+или `provider_unsupported`. Отказ до durable enqueue не выдаёт accepted-квитанцию.
+`not_delivered` допускается только при доказанном отсутствии native-приёма;
+закрытый тред с неопределённой попыткой остаётся `provider_uncertain`.
 `duplicate=true` означает повтор уже сохранённого ключа, не новый provider send.
 Producer после квитанции может отметить свой batch переданным T3: обязательство
 хранить и доставлять его перешло T3. До квитанции batch и его ID остаются у
 producer. Нельзя сдвигать только курсор, забыв ID неоднозначного вызова.
+Потерянный enqueue ack и последующее закрытие треда не мешают подтвердить
+сохранение: retry возвращает accepted=true/duplicate=true/not_delivered с причиной
+и прежним historyItemID. Producer прекращает повтор enqueue и показывает итог
+«не доставлено», не выдавая его за прочтение моделью.
 
-T3 сохраняет переход в provider attempt до вызова native API. Сбой до начала
+T3 сохраняет переход в provider attempt до вызова native API: неизменяемые
+attemptID, provider instance, nativeThreadID, logical run, fingerprint и границу
+известной native history перед попыткой. Изменение текущего mapping не изменяет
+назначение уже начатой попытки. Сбой до начала
 вызова допускает повтор; заведомый отказ без приёма допускает отложенный retry.
 Потерянный ответ после возможного приёма — `provider_uncertain`: повторный
 enqueue от producer не вызывает ещё один provider send. T3 сверяет native
-rollout по неизменяемому sourceEventID внутри tool output и связывает найденный
-item с собственной историей. Отсутствие item в одном снимке не доказывает отказ.
+rollout именно сохранённого native target/попытки: functionCallOutput с ожидаемыми
+tool name/namespace и полным конвертом source/sourceEventID/logical threadID/
+fingerprint/text. Fingerprint пересчитывается по содержимому. Одного совпадения
+sourceEventID недостаточно. Найденный item должен принадлежать записанной
+попытке, а не оказаться унаследованным при fork/import; если происхождение нельзя
+различить, исход остаётся uncertain. Доказанный item связывается с T3 history.
+Отсутствие item в одном снимке не доказывает отказ.
 Без доказательства приёма/неприёма автоматической повторной отправки нет.
 Такое событие остаётся видимым с диагностикой, а не молча считается доставленным.
 
@@ -119,6 +138,18 @@ item с собственной историей. Отсутствие item в о
 Архивирование/удаление/смена на неподдерживаемый provider до первой доставки
 останавливает её с видимым итогом; не будит закрытый тред и не шлёт другому агенту.
 Pending и uncertain нельзя очищать по обычному сроку хранения завершённых событий.
+В версии 1 ключи дедупликации **не имеют автоматического срока истечения**.
+После provider_accepted и not_delivered T3 также сохраняет tombstone:
+source/threadID/sourceEventID/fingerprint, accepted, терминальный state/reason,
+historyItemID и ссылки на доказательство native-приёма, если оно было.
+Тело конверта можно убрать по политике хранения, но видимая history-заглушка
+и tombstone остаются. Поздний retry получает прежний исход; изменённое содержимое
+с тем же ключом — event_conflict. Очистка тела, закрытие/удаление треда,
+перезапуск, backup/restore и смена native thread не превращают старый ID в новый.
+Если T3 не может сохранить это правило после утраты ledger, ingress остаётся
+недоступным до восстановления ledger; чистый ledger не выдаётся за продолжение
+старого пространства ID. Иной TTL/epoch — отдельная версия протокола с явным
+отказом на просроченные ID, а не молчаливый повтор отправки.
 
 ## Вызов внутри адаптера, не из tg-agent
 
@@ -132,7 +163,7 @@ Codex adapter через поддерживаемую операцию `turn/sta
   "toolOutput": {
     "name": "notification",
     "namespace": "tg-agent",
-    "output": "{\"source\":\"tg-agent\",\"sourceEventID\":\"notification-immutable-id\",\"trust\":\"untrusted\",\"text\":\"tg-agent: test-chat — ids=[11]\"}"
+    "output": "{\"source\":\"tg-agent\",\"sourceEventID\":\"notification-immutable-id\",\"threadID\":\"mcp:logical-t3-thread\",\"fingerprint\":\"sha256-canonical-envelope\",\"trust\":\"untrusted\",\"text\":\"tg-agent: test-chat — ids=[11]\"}"
   }
 }
 ```
@@ -161,7 +192,10 @@ Codex adapter через поддерживаемую операцию `turn/sta
 | Idle | Один новый service_event run, input=[], tool role в native и T3 history |
 | Active меняется на idle/обратно | Один native submit под lifecycle, корректная привязка run |
 | Потеря enqueue receipt | Тот же ID даёт duplicate, один сохранённый event/history item |
+| Потеря receipt, затем закрытие треда | Accepted terminal receipt с not_delivered/reason; producer прекращает retry |
+| Поздний retry после очистки тела завершённого события | Tombstone возвращает прежний исход; второй native submit не возникает |
 | Native ответ потерян | provider_uncertain, повтор producer не создаёт второй native submit |
+| Одинаковый sourceEventID в перенесённой/разветвлённой истории | Проверяются полный fingerprint/конверт и сохранённая попытка, чужой item не засчитывается |
 | Новый native thread того же T3 thread | Pending следует актуальному mapping; уже принятое не дублируется |
 | Чужой thread/subagent/архив/нет capability | Явный отказ или сохранённый terminal outcome, никаких скрытых fallback |
 | Подмена role/слишком большой payload/конфликт ID | Отказ до provider call, ошибка не выводит payload |

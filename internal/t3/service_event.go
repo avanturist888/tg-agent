@@ -80,6 +80,10 @@ func (e ServiceEvent) Fingerprint() (string, error) {
 	if err := e.Validate(); err != nil {
 		return "", err
 	}
+	return e.fingerprint(), nil
+}
+
+func (e ServiceEvent) fingerprint() string {
 	hash := sha256.New()
 	hash.Write([]byte("tg-agent/service-event/v1\x00"))
 	for _, field := range []string{e.Source, e.SourceEventID, e.ThreadID, e.Text} {
@@ -88,7 +92,7 @@ func (e ServiceEvent) Fingerprint() (string, error) {
 		hash.Write(size[:])
 		hash.Write([]byte(field))
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 type ServiceEventReceipt struct {
@@ -96,7 +100,9 @@ type ServiceEventReceipt struct {
 	SourceEventID string `json:"sourceEventID"`
 	ThreadID      string `json:"threadID"`
 	Fingerprint   string `json:"fingerprint"`
+	Accepted      bool   `json:"accepted"`
 	State         string `json:"state"`
+	Reason        string `json:"reason,omitempty"`
 	Duplicate     bool   `json:"duplicate"`
 	HistoryItemID string `json:"historyItemID"`
 }
@@ -108,16 +114,22 @@ func (e ServiceEvent) ValidateReceipt(r ServiceEventReceipt) error {
 	if err != nil {
 		return err
 	}
-	if r.Source != e.Source || r.SourceEventID != e.SourceEventID || r.ThreadID != e.ThreadID ||
+	if !r.Accepted || r.Source != e.Source || r.SourceEventID != e.SourceEventID || r.ThreadID != e.ThreadID ||
 		r.Fingerprint != hash || r.HistoryItemID == "" {
 		return errors.New("service event receipt does not match")
 	}
 	switch r.State {
 	case "pending", "provider_uncertain", "provider_accepted":
-		return nil
-	default:
-		return errors.New("service event was not durably accepted")
+		if r.Reason == "" {
+			return nil
+		}
+	case "not_delivered":
+		switch r.Reason {
+		case "target_archived", "target_deleted", "provider_unsupported":
+			return nil
+		}
 	}
+	return errors.New("invalid service event delivery outcome")
 }
 
 type ServiceToolOutput struct {
@@ -156,7 +168,9 @@ func (e ServiceEvent) toolPayload() ([]byte, error) {
 	return json.Marshal(struct {
 		Source        string `json:"source"`
 		SourceEventID string `json:"sourceEventID"`
+		ThreadID      string `json:"threadID"`
+		Fingerprint   string `json:"fingerprint"`
 		Trust         string `json:"trust"`
 		Text          string `json:"text"`
-	}{e.Source, e.SourceEventID, "untrusted", e.Text})
+	}{e.Source, e.SourceEventID, e.ThreadID, e.fingerprint(), "untrusted", e.Text})
 }
