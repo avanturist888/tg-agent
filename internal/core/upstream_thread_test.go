@@ -96,7 +96,7 @@ func TestUpstreamAgentStale(t *testing.T) {
 	if cards, _ := PinnedUpstream(s); len(cards) != 1 || cards[0].Agent {
 		t.Fatalf("после: %+v", cards)
 	}
-	// неудачное закрепление без агента — изменение не запоминается
+	// Неудачное закрепление сохраняется независимо от нового состояния источника.
 	f.value = "26.12.0"
 	upstreamWake = func(context.Context, *config.Settings, string, string) error { return errors.New("нет") }
 	f.mu.Lock()
@@ -108,7 +108,10 @@ func TestUpstreamAgentStale(t *testing.T) {
 		}
 		return oldBot(ctx, s, method, p, out)
 	}
-	if st, _ := CheckUpstream(ctx, s); st.Sources["web"].Values["v"] != "26.11.0" {
-		t.Fatalf("запомнено, хотя владелец не увидел: %v", st.Sources["web"].Values)
+	if st, _ := CheckUpstream(ctx, s); st.Sources["web"].Values["v"] != "26.12.0" {
+		t.Fatalf("источник не продвинулся после сохранения задания: %v", st.Sources["web"].Values)
+	}
+	if m, err := upstreamNotices(s); err != nil || !m["web"].CardPending || !m["web"].TaskPending {
+		t.Fatalf("не сохранены независимые повторы: %+v %v", m["web"], err)
 	}
 }

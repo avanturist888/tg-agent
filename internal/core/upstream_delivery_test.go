@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,9 @@ func TestUpstreamTaskSurvivesBotFailure(t *testing.T) {
 	f := &fakeUpstream{value: "1"}
 	s := f.install(t)
 	ctx := context.Background()
+	if _, err := os.Stat(filepath.Join(s.DataDir(), "upstream-delivery")); !os.IsNotExist(err) {
+		t.Fatalf("fixture must start without delivery directory: %v", err)
+	}
 	CheckUpstream(ctx, s)
 	f.take()
 	wakes := 0
@@ -41,6 +46,101 @@ func TestUpstreamTaskSurvivesBotFailure(t *testing.T) {
 	}
 	if cards, _ := PinnedUpstream(s); len(cards) != 1 || cards[0].MessageID == 0 || !cards[0].Agent {
 		t.Fatalf("visible recovered card: %+v", cards)
+	}
+}
+
+func TestUpstreamReplacementRetainsResolvedCardCleanup(t *testing.T) {
+	f := &fakeUpstream{}
+	s := f.install(t)
+	ctx := context.Background()
+	upstreamWake = func(context.Context, *config.Settings, string, string) error { return nil }
+	if err := sendPinned(ctx, s, "old", "web", "title", "brief"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EscalateUpstream(ctx, s, "web", "decision"); err != nil {
+		t.Fatal(err)
+	}
+	original := upstreamBot
+	fail := true
+	upstreamBot = func(ctx context.Context, s *config.Settings, method string, payload any, out any) error {
+		if fail && (method == "editMessageText" || method == "unpinChatMessage") {
+			return errors.New("bot offline")
+		}
+		return original(ctx, s, method, payload, out)
+	}
+	if _, err := AckUpstream(ctx, s, "web", "resolved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendPinned(ctx, s, "new", "web", "title", "brief"); err != nil {
+		t.Fatal(err)
+	}
+	m, err := upstreamNotices(s)
+	if err != nil || len(m["web"].Previous) != 1 || m["web"].Previous[0].ID != 1 || !m["web"].CardPending {
+		t.Fatalf("lost unresolved old presentation: %+v %v", m["web"], err)
+	}
+	f.take()
+	fail = false
+	retryUpstreamNotices(ctx, s)
+	if calls := strings.Join(f.take(), "|"); !strings.Contains(calls, "unpinChatMessage:1") {
+		t.Fatalf("forgot pinned old card: %q", calls)
+	}
+	m, err = upstreamNotices(s)
+	if err != nil || len(m["web"].Previous) != 0 || m["web"].CardPending {
+		t.Fatalf("cleanup still pending: %+v %v", m["web"], err)
+	}
+}
+
+func TestUpstreamRecurringIdenticalOutageIsNewEvent(t *testing.T) {
+	f := &fakeUpstream{value: "1"}
+	s := f.install(t)
+	ctx := context.Background()
+	wakes := 0
+	upstreamWake = func(context.Context, *config.Settings, string, string) error { wakes++; return nil }
+	if _, err := CheckUpstream(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	for episode := 0; episode < 2; episode++ {
+		f.err = errors.New("identical outage")
+		for range upstreamFailNotice {
+			if _, err := CheckUpstream(ctx, s); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if wakes != episode+1 {
+			t.Fatalf("outage %d suppressed, wakes=%d", episode, wakes)
+		}
+		if _, err := AckUpstream(ctx, s, "web", "recovered"); err != nil {
+			t.Fatal(err)
+		}
+		f.err = nil
+		if _, err := CheckUpstream(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUpstreamOlderWriterAcknowledgementAndReplacement(t *testing.T) {
+	f := &fakeUpstream{}
+	s := f.install(t)
+	ctx := context.Background()
+	upstreamWake = func(context.Context, *config.Settings, string, string) error { return nil }
+	if err := sendPinned(ctx, s, "old", "web", "title", "brief"); err != nil {
+		t.Fatal(err)
+	}
+	// Older SQLite builds, and the legacy rollback Replace importer, only
+	// mutate this compatible table and cannot update the new notice KV.
+	if err := updatePinned(s, func(m map[string]pinnedCard) { delete(m, "web") }); err != nil {
+		t.Fatal(err)
+	}
+	if cards, err := PinnedUpstream(s); err != nil || len(cards) != 0 {
+		t.Fatalf("older ack resurrected: %+v %v", cards, err)
+	}
+	retryUpstreamNotices(ctx, s)
+	if err := updatePinned(s, func(m map[string]pinnedCard) { m["web"] = pinnedCard{ID: 900, Text: "newer legacy card"} }); err != nil {
+		t.Fatal(err)
+	}
+	if cards, err := PinnedUpstream(s); err != nil || len(cards) != 1 || cards[0].MessageID != 900 || cards[0].Event != "" {
+		t.Fatalf("newer legacy card hidden: %+v %v", cards, err)
 	}
 }
 

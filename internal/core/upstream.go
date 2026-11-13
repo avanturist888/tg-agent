@@ -113,6 +113,12 @@ func CheckUpstream(ctx context.Context, s *config.Settings) (*upstream.State, er
 	first := false
 	for _, r := range upstream.Check(ctx, upstreamClient(), st, upstreamSources()) {
 		id := r.Source.ID
+		// Persisted prior observation distinguishes a fresh recurrence while
+		// remaining stable when queueing succeeded but saving source state failed.
+		occurrence := ""
+		if ss := st.Sources[id]; ss != nil {
+			occurrence = ss.Checked.UTC().Format(time.RFC3339Nano)
+		}
 		switch {
 		case r.Err != nil:
 			if ctx.Err() != nil {
@@ -127,11 +133,11 @@ func CheckUpstream(ctx context.Context, s *config.Settings) (*upstream.State, er
 				brief := fmt.Sprintf("Слежение за обновлениями не может проверить источник «%s» (%s): "+
 					"%d проверок подряд с ошибкой: %s\nИсточник мог переехать или поменять формат — "+
 					"почини проверку в internal/upstream.", r.Source.Title, id, upstreamFailNotice, r.Err.Error())
-				_ = sendPinned(ctx, s, text, id, "Не удаётся проверить: "+r.Source.Title, brief)
+				_ = sendPinned(ctx, s, text, id, "Не удаётся проверить: "+r.Source.Title, brief, occurrence)
 			}
 		case r.Changed():
 			if s.BotReady() || upstreamWake != nil {
-				if err := sendPinned(ctx, s, upstreamCard(r), id, "Обновление: "+r.Source.Title, upstreamBrief(r)); err != nil {
+				if err := sendPinned(ctx, s, upstreamCard(r), id, "Обновление: "+r.Source.Title, upstreamBrief(r), occurrence); err != nil {
 					continue // не запоминаем: сообщим со следующей проверкой
 				}
 			}
@@ -293,9 +299,9 @@ func escalateStale(ctx context.Context, s *config.Settings, now time.Time) {
 // sendPinned — карточка изменения с кнопкой «Разобрано». Сначала её
 // разбирает агент: карточка без звука и не закреплена. Агента не разбудить —
 // закреплена для владельца.
-func sendPinned(ctx context.Context, s *config.Settings, text, source, title, brief string) error {
+func sendPinned(ctx context.Context, s *config.Settings, text, source, title, brief string, occurrence ...string) error {
 	if upstreamWake != nil && brief != "" {
-		return queueUpstreamNotice(ctx, s, text, source, title, brief)
+		return queueUpstreamNotice(ctx, s, text, source, title, brief, strings.Join(occurrence, "\x00"))
 	}
 	// No agent route requested: retain the direct owner notification path.
 	var sent struct {
@@ -334,8 +340,8 @@ func sendPinned(ctx context.Context, s *config.Settings, text, source, title, br
 // retirePinned — прежняя карточка источника, которую заменила новая:
 // открепить (новая уже закреплена — плашка наверху показывает её), убрать
 // кнопку и пометить.
-func retirePinned(ctx context.Context, s *config.Settings, c pinnedCard) {
-	_ = upstreamBot(ctx, s, "unpinChatMessage", map[string]any{"chat_id": s.ApprovalChatID, "message_id": c.ID}, nil)
+func retirePinned(ctx context.Context, s *config.Settings, c pinnedCard) error {
+	pinErr := upstreamBot(ctx, s, "unpinChatMessage", map[string]any{"chat_id": s.ApprovalChatID, "message_id": c.ID}, nil)
 	err := errors.New("текст карточки неизвестен")
 	if c.Text != "" {
 		err = upstreamBot(ctx, s, "editMessageText", map[string]any{
@@ -344,12 +350,19 @@ func retirePinned(ctx context.Context, s *config.Settings, c pinnedCard) {
 			"link_preview_options": map[string]any{"is_disabled": true},
 		}, nil)
 	}
-	if err != nil { // пометить не вышло — хотя бы снять кнопку
-		_ = upstreamBot(ctx, s, "editMessageReplyMarkup", map[string]any{
+	if err != nil && !strings.Contains(err.Error(), "message is not modified") { // хотя бы снять кнопку
+		err = upstreamBot(ctx, s, "editMessageReplyMarkup", map[string]any{
 			"chat_id": s.ApprovalChatID, "message_id": c.ID, "reply_markup": map[string]any{"inline_keyboard": [][]any{}},
 		}, nil)
 	}
 	logEvent(s, "upstream_card_replaced", "message_id", c.ID)
+	if pinErr != nil {
+		return pinErr
+	}
+	if err != nil && !strings.Contains(err.Error(), "message is not modified") {
+		return err
+	}
+	return nil
 }
 
 // handleUpstreamCallback — «Разобрано»: открепить карточку и убрать кнопку.
@@ -370,6 +383,7 @@ func handleUpstreamCallback(ctx context.Context, s *config.Settings, q *bot.Call
 			if n.CardID != 0 && n.CardID == id {
 				agent = agent || n.Agent
 				n.Done, n.TaskPending, n.CardPending, n.Note = true, false, true, "отмечено владельцем"
+				n.Projection = nil
 				m[source] = n
 				if err := cardsTab.Delete(context.Background(), tx, source); err != nil {
 					return err
@@ -596,7 +610,9 @@ func ReportIncident(ctx context.Context, s *config.Settings, in UpstreamIncident
 		return nil, &Bad{Msg: "бот подтверждений не настроен"}
 	}
 	logEvent(s, "upstream_incident", "source", in.Source, "title", in.Title)
-	return map[string]bool{"ok": true}, sendPinned(ctx, s, in.Card, in.Source, in.Title, in.Brief)
+	// An explicit incident report is a new occurrence, even when its wording
+	// matches an incident resolved before the account failed again.
+	return map[string]bool{"ok": true}, sendPinned(ctx, s, in.Card, in.Source, in.Title, in.Brief, time.Now().UTC().Format(time.RFC3339Nano))
 }
 
 // ReadUpstreamThread — назначенный тред; nil — автоматический разбор не настроен.

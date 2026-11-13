@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"html"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -35,18 +36,12 @@ type upstreamNotice struct {
 	Escalated   bool         `json:"escalated,omitempty"`
 	Note        string       `json:"note,omitempty"`
 	Previous    []pinnedCard `json:"previous,omitempty"`
+	Projection  *pinnedCard  `json:"projection,omitempty"` // last row written to the legacy-compatible table
 }
 
 func upstreamNotices(s *config.Settings) (map[string]upstreamNotice, error) {
-	db, err := stateDB(s)
-	if err != nil {
-		return nil, err
-	}
 	var m map[string]upstreamNotice
-	_, err = store.GetKV(context.Background(), db.Q(), upstreamNoticesKey, &m)
-	if m == nil {
-		m = map[string]upstreamNotice{}
-	}
+	err := editUpstreamNotices(s, func(current map[string]upstreamNotice, _ *sql.Tx) error { m = current; return nil })
 	return m, err
 }
 
@@ -64,11 +59,34 @@ func editUpstreamNotices(s *config.Settings, f func(map[string]upstreamNotice, *
 		if m == nil {
 			m = map[string]upstreamNotice{}
 		}
+		// Older SQLite builds and rollback JSON imports only update cardsTab.
+		// A changed projection is evidence of that writer, not stale new state
+		// which may override its acknowledgement, escalation or replacement.
+		for source, n := range m {
+			card, exists, err := cardsTab.Get(ctx, tx, source)
+			if err != nil {
+				return err
+			}
+			if n.Projection == nil && !exists || n.Projection != nil && exists && sameUpstreamCard(*n.Projection, card) {
+				continue
+			}
+			if !exists {
+				n.Done, n.TaskPending, n.CardPending, n.Pinned = true, false, false, false
+				n.Note, n.Projection, n.Previous = "отмечено прежней сборкой", nil, nil
+				m[source] = n
+			} else {
+				delete(m, source) // the older writer's live row owns this source now
+			}
+		}
 		if err := f(m, tx); err != nil {
 			return err
 		}
 		return store.PutKV(ctx, tx, upstreamNoticesKey, m)
 	})
+}
+
+func sameUpstreamCard(a, b pinnedCard) bool {
+	return a.ID == b.ID && a.Text == b.Text && a.Agent == b.Agent && a.At.Equal(b.At)
 }
 
 func editUpstreamNotice(s *config.Settings, source, event string, f func(*upstreamNotice, *sql.Tx) error) error {
@@ -85,21 +103,29 @@ func editUpstreamNotice(s *config.Settings, source, event string, f func(*upstre
 	})
 }
 
-func queueUpstreamNotice(ctx context.Context, s *config.Settings, text, source, title, brief string) error {
-	event := fmt.Sprintf("%x", sha256.Sum256([]byte(source+"\x00"+text+"\x00"+title+"\x00"+brief)))
+func queueUpstreamNotice(ctx context.Context, s *config.Settings, text, source, title, brief, occurrence string) error {
+	event := fmt.Sprintf("%x", sha256.Sum256([]byte(source+"\x00"+text+"\x00"+title+"\x00"+brief+"\x00"+occurrence)))
 	if err := editUpstreamNotices(s, func(m map[string]upstreamNotice, tx *sql.Tx) error {
 		if m[source].Event == event {
 			return nil
 		}
 		previous := m[source].Previous
-		if old := m[source]; old.CardID != 0 && !old.Done {
+		if old := m[source]; old.CardID != 0 && (!old.Done || old.CardPending || old.Pinned) {
 			previous = append(previous, pinnedCard{ID: old.CardID, Text: old.Text})
 		} else if old, ok, err := cardsTab.Get(context.Background(), tx, source); err != nil {
 			return err
 		} else if ok && old.ID != 0 {
 			previous = append(previous, old)
 		}
-		m[source] = upstreamNotice{Event: event, Text: text, Title: title, Brief: brief,
+		legacy, exists, err := cardsTab.Get(context.Background(), tx, source)
+		if err != nil {
+			return err
+		}
+		var projection *pinnedCard
+		if exists {
+			projection = &legacy
+		}
+		m[source] = upstreamNotice{Event: event, Text: text, Title: title, Brief: brief, Projection: projection,
 			At: time.Now(), TaskPending: true, CardPending: true, Previous: previous}
 		return nil
 	}); err != nil {
@@ -128,7 +154,11 @@ func upstreamTask(source string, n upstreamNotice) string {
 
 func deliverUpstreamNotice(ctx context.Context, s *config.Settings, source string) error {
 	name := fmt.Sprintf("%x", sha256.Sum256([]byte(source)))
-	return lock.With(ctx, filepath.Join(s.DataDir(), "upstream-delivery", name), time.Second, func() error {
+	dir := filepath.Join(s.DataDir(), "upstream-delivery")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return lock.With(ctx, filepath.Join(dir, name), time.Second, func() error {
 		m, err := upstreamNotices(s)
 		if err != nil {
 			return err
@@ -184,7 +214,9 @@ func showUpstreamNotice(ctx context.Context, s *config.Settings, source, event s
 	}
 	if n.Done && n.CardID == 0 {
 		for _, old := range n.Previous {
-			retirePinned(ctx, s, old)
+			if err := retirePinned(ctx, s, old); err != nil {
+				return err
+			}
 		}
 		return editUpstreamNotice(s, source, event, func(cur *upstreamNotice, _ *sql.Tx) error {
 			cur.CardPending, cur.Previous = false, nil
@@ -264,7 +296,9 @@ func showUpstreamNotice(ctx context.Context, s *config.Settings, source, event s
 		}
 	}
 	for _, old := range n.Previous {
-		retirePinned(ctx, s, old)
+		if err := retirePinned(ctx, s, old); err != nil {
+			return err
+		}
 	}
 	return editUpstreamNotice(s, source, event, func(cur *upstreamNotice, tx *sql.Tx) error {
 		cur.Pinned = pinned
@@ -274,9 +308,12 @@ func showUpstreamNotice(ctx context.Context, s *config.Settings, source, event s
 		}
 		cur.CardPending, cur.Pinned, cur.Previous = false, pinned, nil
 		if cur.Done {
+			cur.Projection = nil
 			return cardsTab.Delete(context.Background(), tx, source)
 		}
-		return cardsTab.Put(context.Background(), tx, source, pinnedCard{ID: cur.CardID, Text: cur.Text, Agent: cur.Agent, At: cur.At})
+		card := pinnedCard{ID: cur.CardID, Text: cur.Text, Agent: cur.Agent, At: cur.At}
+		cur.Projection = &card
+		return cardsTab.Put(context.Background(), tx, source, card)
 	})
 }
 
@@ -307,6 +344,7 @@ func resolveUpstreamNotice(ctx context.Context, s *config.Settings, source, even
 		n.Done, n.Escalated, n.Note = done, !done, note
 		n.TaskPending, n.CardPending = false, true
 		if done {
+			n.Projection = nil
 			return cardsTab.Delete(context.Background(), tx, source)
 		}
 		n.Agent = false
