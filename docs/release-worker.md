@@ -9,6 +9,9 @@
 Используется установленный wk с `clean-v1` и проектным `tools/wk.d/before`.
 Native helper задаёт private HOME/AppData/Go/temp до project Bash/deps;
 before оставляет TG/T3 aliases в отдельном каталоге внутри WK_RUN_TMP.
+Он же задаёт абсолютный `PSModuleAnalysisCachePath` внутри WK_RUN_TMP **до**
+запуска PowerShell. Иначе Windows PowerShell может создать свой служебный
+кэш `Microsoft/Windows/PowerShell/ModuleAnalysisCache` в рабочей папке.
 Команда PowerShell вызывается с `-NoProfile -NonInteractive`.
 
 `build-worker.ps1` проверяет чистоту исходников, выполняет `go test -count=1

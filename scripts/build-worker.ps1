@@ -4,6 +4,14 @@ $ErrorActionPreference = 'Stop'
 if ($env:WK_BOOTSTRAP_ISOLATION -ne 'clean-v1' -or -not $env:TG_AGENT_HOME -or -not $env:T3CODE_HOME) {
     throw 'Run through installed wk with the project before hook and private environment.'
 }
+if (-not $env:WK_RUN_TMP -or -not $env:PSModuleAnalysisCachePath) {
+    throw 'The before hook must set the PowerShell cache before process startup.'
+}
+$runTempRoot = [IO.Path]::GetFullPath($env:WK_RUN_TMP).TrimEnd([char[]]'\/') + [IO.Path]::DirectorySeparatorChar
+$powerShellCache = [IO.Path]::GetFullPath($env:PSModuleAnalysisCachePath)
+if (-not $powerShellCache.StartsWith($runTempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'PowerShell module cache must be inside the private run directory.'
+}
 $Root = Split-Path -Parent $PSScriptRoot
 $Artifacts = [IO.Path]::GetFullPath($Artifacts)
 if (Test-Path -LiteralPath $Artifacts) { throw 'Use a new artifact directory.' }
@@ -39,7 +47,8 @@ try {
         Copy-Item -LiteralPath (Join-Path $module "lib/x86_64-pc-windows-gnu/$dll") -Destination $Artifacts
     }
     $dirty = @(git status --porcelain --untracked-files=normal)
-    if ($LASTEXITCODE -ne 0 -or $dirty.Count) { throw 'Build changed source; package is not releasable.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot check source state after build.' }
+    if ($dirty.Count) { throw ("Build changed source; package is not releasable:`n" + ($dirty -join "`n")) }
     $files = @(Get-ChildItem -LiteralPath $Artifacts -File | ForEach-Object {
         @{ name = $_.Name; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
     })

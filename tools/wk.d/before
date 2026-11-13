@@ -4,7 +4,7 @@ set -euo pipefail
 [[ ${WK_BOOTSTRAP_ISOLATION:-} == clean-v1 ]] || exit 125
 : "${WK_RUN_TMP:?}" "${WK_HOOK_ENV:?}"
 test_home=$(mktemp -d "$(cygpath -u "$WK_RUN_TMP")/tg-agent-test-home.XXXXXX")
-mkdir -p "$test_home/installation" "$test_home/t3"
+mkdir -p "$test_home/installation" "$test_home/t3" "$test_home/powershell"
 test_home_win=$(cygpath -m "$test_home")
 while IFS= read -r test_key; do
   case "$test_key" in
@@ -13,4 +13,5 @@ while IFS= read -r test_key; do
 done < <(compgen -e) >> "$WK_HOOK_ENV"
 printf '%s\n' \
   "TG_AGENT_HOME=$test_home_win/installation" "TG_PROFILE=" \
-  "TG_BOT_ENV_FILE=$test_home_win/missing-bot.env" "T3CODE_HOME=$test_home_win/t3" >> "$WK_HOOK_ENV"
+  "TG_BOT_ENV_FILE=$test_home_win/missing-bot.env" "T3CODE_HOME=$test_home_win/t3" \
+  "PSModuleAnalysisCachePath=$test_home_win/powershell/ModuleAnalysisCache" >> "$WK_HOOK_ENV"
