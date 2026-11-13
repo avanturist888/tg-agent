@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+wk_store=${WK_HOME:-${LOCALAPPDATA:?LOCALAPPDATA is required}/wk}
+command -v cygpath >/dev/null 2>&1 && wk_store=$(cygpath -u "$wk_store")
+wk_version=2ac519a12085ecf814a2627ce27e7715f3c983ba
+[[ $(cat "$wk_store/core/$wk_version/VERSION") == "$wk_version" ]] || exit 125
+exec bash "$wk_store/core/$wk_version/bin/wk" "$@"
