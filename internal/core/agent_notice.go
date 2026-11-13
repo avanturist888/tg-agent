@@ -12,6 +12,17 @@ func sendAgentNotice(ctx context.Context, agent inbox.Addr, text string) (string
 	if agent.Codex() {
 		return "mailbox", codexNotice(ctx, agent, text)
 	}
+	// An access request can retain the old Claude address after the thread has
+	// switched providers. Deliver to the logical thread, not its former socket.
+	// Use the mailbox for any known native-session handoff: guessing the new
+	// provider from the old address could reintroduce steer for Codex.
+	if agent.Session != "" {
+		if thread, err := threadOf(ctx, agent.Session); err == nil && thread != "" {
+			if current := currentSession(ctx, thread); current != "" && current != agent.Session {
+				return "mailbox", threadNotice(ctx, thread, text)
+			}
+		}
+	}
 	return "inbox", inbox.Send(ctx, agent, "tg-agent", text)
 }
 
@@ -30,6 +41,10 @@ var codexNotice = func(ctx context.Context, agent inbox.Addr, text string) error
 	if thread == "" {
 		return t3.NoThread
 	}
+	return threadNotice(ctx, thread, text)
+}
+
+var threadNotice = func(ctx context.Context, thread, text string) error {
 	exe := nestorExe()
 	if exe == "" {
 		return errors.New("для уведомлений Codex нужен Нестор (TG_NESTOR, PATH, ~/nestor/bin)")

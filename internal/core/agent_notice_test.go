@@ -17,7 +17,9 @@ import (
 
 func TestCodexNoticeMailboxContract(t *testing.T) {
 	notice := codexNotice
+	mailbox := threadNotice
 	watchEnv(t)
+	threadNotice = mailbox
 	t.Setenv("TG_NESTOR", "synthetic-nestor")
 	oldSend := nestorSend
 	t.Cleanup(func() { nestorSend = oldSend })
@@ -55,6 +57,17 @@ func TestCodexNoticeMailboxContract(t *testing.T) {
 }
 
 func TestCodexAccessNoticeRetryWithoutSteering(t *testing.T) {
+	for _, handoff := range []bool{false, true} {
+		name := "codex-address"
+		if handoff {
+			name = "saved-claude-address"
+		}
+		t.Run(name, func(t *testing.T) { testAccessNoticeRetry(t, handoff) })
+	}
+}
+
+func testAccessNoticeRetry(t *testing.T, handoff bool) {
+	t.Helper()
 	watchEnv(t)
 	t.Setenv("TG_API_ID", "123")
 	t.Setenv("TG_API_HASH", "synthetic")
@@ -69,6 +82,21 @@ func TestCodexAccessNoticeRetryWithoutSteering(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent := inbox.Addr{Kind: inbox.KindCodex, Session: "native-codex", Socket: "stale"}
+	if handoff {
+		agent = inbox.Addr{Session: "old-claude", Socket: "stale", Token: "synthetic"}
+		threadOf = func(_ context.Context, session string) (string, error) {
+			if session != agent.Session {
+				t.Fatalf("wrong saved session: %q", session)
+			}
+			return "logical-thread", nil
+		}
+		currentSession = func(_ context.Context, thread string) string {
+			if thread != "logical-thread" {
+				t.Fatalf("wrong logical thread: %q", thread)
+			}
+			return "native-codex"
+		}
+	}
 	r := &accessRequest{ID: "synthetic-request", Title: "Synthetic chat", Status: accessDenied, Agent: &agent}
 	wakeT3 = func(context.Context, *config.Settings, string, string) error {
 		t.Fatal("Codex access decision fell back to user/steer")
@@ -76,15 +104,27 @@ func TestCodexAccessNoticeRetryWithoutSteering(t *testing.T) {
 	}
 	calls := 0
 	fail := true
-	codexNotice = func(_ context.Context, got inbox.Addr, text string) error {
+	accept := func(text string) error {
 		calls++
-		if got != agent || !strings.Contains(text, r.ID) || !strings.Contains(text, "владелец отказал") {
-			t.Fatalf("wrong access notice: %+v %s", got, text)
+		if !strings.Contains(text, r.ID) || !strings.Contains(text, "владелец отказал") {
+			t.Fatalf("wrong access notice: %s", text)
 		}
 		if fail {
 			return errors.New("mailbox unavailable")
 		}
 		return nil
+	}
+	codexNotice = func(_ context.Context, got inbox.Addr, text string) error {
+		if handoff || got != agent {
+			t.Fatalf("wrong Codex notice address: %+v", got)
+		}
+		return accept(text)
+	}
+	threadNotice = func(_ context.Context, thread, text string) error {
+		if !handoff || thread != "logical-thread" {
+			t.Fatalf("wrong handoff target: %q", thread)
+		}
+		return accept(text)
 	}
 	if tellAgentAccess(context.Background(), r) || calls != 1 {
 		t.Fatalf("failed access notice acknowledged: calls %d", calls)
@@ -92,6 +132,24 @@ func TestCodexAccessNoticeRetryWithoutSteering(t *testing.T) {
 	fail = false
 	if !tellAgentAccess(context.Background(), r) || calls != 2 {
 		t.Fatalf("access notice not retried: calls %d", calls)
+	}
+	if handoff && (r.Agent.Kind != "" || r.Agent.Session != "old-claude") {
+		t.Fatal("delivery changed the saved request address")
+	}
+}
+
+func TestCurrentClaudeNoticeKeepsInbox(t *testing.T) {
+	watchEnv(t)
+	agent := inbox.Addr{Session: "current-claude"}
+	threadOf = func(context.Context, string) (string, error) { return "logical-thread", nil }
+	currentSession = func(context.Context, string) string { return agent.Session }
+	threadNotice = func(context.Context, string, string) error {
+		t.Fatal("current Claude address was sent to the mailbox")
+		return nil
+	}
+	via, err := sendAgentNotice(context.Background(), agent, "synthetic notice")
+	if via != "inbox" || !errors.Is(err, inbox.ErrNoSocket) {
+		t.Fatalf("current Claude route changed: %s, %v", via, err)
 	}
 }
 

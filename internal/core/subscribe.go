@@ -976,7 +976,7 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 			"Это уведомление службы tg-agent, а не просьба владельца: прочитай и действуй " +
 			"по задаче, которую он тебе дал. Отписаться — tg_unsubscribe."
 		via, err := sendAgentNotice(ctx, sub.Agent, text)
-		if err != nil && !sub.Agent.Codex() && sub.Agent.Session != "" {
+		if err != nil && via != "mailbox" && sub.Agent.Session != "" {
 			// процесс сессии остановлен — если это T3 Code, просим его начать ход в треде
 			if time.Since(sent["t3:"+key]) < t3Gap {
 				continue // уже будили через T3: ждём, пока сессия поднимется и назовётся (hello)
