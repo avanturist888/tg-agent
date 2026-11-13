@@ -363,6 +363,74 @@ func TestSubscriptionsFollowNewT3Session(t *testing.T) {
 	}
 }
 
+func TestSubscriptionsFollowCodexHandoff(t *testing.T) {
+	for _, alreadySubscribed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("subscribed=%v", alreadySubscribed), func(t *testing.T) {
+			s := watchEnv(t)
+			ctx := context.Background()
+			rule := s.Chats["test"]
+			rule.Send = true
+			s.Chats["test"] = rule
+			threadOf = func(_ context.Context, session string) (string, error) {
+				if session == "claude-s" || session == "codex-s" {
+					return "same-thread", nil
+				}
+				return "", t3.NoThread
+			}
+			currentSession = func(context.Context, string) string { return "codex-s" }
+			old := inbox.Addr{Session: "claude-s", Socket: "closed", Token: "test-token"}
+			fresh := inbox.Addr{Session: "codex-s", Kind: inbox.KindCodex}
+			appendNewer(s, "test", []int{90, 91, 92})
+			if _, err := Subscribe(WithAgent(ctx, &old), s, "test", SubOpts{After: 90}); err != nil {
+				t.Fatal(err)
+			}
+			if err := editRoutes(s, func(rs routes) bool {
+				rs["test"] = map[int]*route{90: {Chain: []string{old.Key()}, Told: true, At: time.Now()}}
+				return true
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if alreadySubscribed {
+				if _, err := Subscribe(WithAgent(ctx, &fresh), s, "test", SubOpts{After: 92}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := Hello(s, fresh); err != nil {
+				t.Fatal(err)
+			}
+			want := 90
+			if alreadySubscribed {
+				want = 92 // the new provider has already processed these messages
+			}
+			subs := loadSubs(s)
+			if len(subs) != 1 || subs[old.Key()] != nil || subs[fresh.Key()] == nil ||
+				subs[fresh.Key()].Chats["test"] != want || subs[fresh.Key()].Agent != fresh {
+				t.Fatalf("handoff lost the subscription, cursor or provider: %+v", subs)
+			}
+			if r := loadRoutes(s)["test"][90]; r.owner() != fresh.Key() || !r.Told {
+				t.Fatalf("handoff lost existing message ownership: %+v", r)
+			}
+			appendNewer(s, "test", []int{93})
+			calls := 0
+			wakeT3 = func(_ context.Context, _ *config.Settings, session, text string) error {
+				calls++
+				if session != fresh.Session || !strings.Contains(text, fmt.Sprintf("after_id=%d", want)) ||
+					!strings.Contains(text, fmt.Sprintf("новых: %d", 93-want)) {
+					t.Errorf("wrong handoff notification: %s %s", session, text)
+				}
+				return nil
+			}
+			notifyOnce(ctx, s, map[string]time.Time{})
+			if calls != 1 {
+				t.Fatalf("wanted one Codex notification, got %d", calls)
+			}
+			if got := loadSubs(s)[fresh.Key()].Chats["test"]; got != 93 {
+				t.Fatalf("Codex was not notified: cursor %d", got)
+			}
+		})
+	}
+}
+
 func TestSubscribeQueue(t *testing.T) {
 	s := watchEnv(t)
 	rule := s.Chats["test"]
