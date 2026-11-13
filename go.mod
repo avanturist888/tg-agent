@@ -7,7 +7,7 @@ require (
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/coder/websocket v1.8.15
 	github.com/gotd/log v0.1.0
-	github.com/gotd/td v0.165.1
+	github.com/gotd/td v0.166.0
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/joho/godotenv v1.5.1
 	github.com/klauspost/compress v1.19.2
@@ -58,9 +58,9 @@ require (
 	go.mau.fi/libsignal v0.2.2 // indirect
 	go.mau.fi/util v0.11.0 // indirect
 	go.mau.fi/whatsmeow v0.0.0-20261110152934-c88388f983b4 // indirect
-	go.opentelemetry.io/otel v1.44.0 // indirect
-	go.opentelemetry.io/otel/metric v1.44.0 // indirect
-	go.opentelemetry.io/otel/trace v1.44.0 // indirect
+	go.opentelemetry.io/otel v1.45.0 // indirect
+	go.opentelemetry.io/otel/metric v1.45.0 // indirect
+	go.opentelemetry.io/otel/trace v1.45.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
