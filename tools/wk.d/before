@@ -1,22 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# wk owns this run's temporary directory and removes it after its job is empty.
-: "${TMPDIR:?}" "${WK_HOOK_ENV:?}"
-test_home=$(mktemp -d "$TMPDIR/tg-agent-test-home.XXXXXX")
-mkdir -p "$test_home/installation" "$test_home/t3" "$test_home/appdata" "$test_home/localappdata"
+# Native wk owns HOME/AppData/Go/temp before this hook or any project process.
+[[ ${WK_BOOTSTRAP_ISOLATION:-} == clean-v1 ]] || exit 125
+: "${WK_RUN_TMP:?}" "${WK_HOOK_ENV:?}"
+test_home=$(mktemp -d "$(cygpath -u "$WK_RUN_TMP")/tg-agent-test-home.XXXXXX")
+mkdir -p "$test_home/installation" "$test_home/t3"
 test_home_win=$(cygpath -m "$test_home")
-# Reuse the worker's module cache without changing or cleaning its location.
-test_gopath=$(go env GOPATH)
-test_modcache=$(go env GOMODCACHE)
 while IFS= read -r test_key; do
   case "$test_key" in
     TG_*|T3_*|T3CODE_*|CLAUDE_*|CODEX_*) printf '%s=\n' "$test_key" ;;
   esac
 done < <(compgen -e) >> "$WK_HOOK_ENV"
 printf '%s\n' \
-  "HOME=$test_home_win" "USERPROFILE=$test_home_win" \
-  "APPDATA=$test_home_win/appdata" "LOCALAPPDATA=$test_home_win/localappdata" \
   "TG_AGENT_HOME=$test_home_win/installation" "TG_PROFILE=" \
-  "TG_BOT_ENV_FILE=$test_home_win/missing-bot.env" "T3CODE_HOME=$test_home_win/t3" \
-  "GOPATH=$test_gopath" "GOMODCACHE=$test_modcache" \
-  "GOENV=off" "GOFLAGS=" "GOWORK=off" >> "$WK_HOOK_ENV"
+  "TG_BOT_ENV_FILE=$test_home_win/missing-bot.env" "T3CODE_HOME=$test_home_win/t3" >> "$WK_HOOK_ENV"
