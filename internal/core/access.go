@@ -835,8 +835,8 @@ var tellAgentAccess = func(ctx context.Context, r *accessRequest) bool {
 		text = fmt.Sprintf("tg-agent: владелец открыл чат «%s» (запрос %s): alias %q, %s. "+
 			"Обращайся к нему по alias, правила — в tg_list_chats.", r.Title, r.ID, s.Ref(r.Alias), grantedRights(r))
 	}
-	_, err = sendAgentNotice(ctx, *r.Agent, text)
-	if err != nil && !r.Agent.Codex() && r.Agent.Session != "" {
+	err = inbox.Send(ctx, *r.Agent, "tg-agent", text)
+	if err != nil && r.Agent.Session != "" {
 		err = wakeT3(ctx, s, r.Agent.Session, text) // сессию остановил T3 Code
 	}
 	return err == nil
