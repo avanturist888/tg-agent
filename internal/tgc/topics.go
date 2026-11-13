@@ -221,20 +221,23 @@ func (c *Conn) Topics(ctx context.Context, t Target, limit int) ([]Topic, error)
 
 // FillTopics — у форума: отметить выдачу и подтянуть названия тем её сообщений.
 func (c *Conn) FillTopics(ctx context.Context, t Target, b *Batch) error {
-	if t.Kind != "channel" || len(b.Messages) == 0 {
+	if t.Kind != "channel" {
 		return nil
 	}
 	forum := false
 	if ch, ok := b.Chats[t.ID].(*tg.Channel); ok {
 		forum = ch.Forum
 	} else {
+		if len(b.Messages) == 0 {
+			return nil // no channel metadata: do not add an RPC for an empty history
+		}
 		var err error
 		if forum, err = c.IsForum(ctx, t); err != nil {
 			return err
 		}
 	}
 	b.Forum = forum
-	if !forum {
+	if !forum || len(b.Messages) == 0 {
 		return nil
 	}
 	var ids []int

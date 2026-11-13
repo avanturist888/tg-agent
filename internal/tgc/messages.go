@@ -58,6 +58,13 @@ func (c *Conn) unpack(res tg.MessagesMessagesClass) *Batch {
 // beforeID — только старше этого id, afterID — только новее; topic > 0 —
 // только эта тема форума (General — по общей ленте с отбором).
 func (c *Conn) History(ctx context.Context, t Target, limit, beforeID, afterID int, search string, topic int) (*Batch, error) {
+	return c.HistorySince(ctx, t, limit, beforeID, afterID, search, topic, time.Time{})
+}
+
+// HistorySince enforces the time boundary while collecting pages, so rejected
+// messages neither consume the limit nor hide subsequent matching messages.
+// The IDBefore optimization alone does not enforce dates in the returned data.
+func (c *Conn) HistorySince(ctx context.Context, t Target, limit, beforeID, afterID int, search string, topic int, since time.Time) (*Batch, error) {
 	all := &Batch{Users: map[int64]*tg.User{}, Chats: map[int64]tg.ChatClass{}}
 	offset := beforeID
 	pages := 0
@@ -115,6 +122,12 @@ func (c *Conn) History(ctx context.Context, t Target, limit, beforeID, afterID i
 			offset = m.GetID()
 			if topic == GeneralTopic && TopicOf(m, true) != GeneralTopic {
 				continue
+			}
+			if !since.IsZero() {
+				date := messageDate(m)
+				if date <= 0 || time.Unix(int64(date), 0).Before(since) {
+					continue
+				}
 			}
 			if len(all.Messages) < limit {
 				all.Messages = append(all.Messages, m)

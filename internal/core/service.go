@@ -394,7 +394,7 @@ func readTelegram(ctx context.Context, s *config.Settings, rule config.ChatRule,
 				*messages = append(*messages, c.Serialize(m, batch))
 			}
 		} else {
-			if batch, err = c.History(ctx, t, limit, o.BeforeID, o.AfterID, o.Search, o.Topic); err != nil {
+			if batch, err = c.HistorySince(ctx, t, limit, o.BeforeID, o.AfterID, o.Search, o.Topic, o.Since); err != nil {
 				return err
 			}
 			if err := c.FillTopics(ctx, t, batch); err != nil {
