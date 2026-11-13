@@ -120,7 +120,9 @@ bin\tg.exe deny work-team                  # закрыть доступ сов�
 powershell -NoProfile -ExecutionPolicy Bypass -File <tg-agent>\scripts\build.ps1 -Artifacts <каталог-пакета> -BaselinePath <baseline.json>
 ```
 
-Скрипт прогоняет тесты и кладёт `tg.exe` и `tgw.exe` в `bin\`.
+Скрипт проверяет готовый пакет с worker, сохраняет прежние exe/DLL и вводит
+сборку в `bin\`. Тесты, vet и компиляция выполняются на worker; получение
+пакета и сохранение baseline описаны в [порядке выпуска](docs/release-worker.md).
 
 ### 1. Ключи приложения
 
