@@ -209,7 +209,7 @@ func TestUpstreamToAgent(t *testing.T) {
 	f.take()
 	f.value = "26.11.0"
 	CheckUpstream(ctx, s)
-	if calls := f.take(); len(calls) != 1 || !strings.Contains(calls[0], "Разбирает агент") {
+	if calls := f.take(); len(calls) != 1 || !strings.Contains(calls[0], "Задание передано агенту") {
 		t.Fatalf("карточка агенту: %q", calls)
 	}
 	if len(woke) != 1 || !strings.HasPrefix(woke[0], "Обновление: веб-клиент MAX|") ||
@@ -224,7 +224,7 @@ func TestUpstreamToAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if calls := f.take(); strings.Join(calls, "|") != "editMessageText:2|pinChatMessage:2" ||
-		!strings.Contains(f.lastEdit, "Нужно твоё решение:</b> сменился вход") || strings.Contains(f.lastEdit, "Разбирает агент") {
+		!strings.Contains(f.lastEdit, "Нужно твоё решение:</b> сменился вход") || strings.Contains(f.lastEdit, "Задание передано агенту") {
 		t.Fatalf("эскалация: %q %q", calls, f.lastEdit)
 	}
 	if cards, _ := PinnedUpstream(s); len(cards) != 1 || cards[0].Agent {
@@ -237,8 +237,8 @@ func TestUpstreamToAgent(t *testing.T) {
 	wakeErr = errors.New("нет Нестора")
 	f.value = "26.12.0"
 	CheckUpstream(ctx, s)
-	if calls := f.take(); len(calls) != 3 || calls[1] != "editMessageText:3" || calls[2] != "pinChatMessage:3" ||
-		strings.Contains(f.lastEdit, "Разбирает агент") {
+	if calls := f.take(); len(calls) != 2 || calls[1] != "pinChatMessage:3" ||
+		strings.Contains(calls[0], "Задание передано агенту") {
 		t.Fatalf("без агента: %q", calls)
 	}
 	// разобранную агентом карточку снимает ack без открепления

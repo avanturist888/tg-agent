@@ -134,6 +134,8 @@ go.mau.fi/whatsmeow v0.0.0-20261110152934-c88388f983b4 h1:BVSypGljfp5LWOlX/WyqOK
 go.mau.fi/whatsmeow v0.0.0-20261110152934-c88388f983b4/go.mod h1:iY4lm61nTLWsNiIE1EmHUZwhKGBeoV4dhnVE2uMtNoQ=
 go.mau.fi/whatsmeow v0.0.0-20261113153213-1956f9683795 h1:IOhZMUMtwm6xZoyMoeW8vcSwDcQLCFiJanBZgpbXMy8=
 go.mau.fi/whatsmeow v0.0.0-20261113153213-1956f9683795/go.mod h1:iY4lm61nTLWsNiIE1EmHUZwhKGBeoV4dhnVE2uMtNoQ=
+go.mau.fi/whatsmeow v0.0.0-20261113220833-ecc39170bc14 h1:AVvz9wx0sUeLgltHIlaWwPACrmOaAu2yY2yR5EhJfa8=
+go.mau.fi/whatsmeow v0.0.0-20261113220833-ecc39170bc14/go.mod h1:iY4lm61nTLWsNiIE1EmHUZwhKGBeoV4dhnVE2uMtNoQ=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
 go.opentelemetry.io/auto/sdk v1.2.1/go.mod h1:KRTj+aOaElaLi+wW1kO/DZRXwkF4C5xPbEe3ZiIhN7Y=
 go.opentelemetry.io/otel v1.44.0 h1:JjwHmHpA4iZ3wBxluu2fbbE7j4kqlE8jXyAyPXH7HqU=

@@ -40,9 +40,19 @@ func cmdUpdates(ctx context.Context, args []string) int {
 		for _, c := range cards {
 			who := "закреплена для владельца"
 			if c.Agent {
-				who = "разбирает агент"
+				who = "задание передано агенту"
 			}
-			fmt.Printf("%-15s %s (сообщение %d, %s)\n", c.Source, c.Title, c.MessageID, who)
+			card := fmt.Sprintf("сообщение %d", c.MessageID)
+			if c.CardPending {
+				card += ", обновление карточки ожидает доставки"
+				if !c.Agent {
+					who = "нужно внимание владельца"
+				}
+			}
+			if c.MessageID == 0 {
+				card = "карточка ожидает доставки"
+			}
+			fmt.Printf("%-15s %s (%s, %s)\n", c.Source, c.Title, card, who)
 		}
 		return 0
 	case args[0] == "ack" && len(args) >= 3:
@@ -67,7 +77,11 @@ func cmdUpdates(ctx context.Context, args []string) int {
 		}, &c); err != nil {
 			return fail(err)
 		}
-		fmt.Printf("Закреплена для владельца: %s\n", c.Title)
+		if c.CardPending {
+			fmt.Printf("Решение запрошено, карточка ожидает доставки: %s\n", c.Title)
+		} else {
+			fmt.Printf("Закреплена для владельца: %s\n", c.Title)
+		}
 		return 0
 	case args[0] == "thread" && len(args) <= 2:
 		if len(args) == 2 {
