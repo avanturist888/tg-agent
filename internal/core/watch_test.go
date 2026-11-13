@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"tgagent/internal/config"
+	"tgagent/internal/inbox"
 	"tgagent/internal/t3"
 )
 
@@ -35,9 +36,10 @@ func watchEnv(t *testing.T) *config.Settings {
 	config.Root = t.TempDir()
 	t.Cleanup(func() { config.Root = old })
 	// настоящий T3 Code этой машины тесты не трогают
-	oldWake := wakeT3
+	oldWake, oldNotice := wakeT3, codexNotice
 	wakeT3 = func(context.Context, *config.Settings, string, string) error { return t3.Unavailable }
-	t.Cleanup(func() { wakeT3 = oldWake })
+	codexNotice = func(context.Context, inbox.Addr, string) error { return t3.Unavailable }
+	t.Cleanup(func() { wakeT3, codexNotice = oldWake, oldNotice })
 	oldThread, oldCur, oldInfo := threadOf, currentSession, threadInfo
 	threadOf = func(context.Context, string) (string, error) { return "", t3.NoThread }
 	currentSession = func(context.Context, string) string { return "" }
