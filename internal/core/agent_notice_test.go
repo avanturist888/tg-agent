@@ -1,0 +1,92 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"tgagent/internal/config"
+	"tgagent/internal/inbox"
+	"tgagent/internal/t3"
+)
+
+func TestCodexNoticeMailboxContract(t *testing.T) {
+	notice := codexNotice
+	watchEnv(t)
+	t.Setenv("TG_NESTOR", "synthetic-nestor")
+	oldSend := nestorSend
+	t.Cleanup(func() { nestorSend = oldSend })
+	threadOf = func(_ context.Context, session string) (string, error) {
+		if session != "native-codex" {
+			t.Fatalf("wrong session: %q", session)
+		}
+		return "mcp:target", nil
+	}
+	calls := 0
+	var sendError error
+	nestorSend = func(_ context.Context, exe, text string, args ...string) error {
+		calls++
+		if exe != "synthetic-nestor" || text != "tg-agent: test 11" || strings.Join(args, " ") != "send mcp:target -" {
+			t.Fatalf("mailbox invocation: %q %q %q", exe, text, args)
+		}
+		return sendError
+	}
+	agent := inbox.Addr{Kind: inbox.KindCodex, Session: "native-codex"}
+	if err := notice(context.Background(), agent, "tg-agent: test 11"); err != nil || calls != 1 {
+		t.Fatalf("mailbox: %v, calls %d", err, calls)
+	}
+	sendError = errors.New("mailbox unavailable")
+	if err := notice(context.Background(), agent, "tg-agent: test 11"); !errors.Is(err, sendError) {
+		t.Fatalf("mailbox failure hidden: %v", err)
+	}
+	threadOf = func(context.Context, string) (string, error) { return "", t3.NoThread }
+	if err := notice(context.Background(), agent, "tg-agent: test 11"); !errors.Is(err, t3.NoThread) || calls != 2 {
+		t.Fatalf("unknown thread sent: %v, calls %d", err, calls)
+	}
+}
+
+func TestCodexNotificationRetryWithoutSteering(t *testing.T) {
+	s := watchEnv(t)
+	ctx := context.Background()
+	agent := inbox.Addr{Kind: inbox.KindCodex, Session: "native-codex"}
+	if _, err := appendNewer(s, "test", []int{10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Subscribe(WithAgent(ctx, &agent), s, "test", SubOpts{After: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := appendNewer(s, "test", []int{11}); err != nil {
+		t.Fatal(err)
+	}
+	wakeT3 = func(context.Context, *config.Settings, string, string) error {
+		t.Fatal("Codex notification fell back to user/steer")
+		return nil
+	}
+	calls := 0
+	fail := true
+	codexNotice = func(_ context.Context, got inbox.Addr, text string) error {
+		calls++
+		if got != agent || !strings.Contains(text, "after_id=10") {
+			t.Fatalf("wrong notice: %+v %s", got, text)
+		}
+		if fail {
+			return errors.New("mailbox unavailable")
+		}
+		return nil
+	}
+	notifyOnce(ctx, s, map[string]time.Time{})
+	if got := loadSubs(s)[agent.Key()].Chats["test"]; got != 10 {
+		t.Fatalf("failed notice lost backlog: cursor %d", got)
+	}
+	fail = false
+	notifyOnce(ctx, s, map[string]time.Time{})
+	if got := loadSubs(s)[agent.Key()].Chats["test"]; got != 11 || calls != 2 {
+		t.Fatalf("notice not retried: cursor %d, calls %d", got, calls)
+	}
+	notifyOnce(ctx, s, map[string]time.Time{})
+	if calls != 2 {
+		t.Fatalf("accepted notice duplicated: %d calls", calls)
+	}
+}
