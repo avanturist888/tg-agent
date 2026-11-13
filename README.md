@@ -117,7 +117,7 @@ bin\tg.exe deny work-team                  # закрыть доступ сов�
 Нужен Go (версию он подтянет сам по `go.mod`).
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File <tg-agent>\scripts\build.ps1 -Artifacts <каталог-пакета>
+powershell -NoProfile -ExecutionPolicy Bypass -File <tg-agent>\scripts\build.ps1 -Artifacts <каталог-пакета> -BaselinePath <baseline.json>
 ```
 
 Скрипт прогоняет тесты и кладёт `tg.exe` и `tgw.exe` в `bin\`.
@@ -244,8 +244,10 @@ powershell -ExecutionPolicy Bypass -File <tg-agent>\scripts\build.ps1 -Artifacts
 тесты, vet и сборка exe/DLL с манифестом SHA256. Пакет возвращается через
 общий мост `wk get`. Локально команда выше запускается с
 `-Artifacts <каталог пакета>`: проверяет состав, ревизию и суммы, сохраняет
-прежние файлы и перезапускает службу. До выпуска общего моста wk обновление
-этим путём ожидает его подключения. Агентов останавливать не
+прежние файлы и перезапускает ранее работавшие службы. До сборки сохраняется
+состояние локальных exe/DLL; установщик сверяет его с `baseline.json`, чтобы
+не затереть другое обновление. Порядок и границы отката —
+[выпуск через worker](docs/release-worker.md). Агентов останавливать не
 нужно: их MCP-прослойка замечает новую сборку сама. Открытое окно управления
 открыть заново.
 

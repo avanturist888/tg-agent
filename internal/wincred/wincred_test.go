@@ -3,12 +3,20 @@
 package wincred
 
 import (
+	"crypto/rand"
 	"errors"
+	"fmt"
 	"testing"
 )
 
 func TestRoundTrip(t *testing.T) {
-	const target = "tg-agent/test/wincred-roundtrip"
+	// Credential Manager belongs to the Windows user, not HOME/AppData.
+	// Each run owns its own key even when several test binaries run together.
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		t.Fatal(err)
+	}
+	target := fmt.Sprintf("tg-agent/test/wincred-roundtrip-%x", id)
 	t.Cleanup(func() { _ = Delete(target) })
 	if err := Set(target, "секрет:123_abc"); err != nil {
 		t.Fatal(err)

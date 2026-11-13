@@ -6,12 +6,16 @@ $installer = Join-Path $PSScriptRoot 'install-build.ps1'
 $commit = git -C (Split-Path -Parent $PSScriptRoot) rev-parse HEAD
 $build = $commit.Substring(0, 12) + '-20261112.220000'
 $global:tgInstallerFixtureBuild = $build
+$global:tgInstallerFixtureCommit = $commit
+$global:tgInstallerFixtureModified = 'false'
 function go {
     $global:LASTEXITCODE = 0
     "build -ldflags=`"-X tgagent/internal/config.Build=$global:tgInstallerFixtureBuild`""
+    "build vcs.revision=$global:tgInstallerFixtureCommit"
+    "build vcs.modified=$global:tgInstallerFixtureModified"
 }
-function Assert-Rejected([string]$reason) {
-    try { & $installer -Artifacts $fixture -ValidateOnly } catch {
+function Assert-Rejected([string]$reason, [switch]$Install, [string]$BaselinePath) {
+    try { & $installer -Artifacts $fixture -ValidateOnly:(!$Install) -BaselinePath $BaselinePath } catch {
         if ($_.Exception.Message -notlike $reason) { throw }
         return
     }
@@ -28,6 +32,35 @@ try {
     function Save-Manifest { $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $fixture 'manifest.json') }
     Save-Manifest
     & $installer -Artifacts $fixture -ValidateOnly
+    Assert-Rejected 'Capture the local bin baseline*' -Install
+    $baselinePath = Join-Path $fixture ('../tg-install-baseline-' + [guid]::NewGuid().ToString('N') + '.json')
+    $baseline = @{root='wrong'; commit=$commit; files=@()}
+    $baseline | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 -LiteralPath $baselinePath
+    Assert-Rejected 'Wrong installation baseline.*' -BaselinePath $baselinePath
+    $localRoot = Split-Path -Parent $PSScriptRoot
+    $baseline.root = $localRoot
+    $baseline.files = @($names | ForEach-Object {
+        # An intentionally changed existence state fails before task APIs/cutover.
+        @{name=$_; present=(!(Test-Path -LiteralPath (Join-Path $localRoot "bin/$_") -PathType Leaf)); sha256='wrong'}
+    })
+    $baseline | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 -LiteralPath $baselinePath
+    Assert-Rejected 'Local binary changed since baseline*' -BaselinePath $baselinePath
+    $baseline.files = @($names | ForEach-Object {
+        $current = Join-Path $localRoot "bin/$_"
+        $present = Test-Path -LiteralPath $current -PathType Leaf
+        @{name=$_; present=$present; sha256=$(if ($present) { (Get-FileHash -LiteralPath $current -Algorithm SHA256).Hash } else { $null })}
+    })
+    $baseline | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 -LiteralPath $baselinePath
+    & $installer -Artifacts $fixture -ValidateOnly -BaselinePath $baselinePath
+    [IO.File]::WriteAllText((Join-Path $fixture 'extra.dll'), 'fixture')
+    Assert-Rejected 'Unexpected package contents.*'
+    [IO.File]::Delete((Join-Path $fixture 'extra.dll'))
+    $global:tgInstallerFixtureCommit = '0000000000000000000000000000000000000000'
+    Assert-Rejected 'Embedded source revision does not match*'
+    $global:tgInstallerFixtureCommit = $commit
+    $global:tgInstallerFixtureModified = 'true'
+    Assert-Rejected 'Embedded source revision does not match*'
+    $global:tgInstallerFixtureModified = 'false'
     $manifest.Remove('build')
     Save-Manifest
     Assert-Rejected 'Missing or invalid build ID.*'
@@ -64,6 +97,9 @@ try {
     Write-Output 'Installer checks passed: manifest, embedded build, hash, recovery continues after a locked file.'
 } finally {
     Remove-Variable -Name tgInstallerFixtureBuild -Scope Global
+    Remove-Variable -Name tgInstallerFixtureCommit -Scope Global
+    Remove-Variable -Name tgInstallerFixtureModified -Scope Global
+    if ($baselinePath -and [IO.File]::Exists($baselinePath)) { [IO.File]::Delete($baselinePath) }
     foreach ($path in [IO.Directory]::GetFiles($fixture)) { [IO.File]::Delete($path) }
     [IO.Directory]::Delete($fixture)
 }
