@@ -6,7 +6,7 @@ package core
 // служба WhatsApp сама зовёт разбор, если сервер отверг её клиент как
 // устаревший (core/wa.go). Изменение сначала разбирает агент, а не владелец
 // (он не передатчик): карточка уходит в бот без звука и закрепления, а агент
-// проекта просыпается в назначенном треде (tg updates thread) или в новом
+// проекта просыпается только в назначенном треде (tg updates thread)
 // (через Нестора) — проверяет, чинит сам и
 // снимает карточку (tg updates ack) или зовёт владельца (tg updates escalate:
 // закрепить со звуком). Агента не разбудить — карточка сразу владельцу,
@@ -564,7 +564,7 @@ func ReportIncident(ctx context.Context, s *config.Settings, in UpstreamIncident
 	return map[string]bool{"ok": true}, sendPinned(ctx, s, in.Card, in.Source, in.Title, in.Brief)
 }
 
-// ReadUpstreamThread — назначенный тред; nil — каждый раз новый.
+// ReadUpstreamThread — назначенный тред; nil — автоматический разбор не настроен.
 func ReadUpstreamThread() *UpstreamThread {
 	db, err := upstreamDB()
 	if err != nil {
@@ -578,18 +578,18 @@ func ReadUpstreamThread() *UpstreamThread {
 	return &t
 }
 
-// SetUpstreamThread — назначить тред ("" — снова новый тред на каждое изменение).
+// SetUpstreamThread — назначить существующий тред для автоматического разбора.
 func SetUpstreamThread(thread string) error {
+	thread = strings.TrimSpace(thread)
+	if thread == "" || thread == "new" {
+		return errors.New("укажите существующий тред: tg updates thread here|<id>")
+	}
 	db, err := upstreamDB()
 	if err != nil {
 		return err
 	}
 	ctx := context.Background()
-	thread = strings.TrimSpace(thread)
 	return db.Write(ctx, func(tx *sql.Tx) error {
-		if thread == "" {
-			return store.DelKV(ctx, tx, store.KeyUpstreamThread)
-		}
 		return store.PutKV(ctx, tx, store.KeyUpstreamThread, UpstreamThread{Thread: thread, Set: time.Now()})
 	})
 }
@@ -614,26 +614,23 @@ var nestorSend = func(ctx context.Context, exe, text string, args ...string) err
 }
 
 // wakeProjectAgent — разбудить агента этого проекта через Нестора (почта
-// между агентами машины): в назначенном треде (tg updates thread), а без
-// него или если туда не дошло — в новом. Нет Нестора — ошибка: карточка
-// тогда идёт владельцу.
+// между агентами машины): только в назначенном треде (tg updates thread).
+// Нет назначения или доставка не удалась — ошибка, карточка идёт владельцу;
+// другой тред автоматически не создаётся.
 func wakeProjectAgent(ctx context.Context, s *config.Settings, title, text string) error {
 	exe := nestorExe()
 	if exe == "" {
 		return errors.New("Нестор не найден (TG_NESTOR, PATH, ~/nestor/bin)")
 	}
-	if t := ReadUpstreamThread(); t != nil {
-		tctx, cancel := context.WithTimeout(ctx, 30*time.Second) // на запасной путь должно остаться время
-		err := nestorSend(tctx, exe, "«"+title+"»\n\n"+text, "send", t.Thread, "-")
-		cancel()
-		if err == nil {
-			return nil
-		}
-		if s != nil {
-			logEvent(s, "upstream_wake_thread_failed", "thread", t.Thread, "error", err.Error())
-		}
+	t := ReadUpstreamThread()
+	if t == nil {
+		return errors.New("тред разбора не назначен: tg updates thread here|<id>")
 	}
-	return nestorSend(ctx, exe, text, "send", config.Root, "-", "--new", "--title", title)
+	err := nestorSend(ctx, exe, "«"+title+"»\n\n"+text, "send", t.Thread, "-")
+	if err != nil && s != nil {
+		logEvent(s, "upstream_wake_thread_failed", "thread", t.Thread, "error", err.Error())
+	}
+	return err
 }
 
 func nestorExe() string {

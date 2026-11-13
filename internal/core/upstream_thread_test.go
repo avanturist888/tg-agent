@@ -17,21 +17,22 @@ func TestUpstreamWakeThread(t *testing.T) {
 	t.Cleanup(func() { config.Root, nestorSend = old, oldSend })
 	var calls [][]string
 	fail := map[string]bool{}
+	sendErr := errors.New("тред закрыт")
 	nestorSend = func(_ context.Context, exe, text string, args ...string) error {
 		calls = append(calls, append([]string{text}, args...))
 		if fail[args[1]] {
-			return errors.New("тред закрыт")
+			return sendErr
 		}
 		return nil
 	}
 	s := &config.Settings{}
 
-	// без назначенного — новый тред, как было
-	if err := wakeProjectAgent(context.Background(), s, "Заголовок", "задание"); err != nil {
-		t.Fatal(err)
+	// Без назначения не создаём ни тред, ни письмо другому агенту.
+	if err := wakeProjectAgent(context.Background(), s, "Заголовок", "задание"); err == nil {
+		t.Fatal("нет ошибки при отсутствующем назначении")
 	}
-	if got := strings.Join(calls[0][1:], " "); got != "send "+config.Root+" - --new --title Заголовок" {
-		t.Fatalf("новый тред: %q", got)
+	if len(calls) != 0 {
+		t.Fatalf("отправка без назначения: %q", calls)
 	}
 
 	// назначенный — туда, с заголовком в тексте
@@ -46,18 +47,29 @@ func TestUpstreamWakeThread(t *testing.T) {
 		t.Fatalf("назначенный тред: %q", calls)
 	}
 
-	// не дошло — новый тред
+	// Не дошло — ошибка остаётся видимой, никакого нового треда.
 	fail["mcp:abc"] = true
 	calls = nil
-	if err := wakeProjectAgent(context.Background(), s, "Заголовок", "задание"); err != nil {
-		t.Fatal(err)
+	if err := wakeProjectAgent(context.Background(), s, "Заголовок", "задание"); !errors.Is(err, sendErr) {
+		t.Fatalf("ошибка доставки потеряна: %v", err)
 	}
-	if len(calls) != 2 || calls[1][4] != "--new" {
-		t.Fatalf("запасной путь: %q", calls)
+	if len(calls) != 1 || strings.Join(calls[0][1:], " ") != "send mcp:abc -" {
+		t.Fatalf("адресат после сбоя: %q", calls)
 	}
 
-	if err := SetUpstreamThread(""); err != nil || ReadUpstreamThread() != nil {
-		t.Fatalf("сброс: %v", err)
+	for _, invalid := range []string{"", "   ", "new"} {
+		if err := SetUpstreamThread(invalid); err == nil {
+			t.Fatalf("принято пустое/новое назначение: %q", invalid)
+		}
+		if got := ReadUpstreamThread(); got == nil || got.Thread != "mcp:abc" {
+			t.Fatalf("назначение потеряно: %+v", got)
+		}
+	}
+	// После восстановления тот же тред получает повтор.
+	fail["mcp:abc"] = false
+	calls = nil
+	if err := wakeProjectAgent(context.Background(), s, "Заголовок", "задание"); err != nil || len(calls) != 1 {
+		t.Fatalf("повтор: %v, %q", err, calls)
 	}
 }
 
