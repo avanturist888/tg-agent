@@ -3,3 +3,4 @@
 ^profiles(/|$)
 ^config/chats\.toml$
 ^config/(agents|t3)\.toml$
+!.env.example
