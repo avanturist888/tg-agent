@@ -24,8 +24,12 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	config.Root = dir
-	for _, key := range []string{"TG_AGENT_HOME", "T3CODE_HOME"} {
-		if err := os.Setenv(key, dir); err != nil {
+	for key, value := range map[string]string{
+		"TG_AGENT_HOME":   dir,
+		"T3CODE_HOME":     dir,
+		"TG_BOT_ENV_FILE": filepath.Join(dir, "missing-bot.env"),
+	} {
+		if err := os.Setenv(key, value); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.RemoveAll(dir)
 			os.Exit(1)

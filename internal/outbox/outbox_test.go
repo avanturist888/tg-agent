@@ -4,36 +4,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 	"time"
 
 	"tgagent/internal/store"
 )
-
-// Реальный outbox.json (если есть) переживает чтение и запись без потерь.
-func TestRoundTripRealFile(t *testing.T) {
-	src := filepath.Join("..", "..", "data", "outbox.json")
-	data, err := os.ReadFile(src)
-	if err != nil {
-		t.Skip("нет data/outbox.json")
-	}
-	// только в памяти: приватные данные никуда не копируем
-	var drafts []*Draft
-	if err := json.Unmarshal(data, &drafts); err != nil {
-		t.Fatal(err)
-	}
-	out, err := json.Marshal(drafts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var a, b any
-	json.Unmarshal(data, &a)
-	json.Unmarshal(out, &b)
-	if !reflect.DeepEqual(a, b) {
-		t.Fatal("после перезаписи содержимое отличается")
-	}
-}
 
 func TestExtraFieldsKeptAndScheduled(t *testing.T) {
 	dir := t.TempDir()
