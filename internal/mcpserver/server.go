@@ -16,8 +16,8 @@ import (
 	"tgagent/internal/core"
 	"tgagent/internal/lock"
 	"tgagent/internal/omap"
-	"tgagent/internal/secret"
 	"tgagent/internal/outbox"
+	"tgagent/internal/secret"
 	"tgagent/internal/svc"
 	"tgagent/internal/tgc"
 )
@@ -721,6 +721,15 @@ forwarded_from.name, если он скрыл аккаунт), forwarded_from.da
 вперемешку. Отвечаешь в теме — пиши черновик с reply_to (тема определится
 сама) или с topic.
 
+Checklist (media = todo) содержит todo: title, items (id, text, completed,
+completed_by_id, completed_at), others_can_append/others_can_complete.
+Служебные изменения списка — todo_action: append с items либо completion
+с completed_ids/incompleted_ids; reply_to указывает сообщение списка.
+Это событие изменения, не текущий snapshot: сам список перечитай по ids.
+Если подписи нет, text содержит читаемое представление списка/изменения.
+Entities заголовка и пунктов сохраняют разметку/ссылки, offsets — UTF-16.
+Чтение не меняет checklist и не отмечает пункты выполненными.
+
 Голосовые и кружки (media = voice / video_note) приходят с расшифровкой:
 русская речь — GigaAM на машине владельца, другая — Telegram; чем именно —
 transcript_engine, язык — transcript_language. transcript_status: done —
@@ -981,7 +990,7 @@ BotFather с отправкой (если нет — tg_request_access(chat_id=9
 			})
 		})
 
-	mcp.AddTool(server, &mcp.Tool{Name: "tg_vote",Description: `Проголосовать в опросе от имени владельца (или снять его голос). САМО ПО СЕБЕ НЕ ГОЛОСУЕТ —
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_vote", Description: `Проголосовать в опросе от имени владельца (или снять его голос). САМО ПО СЕБЕ НЕ ГОЛОСУЕТ —
 кроме чатов с автоотправкой.
 
 Голос («приду», «беру») — обещание от имени владельца, поэтому он идёт тем

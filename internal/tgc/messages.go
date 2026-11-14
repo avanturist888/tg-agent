@@ -374,6 +374,9 @@ func MediaLabel(m *tg.Message) string {
 	if WidgetOf(m) != nil {
 		return "widget"
 	}
+	if _, ok := m.Media.(*tg.MessageMediaToDo); ok {
+		return "todo"
+	}
 	if doc != nil {
 		if name := fileName(doc); name != "" {
 			return "file:" + name
@@ -592,6 +595,7 @@ func (c *Conn) Serialize(m tg.MessageClass, b *Batch) *omap.Map {
 		if a, ok := v.Action.(*tg.MessageActionTopicCreate); ok {
 			out.Set("text", a.Title)
 		}
+		setTodo(out, v)
 		setTopic(out, m, b)
 		return out
 	case *tg.Message:
@@ -625,6 +629,7 @@ func (c *Conn) Serialize(m tg.MessageClass, b *Batch) *omap.Map {
 		if w := WidgetOf(v); w != nil {
 			out.Set("widget", WidgetInfo(w)) // HTML-сообщение бота; сам HTML — tg_view_media
 		}
+		setTodo(out, v)
 		if f := File(v); f != nil && PhotoOf(v) == nil && !isSticker(DocumentOf(v)) {
 			var name any
 			if f.Name != "" {

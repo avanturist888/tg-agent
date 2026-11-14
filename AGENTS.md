@@ -806,6 +806,18 @@ tg_search_chat(chat="work-team", query="деплой") → найти по сл�
 `tg_draft_message` (`linked`, `ambiguous`, `not_found` — с подсказкой) и при
 нужде пересоздай черновик со ссылкой.
 
+**Checklist (списки задач).** У `media: "todo"` есть `todo`: `title`,
+`items` с `id`, `text`, `completed`; у выполненного — `completed_by_id`
+и `completed_at`. ID пункта принадлежит этому списку, это не id сообщения.
+`others_can_append` / `others_can_complete` — разрешения самого списка.
+Разметка и скрытые ссылки — `title_entities` / `items[].entities`;
+`offset`/`length` там в единицах UTF-16 Telegram. В `text` без подписи —
+читаемое представление списка. Служебные изменения сохраняют `service_action`
+и `reply_to`, а в `todo_action` дают `type: "append"` с добавленными `items`
+или `type: "completion"` с `completed_ids` / `incompleted_ids`. Это изменения
+в момент события, не текущие статусы; свежий список читай по `reply_to`.
+Чтение ничего не отмечает выполненным; операций изменения checklist пока нет.
+
 **Пересланные сообщения.** У пересланного есть `forwarded_from`, и тогда
 `from` — тот, кто переслал, а не автор. Автор оригинала — в
 `forwarded_from.from` (человек или канал, `channel: true`), а если он скрыл
