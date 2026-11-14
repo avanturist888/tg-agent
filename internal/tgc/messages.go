@@ -137,6 +137,9 @@ func (c *Conn) HistorySince(ctx context.Context, t Target, limit, beforeID, afte
 			break
 		}
 	}
+	if err := c.completeRich(ctx, t, all); err != nil {
+		return nil, err
+	}
 	c.Peers.Save()
 	return all, nil
 }
@@ -153,6 +156,9 @@ func (c *Conn) HistoryAround(ctx context.Context, t Target, date, limit int) (*B
 		return nil, err
 	}
 	b := c.unpack(res)
+	if err := c.completeRich(ctx, t, b); err != nil {
+		return nil, err
+	}
 	c.Peers.Save()
 	return b, nil
 }
@@ -220,6 +226,9 @@ func (c *Conn) Messages(ctx context.Context, t Target, ids []int) (*Batch, error
 				all.Messages = append(all.Messages, m)
 			}
 		}
+	}
+	if err := c.completeRich(ctx, t, all); err != nil {
+		return nil, err
 	}
 	c.Peers.Save()
 	return all, nil
@@ -605,6 +614,9 @@ func (c *Conn) Serialize(m tg.MessageClass, b *Batch) *omap.Map {
 			// у rich-сообщения message пустой — текст собираем из блоков
 			out.Set("text", richtext.ToMarkdown(rich))
 			out.Set("rich", true)
+			if rich.Part {
+				out.Set("rich_partial", true)
+			}
 		}
 		if v.Mentioned {
 			out.Set("mentioned", true) // упомянули владельца аккаунта
