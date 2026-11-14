@@ -120,3 +120,29 @@ func TestTodoEmptyAndUnrelatedMessages(t *testing.T) {
 		}
 	}
 }
+
+func TestTodoEntityPayloads(t *testing.T) {
+	media := &tg.MessageMediaToDo{Todo: tg.TodoList{Title: tg.TextWithEntities{
+		Text: "Дата и правка",
+		Entities: []tg.MessageEntityClass{
+			&tg.MessageEntityFormattedDate{Offset: 0, Length: 4, Date: 1_800_000_000,
+				Relative: true, ShortTime: true, LongDate: true, DayOfWeek: true},
+			&tg.MessageEntityDiffReplace{Offset: 7, Length: 6, OldText: "прежнее"},
+			&tg.MessageEntityBlockquote{Length: 13, Collapsed: true},
+		},
+	}}}
+	out := serializedTodo(t, &tg.Message{ID: 45, Media: media})
+	entities := out["todo"].(map[string]any)["title_entities"].([]any)
+	date := entities[0].(map[string]any)
+	if date["date"] != float64(1_800_000_000) {
+		t.Fatalf("formatted date lost timestamp: %+v", date)
+	}
+	for key, want := range map[string]bool{"relative": true, "short_time": true, "long_time": false, "short_date": false, "long_date": true, "day_of_week": true} {
+		if date[key] != want {
+			t.Fatalf("date rendering flag %s: %+v", key, date)
+		}
+	}
+	if entities[1].(map[string]any)["old_text"] != "прежнее" || entities[2].(map[string]any)["collapsed"] != true {
+		t.Fatalf("entity payloads lost: %+v", entities)
+	}
+}

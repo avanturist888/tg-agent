@@ -99,6 +99,15 @@ func todoEntities(entities []tg.MessageEntityClass) []*omap.Map {
 			row.Set("document_id", fmt.Sprint(e.DocumentID))
 		case *tg.MessageEntityPre:
 			row.Set("language", e.Language)
+		case *tg.MessageEntityFormattedDate:
+			row.Set("date", e.Date).Set("relative", e.Relative).
+				Set("short_time", e.ShortTime).Set("long_time", e.LongTime).
+				Set("short_date", e.ShortDate).Set("long_date", e.LongDate).
+				Set("day_of_week", e.DayOfWeek)
+		case *tg.MessageEntityDiffReplace:
+			row.Set("old_text", e.OldText)
+		case *tg.MessageEntityBlockquote:
+			row.Set("collapsed", e.Collapsed)
 		}
 		rows = append(rows, row)
 	}
