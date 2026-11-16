@@ -270,8 +270,8 @@ func MediaInfo(m *Message) (*Media, whatsmeow.DownloadableMessage, error) {
 		e := msg.GetPtvMessage()
 		dl = e
 		md.MIME, md.Size, md.Thumb, md.Seconds, md.Name = e.GetMimetype(), int64(e.GetFileLength()), e.GetJPEGThumbnail(), float64(e.GetSeconds()), "video_note.mp4"
-	case msg.VideoMessage != nil:
-		e := msg.GetVideoMessage()
+	case videoOf(&msg) != nil:
+		e := videoOf(&msg)
 		dl = e
 		md.MIME, md.Size, md.Thumb, md.Seconds, md.Name = e.GetMimetype(), int64(e.GetFileLength()), e.GetJPEGThumbnail(), float64(e.GetSeconds()), "video.mp4"
 	case msg.AudioMessage != nil:

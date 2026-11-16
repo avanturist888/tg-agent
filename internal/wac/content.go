@@ -34,8 +34,8 @@ func Parse(m *waE2E.Message) Content {
 	case m.PtvMessage != nil:
 		e := m.GetPtvMessage()
 		return Content{Text: e.GetCaption(), Kind: "video_note", Context: e.GetContextInfo()}
-	case m.VideoMessage != nil:
-		e := m.GetVideoMessage()
+	case videoOf(m) != nil:
+		e := videoOf(m)
 		kind := "video"
 		if e.GetGifPlayback() {
 			kind = "animation"
@@ -88,6 +88,15 @@ func Parse(m *waE2E.Message) Content {
 		return Content{Text: strings.TrimSpace(e.GetName() + "\n" + e.GetDescription()), Kind: "event", Context: e.GetContextInfo()}
 	}
 	return Content{}
+}
+
+// videoOf accepts both ordinary videos and the newer instant-video envelope.
+// PtvMessage retains its distinct video_note handling above.
+func videoOf(m *waE2E.Message) *waE2E.VideoMessage {
+	if v := m.GetVideoMessage(); v != nil {
+		return v
+	}
+	return m.GetInstantVideoMessage()
 }
 
 func pollOf(m *waE2E.Message) *waE2E.PollCreationMessage {
