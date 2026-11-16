@@ -47,14 +47,27 @@ func CleanupSavedFile(ctx context.Context, s *config.Settings, id string) (*omap
 		if err != nil {
 			return err
 		}
-		if t.Kind != "self" {
-			return denied("Alias saved должен указывать именно на Избранное этого аккаунта.")
-		}
-		return c.DeleteMessages(ctx, t, []int{int(*d.MessageID)})
+		return cleanupSavedMessage(ctx, c, t, int(*d.MessageID))
 	})
 	if err != nil {
 		return nil, err
 	}
 	logEvent(s, "saved_file_deleted", "draft_id", d.ID, "chat", rule.Alias, "message_id", *d.MessageID)
 	return omap.New().Set("deleted", true).Set("draft_id", d.ID).Set("message_id", *d.MessageID), nil
+}
+
+func cleanupSavedMessage(ctx context.Context, c *tgc.Conn, t tgc.Target, id int) error {
+	if t.Kind != "self" {
+		return denied("Alias saved должен указывать именно на Избранное этого аккаунта.")
+	}
+	// Private-chat message IDs are global. The alias stored in an old draft
+	// may have been rebound, so the current target alone is not enough.
+	m, _, err := c.Message(ctx, t, id)
+	if err != nil {
+		return err
+	}
+	if m == nil {
+		return denied("Сообщение не найдено именно в Избранном — удаление не выполняется.")
+	}
+	return c.DeleteMessages(ctx, t, []int{id})
 }
