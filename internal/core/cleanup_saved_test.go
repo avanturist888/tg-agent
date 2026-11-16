@@ -17,6 +17,7 @@ import (
 func TestSavedFileCleanupGuards(t *testing.T) {
 	s := watchEnv(t)
 	s.Chats["saved"] = config.ChatRule{Alias: "saved", Peer: "me", Read: true, Send: true}
+	s.ChatOrder = append(s.ChatOrder, "saved")
 	box := outbox.New(s.DataDir())
 	create := func(chat, text string, count int, sent bool, age time.Duration) string {
 		t.Helper()
