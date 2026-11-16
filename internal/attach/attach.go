@@ -151,7 +151,7 @@ func Snapshot(s *config.Settings, draftID string, paths []string, asFiles bool) 
 		}
 		return nil, err
 	}
-	result, err := snapshotInto(target, ok, asFiles)
+	result, err := snapshotInto(target, ok, asFiles, s.IsTelegram())
 	if err != nil {
 		_ = os.RemoveAll(target)
 		return nil, err
@@ -167,7 +167,7 @@ type checkedFile struct {
 	size int64
 }
 
-func snapshotInto(target string, ok []checkedFile, asFiles bool) ([]outbox.FileSnap, error) {
+func snapshotInto(target string, ok []checkedFile, asFiles, audio bool) ([]outbox.FileSnap, error) {
 	var result []outbox.FileSnap
 	for i, c := range ok {
 		// своя подпапка на файл: имя остаётся исходным — Telegram берёт его
@@ -183,6 +183,11 @@ func snapshotInto(target string, ok []checkedFile, asFiles bool) ([]outbox.FileS
 		snap := outbox.FileSnap{Path: copyPath, Name: filepath.Base(c.path), Size: c.size, Source: c.path}
 		if !asFiles && photoOK(copyPath, c.size) {
 			snap.Kind = outbox.KindPhoto
+		} else if !asFiles && audio {
+			switch strings.ToLower(filepath.Ext(copyPath)) {
+			case ".mp3", ".m4a", ".m4b":
+				snap.Kind = outbox.KindAudio
+			}
 		}
 		result = append(result, snap)
 	}

@@ -129,10 +129,26 @@ func route(next mcp.MethodHandler) mcp.MethodHandler {
 			for _, acct := range others() {
 				parts = append(parts, part(acct, forward(ctx, acct, name, raw)))
 			}
-			return text(omap.Pretty(omap.New().Set("accounts", parts).Set("hint",
-				"Аккаунтов несколько. К чату не основного аккаунта обращайся «<аккаунт>/<alias>» "+
-					"(alias в списке уже так и записан); alias, который есть только у одного аккаунта, "+
-					"работает и без него."))), nil
+			hint := "Результаты сгруппированы по аккаунтам."
+			switch name {
+			case "tg_list_chats":
+				hint = "Аккаунтов несколько. К чату не основного аккаунта обращайся «<аккаунт>/<alias>» " +
+					"(alias в списке уже так и записан); alias, который есть только у одного аккаунта, работает и без него."
+			case "tg_list_drafts":
+				hint = "Черновики сгруппированы по аккаунтам. Фильтр status действует для каждого аккаунта; аргумента chat нет."
+			}
+			failed := false
+			for _, p := range parts {
+				if _, ok := p.Get("error"); ok {
+					failed = true
+				}
+			}
+			if failed {
+				hint += " Есть ошибки: проверь error/message нужного аккаунта."
+			}
+			out := text(omap.Pretty(omap.New().Set("accounts", parts).Set("hint", hint)))
+			out.IsError = failed
+			return out, nil
 		}
 		return local()
 	}
@@ -258,6 +274,11 @@ func part(acct string, res mcp.Result) *omap.Map {
 	}
 	m.Delete("account")
 	m.Delete("hint")
+	if r, ok := res.(*mcp.CallToolResult); ok && r.IsError {
+		if _, exists := m.Get("error"); !exists {
+			m.Set("error", "tool_error")
+		}
+	}
 	return out.Merge(m)
 }
 

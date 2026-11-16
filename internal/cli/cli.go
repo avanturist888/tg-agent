@@ -86,6 +86,7 @@ func init() {
 		{name: "read", help: "прочитать чат", run: cmdRead},
 		{name: "bot-token", help: "токен бота из ответа BotFather — только в трубу: tg bot-token botfather | …", run: cmdBotToken},
 		{name: "drafts", help: "очередь черновиков от агентов", run: cmdDrafts},
+		{name: "cleanup-saved-file", help: "удалить свой файл из Избранного по draft_id (не старше часа)", run: cmdCleanupSavedFile},
 		{name: "pending", help: "что ждёт нажатия кнопки", run: cmdPending},
 		{name: "serve", help: "служба: соединение с Telegram, ленты, кнопки бота (её запускает Планировщик)", run: cmdServe},
 		{name: "approvals", help: "--once: разобрать накопившиеся нажатия без службы", run: cmdApprovals},
@@ -888,6 +889,18 @@ func cmdToolCall(ctx context.Context, args []string) int {
 		res = *mcpserver.Failed(err)
 	}
 	return writeJSON(&res)
+}
+
+func cmdCleanupSavedFile(ctx context.Context, args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "Использование: tg cleanup-saved-file <draft_id>")
+		return 2
+	}
+	var res json.RawMessage
+	if err := service.Do(ctx, "cleanup_saved_file", service.DraftArgs{ID: args[0]}, &res); err != nil {
+		return fail(err)
+	}
+	return writeJSON(res)
 }
 
 // cmdOp — операция службы на месте: так её вызывает служба другого

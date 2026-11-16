@@ -1140,6 +1140,8 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 
 // WaitForDecision — дождаться нажатия кнопки. Работает и с демоном, и без него.
 func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, timeout time.Duration) (*omap.Map, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	box := outbox.New(s.DataDir())
 	deadline := time.Now().Add(timeout)
 	resolved := func() bool {
@@ -1151,16 +1153,21 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 		// одобрено, но отправка сорвалась — агенту надо знать сразу
 		return isFinal(d.Status) || (d.Status == outbox.Approved && d.SendError != nil)
 	}
+	// A running service owns delivery. Observers must not enter SendDue:
+	// its mutex covers the whole upload batch and may be held for minutes.
+	serviceUp := tgc.InService() || svc.Up(ctx)
 	updates := lock.New(s.UpdatesLockPath(), 500*time.Millisecond)
-	if ownsUpdates(s) && updates.Acquire(ctx) == nil {
+	if !serviceUp && ownsUpdates(s) && updates.Acquire(ctx) == nil {
 		// службы нет — качаем апдейты бота сами, пока ждём
 		Pump(ctx, s, deadline, resolved)
 		updates.Release()
 	} else {
 		// апдейты разбирает демон, нам остаётся следить за статусом
 		for time.Now().Before(deadline) && !resolved() && ctx.Err() == nil {
-			SendDue(ctx, s) // на случай, если демона нет, а бот не настроен
-			sleepCtx(ctx, 2*time.Second)
+			if !serviceUp {
+				SendDue(ctx, s) // без службы и бота: прежний самостоятельный путь
+			}
+			sleepCtx(ctx, min(2*time.Second, time.Until(deadline)))
 		}
 	}
 

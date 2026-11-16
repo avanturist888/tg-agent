@@ -91,6 +91,42 @@ func TestSnapshotKinds(t *testing.T) {
 	}
 }
 
+func TestAudioSnapshotAndForceDocument(t *testing.T) {
+	old := config.Root
+	config.Root = t.TempDir()
+	t.Cleanup(func() { config.Root = old })
+	s := &config.Settings{MaxFileMB: 50}
+	var paths []string
+	for _, name := range []string{"chapter.MP3", "chapter.m4a", "chapter.m4b", "report.txt"} {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte("synthetic attachment"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, p)
+	}
+	for _, tc := range []struct {
+		id      string
+		asFiles bool
+		network string
+		audio   bool
+	}{{"audio", false, "", true}, {"forced", true, "", false}, {"wa", false, config.NetWA, false}, {"max", false, config.NetMAX, false}} {
+		s.Network = tc.network
+		got, err := Snapshot(s, tc.id, paths, tc.asFiles)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, snap := range got {
+			want := ""
+			if tc.audio && i < 3 {
+				want = outbox.KindAudio
+			}
+			if snap.Kind != want || snap.Size != int64(len("synthetic attachment")) {
+				t.Fatalf("%s %s: kind=%q, size=%d", tc.id, snap.Name, snap.Kind, snap.Size)
+			}
+		}
+	}
+}
+
 func TestDenied(t *testing.T) {
 	for _, p := range []string{`C:\x\.env`, `C:\x\.env.production`, `C:\u\.ssh\config`, `D:\keys\server.pem`, `C:\a\user.session`} {
 		if deniedReason(p) == "" {

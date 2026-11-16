@@ -46,7 +46,7 @@ type FileSnap struct {
 	Name   string `json:"name"`
 	Size   int64  `json:"size"`
 	Source string `json:"source,omitempty"`
-	Kind   string `json:"kind,omitempty"` // KindPhoto — фото в ленте; пусто — документ без сжатия
+	Kind   string `json:"kind,omitempty"` // photo/audio; пусто — документ без сжатия
 }
 
 // PollSpec — опрос вместо текста (tg_draft_poll). Варианты нумеруются с 0.
@@ -83,6 +83,9 @@ type BotSpec struct {
 
 // KindPhoto — файл уходит фотографией (Telegram покажет его прямо в ленте).
 const KindPhoto = "photo"
+
+// KindAudio — аудиотрек в плеере Telegram, не голосовое сообщение.
+const KindAudio = "audio"
 
 // Draft — черновик сообщения.
 type Draft struct {

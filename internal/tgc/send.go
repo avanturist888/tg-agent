@@ -174,6 +174,7 @@ func mimeOf(path string) string {
 type OutFile struct {
 	Path  string
 	Photo bool
+	Audio bool
 }
 
 // PreSend — сбой до отправляющего запроса (файл не загрузился, медиа не
@@ -193,11 +194,13 @@ func BeforeSend(err error) bool {
 // другим — смешивать их в одном альбоме Telegram не даёт. reply получает
 // первый альбом.
 func (c *Conn) SendFiles(ctx context.Context, t Target, files []OutFile, reply *int64) ([]int, error) {
-	var photos, docs, voices []string
+	var photos, docs, voices, audio []string
 	for _, f := range files {
 		switch {
 		case f.Photo:
 			photos = append(photos, f.Path)
+		case f.Audio:
+			audio = append(audio, f.Path)
 		case isVoiceFile(f.Path):
 			voices = append(voices, f.Path)
 		default:
@@ -205,6 +208,16 @@ func (c *Conn) SendFiles(ctx context.Context, t Target, files []OutFile, reply *
 		}
 	}
 	var ids []int
+	// Tracks keep their input order and are sent as audio, separately from
+	// photo/document groups. A failure preserves the already sent IDs.
+	for _, p := range audio {
+		got, err := c.sendAudio(ctx, t, p, reply)
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, got...)
+		reply = nil
+	}
 	// голосовые в альбом не собираются — каждое отдельным сообщением
 	for _, p := range voices {
 		got, err := c.sendVoice(ctx, t, p, reply)

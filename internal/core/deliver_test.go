@@ -15,6 +15,7 @@ type fakeSender struct {
 	polls               []tgc.PollOut
 	filesErr            error // SendFiles: ушло filesOK файлов, дальше эта ошибка
 	filesOK             int
+	fileArgs            []tgc.OutFile
 }
 
 func (f *fakeSender) SendMessage(_ context.Context, _ tgc.Target, _ string, _ *int64, format string) (*omap.Map, error) {
@@ -38,6 +39,7 @@ func (f *fakeSender) SendVote(_ context.Context, _ tgc.Target, msgID int, _ []in
 
 func (f *fakeSender) SendFiles(_ context.Context, _ tgc.Target, files []tgc.OutFile, _ *int64) ([]int, error) {
 	f.files++
+	f.fileArgs = append(f.fileArgs, files...)
 	ids := make([]int, len(files))
 	for i := range ids {
 		ids[i] = 500 + i
@@ -46,6 +48,24 @@ func (f *fakeSender) SendFiles(_ context.Context, _ tgc.Target, files []tgc.OutF
 		return ids[:f.filesOK], f.filesErr
 	}
 	return ids, nil
+}
+
+func TestSendDraftPreservesFileKinds(t *testing.T) {
+	f := &fakeSender{}
+	d := &outbox.Draft{Files: []outbox.FileSnap{
+		{Path: "photo.jpg", Kind: outbox.KindPhoto},
+		{Path: "chapter.mp3", Kind: outbox.KindAudio},
+		{Path: "forced.mp3"},
+	}}
+	if _, err := sendDraft(context.Background(), f, tgc.Target{}, d); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.fileArgs) != 3 || !f.fileArgs[0].Photo || f.fileArgs[0].Audio || !f.fileArgs[1].Audio || f.fileArgs[1].Photo || f.fileArgs[2].Photo || f.fileArgs[2].Audio {
+		t.Fatalf("file kinds lost: %+v", f.fileArgs)
+	}
+	if sentAs(d.Files[0]) != "photo" || sentAs(d.Files[1]) != "audio" || sentAs(d.Files[2]) != "document" {
+		t.Fatal("reported file kinds differ from sending kinds")
+	}
 }
 
 // Текст или часть файлов ушли, дальше сбой: отказ окончательный — повтор

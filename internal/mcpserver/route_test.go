@@ -145,3 +145,45 @@ func TestRouteToOtherAccount(t *testing.T) {
 		t.Fatalf("лишняя передача: %+v", f.got()[before:])
 	}
 }
+
+func TestDraftListValidationRemainsAnErrorAcrossAccounts(t *testing.T) {
+	f := routeEnv(t)
+	res, err := CallTool(context.Background(), "tg_list_drafts", json.RawMessage(`{"chat":"team"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatal("aggregated validation failure was reported as success")
+	}
+	var body struct {
+		Accounts []map[string]any `json:"accounts"`
+		Hint     string           `json:"hint"`
+	}
+	if err := json.Unmarshal([]byte(res.Content[0].(*mcp.TextContent).Text), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Accounts) != 2 || body.Accounts[0]["error"] == nil || body.Accounts[0]["message"] == nil {
+		t.Fatalf("local validation error lost: %+v", body.Accounts)
+	}
+	// The other account may be an older server: keep its partial response,
+	// but never turn its response into proof of a successful aggregate.
+	if body.Accounts[1]["tool"] != "tg_list_drafts" || !strings.Contains(body.Hint, "Черновики") || strings.Contains(body.Hint, "alias в списке") {
+		t.Fatalf("wrong tool or hint: %+v", body)
+	}
+	for _, call := range f.got() {
+		if call.Name != "tg_list_drafts" {
+			t.Fatalf("called another tool: %s", call.Name)
+		}
+	}
+}
+
+func TestDraftListSuccessHasDraftHint(t *testing.T) {
+	routeEnv(t)
+	res, err := CallTool(context.Background(), "tg_list_drafts", json.RawMessage(`{}`))
+	if err != nil || res.IsError {
+		t.Fatalf("valid list failed: %v, %+v", err, res)
+	}
+	if !strings.Contains(res.Content[0].(*mcp.TextContent).Text, "Черновики сгруппированы") {
+		t.Fatal("draft list has no draft-specific hint")
+	}
+}

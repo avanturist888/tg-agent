@@ -173,6 +173,9 @@ func init() {
 		"hello_peer": {fn: withSettings(func(ctx context.Context, s *config.Settings, a inbox.Addr) (any, error) {
 			return map[string]bool{"ok": true}, core.Hello(s, a)
 		})},
+		"cleanup_saved_file": {fn: withSettings(func(ctx context.Context, s *config.Settings, a DraftArgs) (any, error) {
+			return core.CleanupSavedFile(ctx, s, a.ID)
+		})},
 		// нажатие кнопки общего бота: основная служба передаёт его аккаунту
 		"callback": {local: true, fn: withSettings(func(ctx context.Context, s *config.Settings, q bot.CallbackQuery) (any, error) {
 			// сбой (решение не принято) — ошибкой: основная служба повторит

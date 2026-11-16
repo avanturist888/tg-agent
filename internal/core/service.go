@@ -917,10 +917,13 @@ func durVal(d *float64) any {
 	return *d
 }
 
-// sentAs — как файл уйдёт: photo (в ленте, Telegram пережмёт) или document.
+// sentAs — как файл уйдёт: photo, audio или document.
 func sentAs(f outbox.FileSnap) string {
 	if f.Kind == outbox.KindPhoto {
 		return "photo"
+	}
+	if f.Kind == outbox.KindAudio {
+		return "audio"
 	}
 	return "document"
 }
@@ -1103,12 +1106,12 @@ func WaitApproval(ctx context.Context, s *config.Settings, draftID string, timeo
 			"Дождись, пока человек подтвердит черновик, и вызови tg_send_draft.", s.SendPolicy)
 	}
 	limit := s.ApprovalTimeoutSec
-	if timeoutSec > 0 && timeoutSec < limit {
-		limit = timeoutSec
-	}
 	if auto {
 		// автоотправке нужно не больше задержки и времени на саму отправку
 		limit = max(limit, s.AutoSendDelaySec+60)
+	}
+	if timeoutSec > 0 && timeoutSec < limit {
+		limit = timeoutSec
 	}
 	return WaitForDecision(ctx, s, draftID, time.Duration(limit)*time.Second)
 }
@@ -1247,7 +1250,7 @@ func sendDraft(ctx context.Context, c draftSender, t tgc.Target, d *outbox.Draft
 	if len(d.Files) > 0 {
 		files := make([]tgc.OutFile, len(d.Files))
 		for i, f := range d.Files {
-			files[i] = tgc.OutFile{Path: f.Path, Photo: f.Kind == outbox.KindPhoto}
+			files[i] = tgc.OutFile{Path: f.Path, Photo: f.Kind == outbox.KindPhoto, Audio: f.Kind == outbox.KindAudio}
 		}
 		// без текста файлы отвечают на reply_to сами, с текстом — идут следом
 		reply := d.ReplyTo
