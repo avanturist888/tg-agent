@@ -64,8 +64,12 @@ func TestWaitStatusDoesNotJoinSendingBatch(t *testing.T) {
 		t.Fatal("status observer waited for the upload batch")
 	}
 	current, err := outbox.New(s.DataDir()).Get(d.ID)
-	if err != nil || current.Status != outbox.Scheduled || current.SendAt == nil || current.SendAt.Unix() != at.Unix() {
+	if err != nil || current.Status != outbox.Scheduled || current.SendAt == nil {
 		t.Fatalf("observer changed draft: %+v, %v", current, err)
+	}
+	scheduled, err := time.Parse(time.RFC3339, *current.SendAt)
+	if err != nil || scheduled.Unix() != at.Unix() {
+		t.Fatalf("observer changed scheduled time: %v, %v", current.SendAt, err)
 	}
 }
 
