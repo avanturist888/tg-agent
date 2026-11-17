@@ -37,6 +37,10 @@ type ToolArgs struct {
 	Agent *inbox.Addr `json:"agent,omitempty"`
 	// Meta — _meta вызова: у Codex там номер треда (Agent тогда нет)
 	Meta map[string]any `json:"meta,omitempty"`
+	// PiSession — путь файла сессии pi, от которой вызов (треды T3 под
+	// драйвером pi: ни канала Claude, ни _meta у них нет). Служба признаёт
+	// его только по базе T3 (core.AgentFromPi), для прослойки это подсказка
+	PiSession string `json:"pi_session,omitempty"`
 	// Local — вызов передала служба другого аккаунта: выполнить у себя, не
 	// маршрутизируя дальше (mcpserver/route.go)
 	Local bool `json:"local,omitempty"`
@@ -153,6 +157,10 @@ func init() {
 			if a.Agent == nil && len(a.Meta) > 0 {
 				if s, err := config.Load(); err == nil {
 					a.Agent = core.AgentFromMeta(ctx, s, a.Meta)
+				}
+			} else if a.Agent == nil && a.PiSession != "" {
+				if s, err := config.Load(); err == nil {
+					a.Agent = core.AgentFromPi(ctx, s, a.PiSession)
 				}
 			} else if a.Agent != nil && a.Agent.Codex() {
 				// вызов передала служба другого аккаунта: тред жив и здесь

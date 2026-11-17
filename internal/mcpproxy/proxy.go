@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,6 +67,72 @@ type proxy struct {
 	// agent — входящий канал нашей сессии Claude Code: по нему служба будит
 	// агента (tg_subscribe). Знаем его только мы — потомок сессии.
 	agent *inbox.Addr
+}
+
+// piFresh — файл сессии pi считаем живым, пока он растёт (сессию останавливает
+// T3 Code после получаса простоя, при новом ходе создаётся новый файл).
+const piFresh = 15 * time.Minute
+
+var piSessionsHome = func() string {
+	h, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(h, ".pi", "agent", "sessions")
+}
+
+// piSessionAddr — файл сессии pi, запустившей эту прослойку (треды T3 под
+// драйвером pi). Прослойка — потомок сессии pi: её сеансы лежат в каталоге
+// ~/.pi/agent/sessions, названном по рабочему пути, файл сессии создан при
+// старте и растёт с каждым ходом. Возвращаем новейший свежий файл. Это только
+// подсказка: служба признает путь по базе T3 (core.AgentFromPi), так что тут
+// ошибка лишь оставляет прослойку безымянной — как прежде.
+func piSessionAddr() *inbox.Addr {
+	// Переменные pi есть только у её потомков: у Codex их нет, Claude Code
+	// уходит через FromEnv, запуск руками — тоже мимо.
+	if os.Getenv("T3_MCP_BEARER_TOKEN") == "" || os.Getenv("T3_PI_MCP_EXTENSION_PATH") == "" {
+		return nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil
+	}
+	return piSessionAddrIn(piSessionsHome(), cwd, time.Now())
+}
+
+func piSessionAddrIn(home, cwd string, now time.Time) *inbox.Addr {
+	if home == "" || cwd == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(filepath.Join(home, piSlug(cwd)))
+	if err != nil {
+		return nil
+	}
+	var newest string
+	var newestAt time.Time
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || now.Sub(info.ModTime()) > piFresh {
+			continue
+		}
+		if newest == "" || info.ModTime().After(newestAt) {
+			newest, newestAt = e.Name(), info.ModTime()
+		}
+	}
+	if newest == "" {
+		return nil
+	}
+	return &inbox.Addr{Session: filepath.Join(home, piSlug(cwd), newest), Kind: inbox.KindCodex}
+}
+
+// piSlug — как pi называет каталог сеансов по рабочему пути:
+// C:\Users\vasis\work\maria-shora → --C--Users-vasis-work-maria-shora--.
+// Не совпало — каталога не найдём и вернём пусто, это безопасно.
+func piSlug(dir string) string {
+	return "--" + strings.NewReplacer(":", "-", "\\", "-", "/", "-").Replace(dir) + "--"
 }
 
 // tools — список инструментов: у службы, а без неё — у свежего exe.
@@ -125,8 +192,14 @@ func (p *proxy) handler(name string) mcp.ToolHandler {
 		var res mcp.CallToolResult
 		ta := service.ToolArgs{Name: name, Args: args, Agent: p.agent}
 		if p.agent == nil && req.Params != nil {
-			// Codex: один процесс на все треды, сессию называет только _meta вызова
-			ta.Meta = req.Params.GetMeta()
+			// Codex называет тред в _meta вызова; pi — свежий файл своей сессии
+			// (служба сверит его с базой T3). Файл мог ещё не создаться к запуску
+			// прослойки — пробуем на каждом вызове, пока сессия не назвалась.
+			if a := piSessionAddr(); a != nil {
+				ta.PiSession = a.Session
+			} else {
+				ta.Meta = req.Params.GetMeta()
+			}
 		}
 		build, err := svc.Call(ctx, "tool", ta, &res)
 		if err == nil {

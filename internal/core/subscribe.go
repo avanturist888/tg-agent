@@ -460,6 +460,31 @@ func AgentFromMeta(ctx context.Context, s *config.Settings, meta map[string]any)
 	return a
 }
 
+// AgentFromPi — тред T3 под драйвером pi (модели не Codex и не Claude Code):
+// его прослойка не передаёт ни канал Claude (FromEnv пуст), ни _meta Codex,
+// зато база T3 записывает такому треду путь файла сессии pi
+// (nativeThreadRef.nativeId). Прослойка называет свежайший файл сеанса своего
+// рабочего каталога; признаём его, только если база T3 знает этот путь как
+// открытый тред и это его текущая сессия — та же схема доверия, что у
+// AgentFromMeta. Вызов из треда — заодно знак, что он жив (Hello снимает Dead).
+func AgentFromPi(ctx context.Context, s *config.Settings, sessionPath string) *inbox.Addr {
+	if sessionPath == "" {
+		return nil
+	}
+	th, err := threadInfo(ctx, sessionPath)
+	if err != nil || th.ID == "" || th.Closed {
+		return nil
+	}
+	if currentSession(ctx, th.ID) != sessionPath {
+		return nil // файл не текущая сессия треда: устарел или чужой
+	}
+	a := &inbox.Addr{Session: sessionPath, Kind: inbox.KindCodex}
+	if s != nil {
+		_ = Hello(s, *a)
+	}
+	return a
+}
+
 // AgentOf — сессия, от которой вызов (для передачи в службу другого аккаунта).
 func AgentOf(ctx context.Context) *inbox.Addr { return agentFrom(ctx) }
 
