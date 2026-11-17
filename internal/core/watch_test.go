@@ -49,6 +49,9 @@ func watchEnv(t *testing.T) *config.Settings {
 	threadMemo.Lock()
 	clear(threadMemo.m)
 	threadMemo.Unlock()
+	currentMemo.Lock()
+	clear(currentMemo.m)
+	currentMemo.Unlock()
 	// «свои» сообщения — память процесса: прошлые тесты не должны в неё попадать
 	outMu.Lock()
 	clear(outIDs)

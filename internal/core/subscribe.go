@@ -475,7 +475,7 @@ func AgentFromPi(ctx context.Context, s *config.Settings, sessionPath string) *i
 	if err != nil || th.ID == "" || th.Closed {
 		return nil
 	}
-	if currentSession(ctx, th.ID) != sessionPath {
+	if currentSessionCached(ctx, th.ID) != sessionPath {
 		return nil // файл не текущая сессия треда: устарел или чужой
 	}
 	a := &inbox.Addr{Session: sessionPath, Kind: inbox.KindCodex}
@@ -483,6 +483,37 @@ func AgentFromPi(ctx context.Context, s *config.Settings, sessionPath string) *i
 		_ = Hello(s, *a)
 	}
 	return a
+}
+
+// Текущая сессия треда меняется редко, а служба ходит к базе T3 на каждый
+// вызов pi-прослойки — держим ответ минуту; пустое (удалённый тред) не
+// кешируем, чтобы закрытие заметили сразу.
+const currentTTL = time.Minute
+
+var currentMemo = struct {
+	sync.Mutex
+	m map[string]memoCurrent
+}{m: map[string]memoCurrent{}}
+
+type memoCurrent struct {
+	session string
+	at      time.Time
+}
+
+func currentSessionCached(ctx context.Context, thread string) string {
+	currentMemo.Lock()
+	m, ok := currentMemo.m[thread]
+	currentMemo.Unlock()
+	if ok && time.Since(m.at) < currentTTL {
+		return m.session
+	}
+	cur := currentSession(ctx, thread)
+	if cur != "" {
+		currentMemo.Lock()
+		currentMemo.m[thread] = memoCurrent{session: cur, at: time.Now()}
+		currentMemo.Unlock()
+	}
+	return cur
 }
 
 // AgentOf — сессия, от которой вызов (для передачи в службу другого аккаунта).
@@ -497,9 +528,44 @@ func agentFrom(ctx context.Context) *inbox.Addr {
 	return inbox.FromEnv()
 }
 
-const noInbox = "Сессия не передала адрес своего входящего канала: нужен Claude Code 2.1.234+ " +
-	"и перезапуск сессии после обновления tg-agent (MCP-прослойка обновляется только с новой сессией). " +
-	"Пока следи за чатом через Monitor и `tg watch` (AGENTS.md, «Как следить за чатом»)."
+const noInboxTail = "Пока следи за чатом через `tg watch` (AGENTS.md, «Как следить за чатом»)."
+
+const (
+	// Вызов мимо прослойки (tg.exe из шелла) или старая прослойка Claude Code:
+	// кто это — служба различить не может, подсказываем оба случая.
+	noInbox = "Сессия не назвала себя: подписки и передача сообщений работают через " +
+		"MCP-прослойку сессии, напрямую через tg.exe — нельзя. В сессии Claude Code нужен " +
+		"2.1.234+ и перезапуск после обновления tg-agent; тред T3 под pi — перезапуск сессии " +
+		"треда (прослойка обновляется только с новой сессией). " + noInboxTail
+	// Codex прислал _meta, но тред не признан: старая прослойка или тред не из T3.
+	noInboxCodex = "Прослойка Codex не назвала тред в _meta: она запущена до обновления tg-agent " +
+		"или тред не из T3. Перезапусти сессию Codex — прослойка обновляется только с новым " +
+		"процессом. " + noInboxTail
+	// pi назвал файл сессии, но база T3 его не признала.
+	noInboxPi = "Файл сессии pi не признан базой T3: файл устарел, сессия треда сменилась или тред " +
+		"не из T3. Перезапусти сессию треда — прослойка назовёт свежий файл сама. Новые чаты до " +
+		"этого — через основной тред tg-agent. " + noInboxTail
+)
+
+// noAgentReason — почему сессия не назвалась: подставляет служба (op tool)
+// по тому, что прослойка передала: кодекс — _meta, pi — файл сессии.
+type noAgentKey struct{}
+
+// WithNoAgentReason — причина неудачи признания идентичности вызова.
+func WithNoAgentReason(ctx context.Context, reason string) context.Context {
+	return context.WithValue(ctx, noAgentKey{}, reason)
+}
+
+func noInboxMsg(ctx context.Context) string {
+	r, _ := ctx.Value(noAgentKey{}).(string)
+	switch r {
+	case "codex":
+		return noInboxCodex
+	case "pi":
+		return noInboxPi
+	}
+	return noInbox
+}
 
 // ── инструменты ──────────────────────────────────────────────────────────
 
@@ -611,7 +677,7 @@ func Subscribe(ctx context.Context, s *config.Settings, chat string, o SubOpts) 
 	}
 	a := agentFrom(ctx)
 	if a == nil {
-		return nil, &Bad{Msg: noInbox}
+		return nil, &Bad{Msg: noInboxMsg(ctx)}
 	}
 	var topicName string
 	if n := netOf(s); o.Topic != 0 && n != nil {
@@ -727,7 +793,7 @@ func Unsubscribe(ctx context.Context, s *config.Settings, chat string) (*omap.Ma
 	}
 	a := agentFrom(ctx)
 	if a == nil {
-		return nil, &Bad{Msg: noInbox}
+		return nil, &Bad{Msg: noInboxMsg(ctx)}
 	}
 	alias := ""
 	if chat != "" {

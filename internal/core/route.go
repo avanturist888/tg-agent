@@ -571,7 +571,7 @@ func Pass(ctx context.Context, s *config.Settings, chat string, messageID int, n
 	}
 	a := agentFrom(ctx)
 	if a == nil {
-		return nil, &Bad{Msg: noInbox}
+		return nil, &Bad{Msg: noInboxMsg(ctx)}
 	}
 	subs := loadSubs(s)
 	me := a.Key()

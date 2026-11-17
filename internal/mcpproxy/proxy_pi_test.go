@@ -73,8 +73,20 @@ func TestPiSessionAddrInRefusesStaleAndMissing(t *testing.T) {
 	if err := os.Chtimes(p, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
+	// Один файл в каталоге однозначен, даже если он не растёт (сессия простаивает).
+	if a := piSessionAddrIn(home, cwd, now); a == nil || filepath.Base(a.Session) != "old.jsonl" {
+		t.Fatalf("single stale session not picked: %+v", a)
+	}
+	// Второй файл делает выбор неоднозначным: без свежести не угадываем.
+	write := filepath.Join(dir, "younger.jsonl")
+	if err := os.WriteFile(write, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(write, now.Add(-30*time.Minute), now.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	if a := piSessionAddrIn(home, cwd, now); a != nil {
-		t.Fatalf("stale session accepted: %+v", a)
+		t.Fatalf("ambiguous stale sessions accepted: %+v", a)
 	}
 	if a := piSessionAddrIn(home, `C:\no\such\workspace`, now); a != nil {
 		t.Fatalf("missing dir accepted: %+v", a)

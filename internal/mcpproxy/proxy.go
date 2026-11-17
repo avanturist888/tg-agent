@@ -110,10 +110,12 @@ func piSessionAddrIn(home, cwd string, now time.Time) *inbox.Addr {
 	}
 	var newest string
 	var newestAt time.Time
+	var count int // .jsonl в каталоге: один — сессия треда одна, старость не важна
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
 		}
+		count++
 		info, err := e.Info()
 		if err != nil || now.Sub(info.ModTime()) > piFresh {
 			continue
@@ -123,7 +125,14 @@ func piSessionAddrIn(home, cwd string, now time.Time) *inbox.Addr {
 		}
 	}
 	if newest == "" {
-		return nil
+		if count != 1 {
+			return nil // несколько файлов и ни один не растёт: не угадываем
+		}
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+				newest = e.Name()
+			}
+		}
 	}
 	return &inbox.Addr{Session: filepath.Join(home, piSlug(cwd), newest), Kind: inbox.KindCodex}
 }

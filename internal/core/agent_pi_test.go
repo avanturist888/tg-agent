@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,4 +100,17 @@ func keysOf(m map[string]*subscription) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func TestNoInboxMsgFollowsReason(t *testing.T) {
+	ctx := context.Background()
+	if msg := noInboxMsg(ctx); !strings.Contains(msg, "не назвала себя") {
+		t.Fatalf("default hint wrong: %q", msg)
+	}
+	if msg := noInboxMsg(WithNoAgentReason(ctx, "codex")); !strings.Contains(msg, "_meta") {
+		t.Fatalf("codex hint wrong: %q", msg)
+	}
+	if msg := noInboxMsg(WithNoAgentReason(ctx, "pi")); !strings.Contains(msg, "Файл сессии pi") {
+		t.Fatalf("pi hint wrong: %q", msg)
+	}
 }

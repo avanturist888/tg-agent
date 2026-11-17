@@ -158,9 +158,15 @@ func init() {
 				if s, err := config.Load(); err == nil {
 					a.Agent = core.AgentFromMeta(ctx, s, a.Meta)
 				}
+				if a.Agent == nil {
+					ctx = core.WithNoAgentReason(ctx, "codex")
+				}
 			} else if a.Agent == nil && a.PiSession != "" {
 				if s, err := config.Load(); err == nil {
 					a.Agent = core.AgentFromPi(ctx, s, a.PiSession)
+				}
+				if a.Agent == nil {
+					ctx = core.WithNoAgentReason(ctx, "pi")
 				}
 			} else if a.Agent != nil && a.Agent.Codex() {
 				// вызов передала служба другого аккаунта: тред жив и здесь
