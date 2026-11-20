@@ -199,6 +199,13 @@ tg-agent убирает владельца из цепочки её достав
   будит через общий ящик так же, как Codex. Файл сессии меняется при каждом
   возобновлении — подписки сводит `joinThreadSubs`, как у смены сессий
   Claude.
+  Треды Antigravity в T3 (с 21.11.2026): Antigravity кладёт в `_meta` каждого
+  вызова `antigravity.google/conversation_id` (UUID) — это тот же
+  `nativeThreadRef.nativeId`, что у треда T3 (`driver=antigravity`); для
+  подагентов — `antigravity.google/root_conversation_id`. Прослойка передаёт
+  `_meta` целиком, служба признаёт тред той же сверкой с базой, что у Codex
+  (`core.AgentFromMeta`), будит через общий ящик. Не признан — подсказка
+  `noInboxAntigravity`.
   Подключение требует проверенной установки Нестора с hook-codex и
   живой проверки hooks в используемой сессии T3; правка исходников сама
   по себе не означает ввод в работу. В основном треде active e2e подтверждён

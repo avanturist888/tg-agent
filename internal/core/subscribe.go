@@ -445,19 +445,23 @@ func WithAgent(ctx context.Context, a *inbox.Addr) context.Context {
 	return context.WithValue(ctx, agentKey{}, a)
 }
 
-// AgentFromMeta — тред Codex, от которого вызов: у MCP Codex нет переменных
-// сессии, номер треда — в _meta вызова (inbox.FromMeta). Признаём его, только
-// если T3 знает такой тред: будить Codex можно лишь через T3. Вызов из треда —
-// заодно знак, что он жив (Hello снимает Dead).
+// AgentFromMeta — тред Codex или Antigravity, от которого вызов: у обоих нет
+// переменных сессии, номер треда — в _meta (inbox.FromMeta); у Antigravity это
+// antigravity.google/conversation_id — тот же nativeId, что у треда T3, у
+// подагента запасной root_conversation_id. Признаём первого кандидата, чей
+// тред T3 знает: будить можно лишь через T3. Вызов из треда — заодно знак,
+// что он жив (Hello снимает Dead).
 func AgentFromMeta(ctx context.Context, s *config.Settings, meta map[string]any) *inbox.Addr {
-	a := inbox.FromMeta(meta)
-	if a == nil || sessionThread(ctx, a.Session) == "" {
-		return nil
+	for _, a := range inbox.FromMeta(meta) {
+		if sessionThread(ctx, a.Session) == "" {
+			continue // не из T3 — пробуем следующий (у подагента root)
+		}
+		if s != nil {
+			_ = Hello(s, *a)
+		}
+		return a
 	}
-	if s != nil {
-		_ = Hello(s, *a)
-	}
-	return a
+	return nil
 }
 
 // AgentFromPi — тред T3 под драйвером pi (модели не Codex и не Claude Code):
@@ -541,6 +545,9 @@ const (
 	noInboxCodex = "Прослойка Codex не назвала тред в _meta: она запущена до обновления tg-agent " +
 		"или тред не из T3. Перезапусти сессию Codex — прослойка обновляется только с новым " +
 		"процессом. " + noInboxTail
+	// Antigravity прислал _meta, но тред не признан базой T3.
+	noInboxAntigravity = "Тред Antigravity не признан базой T3: прослойка запущена до обновления tg-agent " +
+		"или тред не из T3. Перезапусти сессию треда — прослойка обновляется только с новой сессией. " + noInboxTail
 	// pi назвал файл сессии, но база T3 его не признала.
 	noInboxPi = "Файл сессии pi не признан базой T3: файл устарел, сессия треда сменилась или тред " +
 		"не из T3. Перезапусти сессию треда — прослойка назовёт свежий файл сама. Новые чаты до " +
@@ -548,7 +555,7 @@ const (
 )
 
 // noAgentReason — почему сессия не назвалась: подставляет служба (op tool)
-// по тому, что прослойка передала: кодекс — _meta, pi — файл сессии.
+// по тому, что прослойка передала: Codex/Antigravity — _meta, pi — файл сессии.
 type noAgentKey struct{}
 
 // WithNoAgentReason — причина неудачи признания идентичности вызова.
@@ -561,6 +568,8 @@ func noInboxMsg(ctx context.Context) string {
 	switch r {
 	case "codex":
 		return noInboxCodex
+	case "antigravity":
+		return noInboxAntigravity
 	case "pi":
 		return noInboxPi
 	}

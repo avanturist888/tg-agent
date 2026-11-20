@@ -35,7 +35,7 @@ type ToolArgs struct {
 	Args json.RawMessage `json:"args,omitempty"`
 	// Agent — входящий канал сессии Claude Code, от которой вызов (для tg_subscribe)
 	Agent *inbox.Addr `json:"agent,omitempty"`
-	// Meta — _meta вызова: у Codex там номер треда (Agent тогда нет)
+	// Meta — _meta вызова: у Codex и Antigravity там номер треда (Agent тогда нет)
 	Meta map[string]any `json:"meta,omitempty"`
 	// PiSession — путь файла сессии pi, от которой вызов (треды T3 под
 	// драйвером pi: ни канала Claude, ни _meta у них нет). Служба признаёт
@@ -159,7 +159,11 @@ func init() {
 					a.Agent = core.AgentFromMeta(ctx, s, a.Meta)
 				}
 				if a.Agent == nil {
-					ctx = core.WithNoAgentReason(ctx, "codex")
+					reason := "codex"
+					if inbox.Antigravity(a.Meta) {
+						reason = "antigravity"
+					}
+					ctx = core.WithNoAgentReason(ctx, reason)
 				}
 			} else if a.Agent == nil && a.PiSession != "" {
 				if s, err := config.Load(); err == nil {

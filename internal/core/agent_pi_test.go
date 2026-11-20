@@ -110,7 +110,37 @@ func TestNoInboxMsgFollowsReason(t *testing.T) {
 	if msg := noInboxMsg(WithNoAgentReason(ctx, "codex")); !strings.Contains(msg, "_meta") {
 		t.Fatalf("codex hint wrong: %q", msg)
 	}
+	if msg := noInboxMsg(WithNoAgentReason(ctx, "antigravity")); !strings.Contains(msg, "Antigravity") {
+		t.Fatalf("antigravity hint wrong: %q", msg)
+	}
 	if msg := noInboxMsg(WithNoAgentReason(ctx, "pi")); !strings.Contains(msg, "Файл сессии pi") {
 		t.Fatalf("pi hint wrong: %q", msg)
+	}
+}
+
+// Подагент Antigravity присылает два валидных UUID, но в T3 зарегистрирован
+// только root_conversation_id — признан запасной кандидат.
+func TestAgentFromMetaRootFallback(t *testing.T) {
+	watchEnv(t)
+	const (
+		conv = "26603355-d2b1-4e80-8e41-ee6f17396c36"
+		root = "8b46a731-faea-4385-a40c-eec24d9a5712"
+	)
+	threadOf = func(_ context.Context, session string) (string, error) {
+		if session == root {
+			return "thread-root", nil
+		}
+		return "", t3.NoThread
+	}
+	a := AgentFromMeta(context.Background(), nil, map[string]any{
+		"antigravity.google/conversation_id":      conv,
+		"antigravity.google/root_conversation_id": root,
+	})
+	if a == nil || a.Session != root || !a.Codex() {
+		t.Fatalf("запасной root не признан: %+v", a)
+	}
+	// одиночный неизвестный тред — отказ
+	if a := AgentFromMeta(context.Background(), nil, map[string]any{"threadId": conv}); a != nil {
+		t.Fatalf("чужой тред признан: %+v", a)
 	}
 }

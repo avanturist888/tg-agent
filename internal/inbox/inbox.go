@@ -88,29 +88,36 @@ const KindCodex = "codex"
 
 var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
-// FromMeta — тред Codex из _meta вызова инструмента: Codex кладёт туда свой
-// номер треда (threadId, thread_id, в том числе внутри JSON-строки
-// x-codex-turn-metadata). nil — не Codex.
-func FromMeta(meta map[string]any) *Addr {
+// FromMeta — кандидаты треда из _meta вызова инструмента, в порядке
+// приоритета: Codex кладёт threadId (thread_id, в том числе внутри JSON-строки
+// x-codex-turn-metadata), Antigravity — antigravity.google/conversation_id
+// (это nativeId треда T3), у подагента запасной antigravity.google/
+// root_conversation_id. Пусто — ни того, ни другого.
+func FromMeta(meta map[string]any) []*Addr {
 	if len(meta) == 0 {
 		return nil
 	}
-	var found string
+	var found []string
 	var walk func(any)
 	walk = func(v any) {
-		if found != "" {
-			return
-		}
 		switch x := v.(type) {
 		case map[string]any:
-			for _, k := range []string{"threadId", "thread_id"} {
+			for _, k := range []string{
+				"threadId",
+				"thread_id",
+				"antigravity.google/conversation_id",
+				"antigravity.google/root_conversation_id",
+			} {
 				if s, ok := x[k].(string); ok && uuidRe.MatchString(s) {
-					found = s
-					return
+					found = append(found, s)
 				}
 			}
 			for _, val := range x {
 				walk(val)
+			}
+		case []any:
+			for _, e := range x {
+				walk(e)
 			}
 		case string:
 			if t := strings.TrimSpace(x); strings.HasPrefix(t, "{") {
@@ -122,10 +129,27 @@ func FromMeta(meta map[string]any) *Addr {
 		}
 	}
 	walk(meta)
-	if found == "" {
-		return nil
+	var out []*Addr
+	seen := map[string]bool{}
+	for _, s := range found {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, &Addr{Session: s, Kind: KindCodex})
 	}
-	return &Addr{Session: found, Kind: KindCodex}
+	return out
+}
+
+// Antigravity — в _meta есть ключ беседы Antigravity (для подсказки ошибки,
+// когда тред не признан).
+func Antigravity(meta map[string]any) bool {
+	for _, k := range []string{"antigravity.google/conversation_id", "antigravity.google/root_conversation_id"} {
+		if s, ok := meta[k].(string); ok && s != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // FromEnv — канал сессии, потомком которой запущен этот процесс (nil — нет).
