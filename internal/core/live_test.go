@@ -50,16 +50,38 @@ func TestLiveApproveSendViaService(t *testing.T) {
 	if d.Status != outbox.Sent || d.MessageID == nil || *d.MessageID <= 0 {
 		t.Fatalf("не отправлено или без id: %s %v (%s)", d.Status, d.SendError, res.Summary)
 	}
-	t.Logf("ушло за %v, message_id %d", time.Since(start).Round(time.Millisecond), *d.MessageID)
+	t.Logf("одобрено за %v, id очереди %d (в Избранном сообщение уйдёт через ~минуту)",
+		time.Since(start).Round(time.Millisecond), *d.MessageID)
 
-	// лента: событие или сверка (раз в минуту) должны дописать id
+	// лента: отложенное сообщение реально уйдёт через ~минуту, событие или
+	// сверка допишут в ленту его реальный id — он больше прежнего верха
 	feed := "saved"
-	deadline := time.Now().Add(75 * time.Second)
-	for FeedLast(s, feed) < int(*d.MessageID) {
+	before := FeedLast(s, feed)
+	deadline := time.Now().Add(90 * time.Second)
+	for FeedLast(s, feed) <= before {
 		if time.Now().After(deadline) {
-			t.Fatalf("id %d не попал в ленту за 75 с (последний %d)", *d.MessageID, FeedLast(s, feed))
+			t.Fatalf("нового сообщения в ленте нет за 90 с (верх %d)", before)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	t.Logf("в ленте через %v после отправки", time.Since(start).Round(time.Second))
+	t.Logf("в ленте через %v после одобрения (верх %d → %d)",
+		time.Since(start).Round(time.Second), before, FeedLast(s, feed))
+
+	// черновик связан с реальным id (scheduled_relinked): правка и уборка
+	// проверочных файлов работают по нему
+	dl := time.Now().Add(10 * time.Second)
+	var d2 *outbox.Draft
+	for {
+		if d2, err = outbox.New(s.DataDir()).Get(id.(string)); err != nil {
+			t.Fatal(err)
+		}
+		if d2.MessageID != nil && *d2.MessageID != *d.MessageID {
+			break
+		}
+		if time.Now().After(dl) {
+			t.Fatalf("черновик не связан с реальным id (остался %d)", *d.MessageID)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Logf("id очереди %d → реальный %d", *d.MessageID, *d2.MessageID)
 }

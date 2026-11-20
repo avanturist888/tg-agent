@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -468,4 +469,62 @@ func (o *Outbox) MarkSent(id string, messageID int64, at string) (*Draft, error)
 		d.AddHistory("event", "sent", "at", at, "message_id", messageID)
 		return nil
 	})
+}
+
+// Relink — черновик, у которого id из очереди отложенных заменён на
+// реальный id доставленного сообщения.
+type Relink struct {
+	ID          string
+	Queue, Real int64
+}
+
+// RelinkScheduled — отложенная отправка ушла (updateDeleteScheduledMessages):
+// пары «id очереди → реальный id». Черновикам sent с id очереди в MessageID
+// ставит реальный: правка, реакции, голоса и уборка проверочных файлов
+// работают по id сообщения, а id очереди с ним не совпадает. Переписанное
+// чёрновику возвращается — в data/sent-unsaved лежит такая же отметка, её
+// надо переписать следом, иначе уборка вернёт id очереди обратно.
+func (o *Outbox) RelinkScheduled(pairs [][2]int64) ([]Relink, error) {
+	byQueue := map[int64]int64{}
+	for _, p := range pairs {
+		byQueue[p[0]] = p[1]
+	}
+	if len(byQueue) == 0 {
+		return nil, nil
+	}
+	sent, err := o.List(Sent)
+	if err != nil {
+		return nil, err
+	}
+	var out []Relink
+	for _, d := range sent {
+		if d.MessageID == nil {
+			continue
+		}
+		queue := *d.MessageID
+		real, ok := byQueue[queue]
+		if !ok {
+			continue
+		}
+		var changed bool
+		if _, err := o.Update(d.ID, func(d *Draft) error {
+			if d.MessageID == nil || *d.MessageID != queue {
+				return nil // id сменился, пока шли — чужой, не трогаем
+			}
+			d.MessageID = &real
+			d.AddHistory("event", "scheduled_sent", "at", audit.Now(), "queue_id", queue, "message_id", real)
+			changed = true
+			return nil
+		}); err != nil {
+			var nf *NotFound
+			if errors.As(err, &nf) {
+				continue // убрали, пока шли
+			}
+			return out, err
+		}
+		if changed {
+			out = append(out, Relink{ID: d.ID, Queue: queue, Real: real})
+		}
+	}
+	return out, nil
 }

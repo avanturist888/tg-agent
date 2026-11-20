@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
@@ -16,30 +17,36 @@ type fakeSender struct {
 	filesErr            error // SendFiles: ушло filesOK файлов, дальше эта ошибка
 	filesOK             int
 	fileArgs            []tgc.OutFile
+	lastTarget          tgc.Target
 }
 
-func (f *fakeSender) SendMessage(_ context.Context, _ tgc.Target, _ string, _ *int64, format string) (*omap.Map, error) {
+func (f *fakeSender) SendMessage(_ context.Context, target tgc.Target, _ string, _ *int64, format string) (*omap.Map, error) {
 	f.sent++
+	f.lastTarget = target
 	return omap.New().Set("message_id", 3606036).Set("format", "rich_"+format), nil
 }
 
-func (f *fakeSender) EditMessage(_ context.Context, _ tgc.Target, id int, _, format string) (*omap.Map, error) {
+func (f *fakeSender) EditMessage(_ context.Context, target tgc.Target, id int, _, format string) (*omap.Map, error) {
 	f.edited++
+	f.lastTarget = target
 	return omap.New().Set("message_id", id).Set("edited", true).Set("format", format), nil
 }
 
-func (f *fakeSender) SendPoll(_ context.Context, _ tgc.Target, p tgc.PollOut, _ *int64) (*omap.Map, error) {
+func (f *fakeSender) SendPoll(_ context.Context, target tgc.Target, p tgc.PollOut, _ *int64) (*omap.Map, error) {
 	f.polls = append(f.polls, p)
+	f.lastTarget = target
 	return omap.New().Set("message_id", 900).Set("format", "poll"), nil
 }
 
-func (f *fakeSender) SendVote(_ context.Context, _ tgc.Target, msgID int, _ []int) (*omap.Map, error) {
+func (f *fakeSender) SendVote(_ context.Context, target tgc.Target, msgID int, _ []int) (*omap.Map, error) {
+	f.lastTarget = target
 	return omap.New().Set("message_id", msgID).Set("format", "vote"), nil
 }
 
-func (f *fakeSender) SendFiles(_ context.Context, _ tgc.Target, files []tgc.OutFile, _ *int64) ([]int, error) {
+func (f *fakeSender) SendFiles(_ context.Context, target tgc.Target, files []tgc.OutFile, _ *int64) ([]int, error) {
 	f.files++
 	f.fileArgs = append(f.fileArgs, files...)
+	f.lastTarget = target
 	ids := make([]int, len(files))
 	for i := range ids {
 		ids[i] = 500 + i
@@ -128,5 +135,31 @@ func TestSendDraftKeepsMessageID(t *testing.T) {
 		if got := toInt64(mid); got != c.want {
 			t.Errorf("%s: message_id %d, ждали %d", c.name, got, c.want)
 		}
+	}
+}
+
+func TestSendDraftSchedulesSelf(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		target tgc.Target
+		draft  outbox.Draft
+		want   time.Duration
+	}{
+		{"Избранное", tgc.Target{Kind: "self"}, outbox.Draft{Text: "привет"}, time.Minute},
+		{"обычный чат", tgc.Target{Kind: "user"}, outbox.Draft{Text: "привет"}, 0},
+		{"правка в Избранном", tgc.Target{Kind: "self"}, outbox.Draft{Text: "стало", EditOf: 77}, 0},
+		{"файлы в Избранном", tgc.Target{Kind: "self"}, outbox.Draft{Files: []outbox.FileSnap{{Path: "a.txt"}}}, time.Minute},
+		{"опрос в Избранном", tgc.Target{Kind: "self"}, outbox.Draft{Poll: &outbox.PollSpec{Question: "Кто?", Options: []string{"я"}}}, time.Minute},
+		{"голос в Избранном", tgc.Target{Kind: "self"}, outbox.Draft{Vote: &outbox.VoteSpec{MessageID: 41, Options: []int{0}}}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeSender{}
+			if _, err := sendDraft(context.Background(), f, tc.target, &tc.draft); err != nil {
+				t.Fatal(err)
+			}
+			if f.lastTarget.ScheduleIn != tc.want {
+				t.Fatalf("ScheduleIn = %v, ждали %v", f.lastTarget.ScheduleIn, tc.want)
+			}
+		})
 	}
 }

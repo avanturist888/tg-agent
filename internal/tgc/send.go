@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
@@ -41,6 +42,10 @@ func sent(u tg.UpdatesClass, randomIDs []int64) (ids []int, date int) {
 			case *tg.UpdateNewChannelMessage:
 				fallback = append(fallback, v.Message.GetID())
 				date = max(date, messageDate(v.Message))
+			case *tg.UpdateNewScheduledMessage:
+				// поставлено в очередь отложенных: id очереди (у доставленного
+				// он сменится — связывает служба, scheduled_relinked)
+				fallback = append(fallback, v.Message.GetID())
 			}
 		}
 	}
@@ -96,6 +101,9 @@ func (c *Conn) SendMessage(ctx context.Context, t Target, text string, reply *in
 		req.NoWebpage = true
 		if r := replyTo(reply, t.Topic); r != nil {
 			req.ReplyTo = r
+		}
+		if t.ScheduleIn > 0 {
+			req.SetScheduleDate(int(time.Now().Add(t.ScheduleIn).Unix()))
 		}
 		res, err := c.API.MessagesSendMessage(ctx, req)
 		if err != nil {
@@ -355,6 +363,9 @@ func (c *Conn) sendVoice(ctx context.Context, t Target, path string, reply *int6
 		},
 		RandomID: randomID(),
 	}
+	if t.ScheduleIn > 0 {
+		req.SetScheduleDate(int(time.Now().Add(t.ScheduleIn).Unix()))
+	}
 	if r := replyTo(reply, t.Topic); r != nil {
 		req.ReplyTo = r
 	}
@@ -393,6 +404,9 @@ func (c *Conn) sendAlbum(ctx context.Context, t Target, paths []string, photo bo
 	}
 	if len(media) == 1 {
 		req := &tg.MessagesSendMediaRequest{Peer: t.Input, Media: media[0], RandomID: randomID()}
+		if t.ScheduleIn > 0 {
+			req.SetScheduleDate(int(time.Now().Add(t.ScheduleIn).Unix()))
+		}
 		if r := replyTo(reply, t.Topic); r != nil {
 			req.ReplyTo = r
 		}
@@ -421,6 +435,9 @@ func (c *Conn) sendAlbum(ctx context.Context, t Target, paths []string, photo bo
 		single = append(single, tg.InputSingleMedia{Media: in, RandomID: r})
 	}
 	req := &tg.MessagesSendMultiMediaRequest{Peer: t.Input, MultiMedia: single}
+	if t.ScheduleIn > 0 {
+		req.SetScheduleDate(int(time.Now().Add(t.ScheduleIn).Unix()))
+	}
 	if r := replyTo(reply, t.Topic); r != nil {
 		req.ReplyTo = r
 	}

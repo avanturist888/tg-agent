@@ -93,6 +93,9 @@ func (c *Conn) sendAudio(ctx context.Context, t Target, path string, reply *int6
 		},
 		RandomID: randomID(),
 	}
+	if t.ScheduleIn > 0 {
+		req.SetScheduleDate(int(time.Now().Add(t.ScheduleIn).Unix()))
+	}
 	if r := replyTo(reply, t.Topic); r != nil {
 		req.ReplyTo = r
 	}

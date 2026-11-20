@@ -179,6 +179,10 @@ type Events struct {
 	// Delete — сообщения удалены. peer == nil — лички и обычные группы:
 	// Telegram не говорит, где они были (id там общие на весь аккаунт).
 	Delete func(ctx context.Context, c *Conn, peer tg.PeerClass, ids []int)
+	// ScheduledSent — отложенные сообщения ушли (updateDeleteScheduledMessages):
+	// пары «id очереди отложенных → реальный id доставленного» в порядке
+	// Telegram. id очереди не совпадает с id сообщения в чате.
+	ScheduledSent func(ctx context.Context, c *Conn, pairs [][2]int)
 }
 
 // Serve — держать постоянное соединение, пока не отменят ctx. Переподключается
@@ -303,6 +307,21 @@ func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage,
 	})
 	d.OnTranscribedAudio(func(ctx context.Context, _ tg.Entities, u *tg.UpdateTranscribedAudio) error {
 		c.hub.transcribed(u)
+		return nil
+	})
+	d.OnDeleteScheduledMessages(func(ctx context.Context, _ tg.Entities, u *tg.UpdateDeleteScheduledMessages) error {
+		if ev.ScheduledSent == nil {
+			return nil
+		}
+		var pairs [][2]int
+		for i, queue := range u.Messages {
+			if i < len(u.SentMessages) {
+				pairs = append(pairs, [2]int{queue, u.SentMessages[i]})
+			}
+		}
+		if len(pairs) > 0 {
+			ev.ScheduledSent(ctx, c, pairs)
+		}
 		return nil
 	})
 	gaps := updates.New(updates.Config{Handler: d, Storage: upd, AccessHasher: upd,

@@ -99,7 +99,8 @@ func Run(ctx context.Context, loader func() (*config.Settings, error)) error {
 			return
 		}
 		if err := tgc.Serve(ctx, s, tgc.Events{Message: core.FeedOnMessage(loader),
-			Edit: core.FeedOnEdit(loader), Delete: core.FeedOnDelete(loader)}, func(ctx context.Context, _ *tgc.Conn) {
+			Edit: core.FeedOnEdit(loader), Delete: core.FeedOnDelete(loader),
+			ScheduledSent: core.FeedOnScheduledSent(loader)}, func(ctx context.Context, _ *tgc.Conn) {
 			reconcile(ctx, loader) // догнать пропущенное, пока нас не было
 			repairOnce.Do(func() { // черновики, ушедшие без message_id (27.10–02.11)
 				if fresh, err := loader(); err == nil {

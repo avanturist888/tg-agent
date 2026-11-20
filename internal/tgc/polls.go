@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/gotd/td/tg"
 
@@ -102,6 +103,9 @@ func (c *Conn) SendPoll(ctx context.Context, t Target, p PollOut, reply *int64) 
 		}
 	}
 	req := &tg.MessagesSendMediaRequest{Peer: t.Input, Media: media, RandomID: randomID()}
+	if t.ScheduleIn > 0 {
+		req.SetScheduleDate(int(time.Now().Add(t.ScheduleIn).Unix()))
+	}
 	if r := replyTo(reply, t.Topic); r != nil {
 		req.ReplyTo = r
 	}

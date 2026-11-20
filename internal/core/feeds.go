@@ -10,8 +10,10 @@ package core
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +23,7 @@ import (
 
 	"tgagent/internal/audit"
 	"tgagent/internal/config"
+	"tgagent/internal/outbox"
 	"tgagent/internal/tgc"
 )
 
@@ -243,6 +246,54 @@ func FeedOnMessage(loader func() (*config.Settings, error)) tgc.OnMessage {
 			if _, err := appendNewer(s, rule.Alias, []int{msgID}); err != nil {
 				_ = audit.Log(s.AuditPath(), "feed_write_failed", "chat", rule.Alias, "error", err.Error())
 			}
+		}
+	}
+}
+
+// FeedOnScheduledSent — отложенные сообщения ушли: черновикам sent с id из
+// очереди отложенных ставится реальный id доставленного (правка, реакции и
+// уборка проверочных файлов работают по id сообщения). Отметки sent-unsaved
+// переписываются следом: иначе уборка вернула бы id очереди обратно.
+func FeedOnScheduledSent(loader func() (*config.Settings, error)) func(ctx context.Context, c *tgc.Conn, pairs [][2]int) {
+	return func(ctx context.Context, _ *tgc.Conn, pairs [][2]int) {
+		s, err := loader()
+		if err != nil {
+			return
+		}
+		var qp [][2]int64
+		for _, p := range pairs {
+			qp = append(qp, [2]int64{int64(p[0]), int64(p[1])})
+		}
+		relinked, err := outbox.New(s.DataDir()).RelinkScheduled(qp)
+		if err != nil {
+			_ = audit.Log(s.AuditPath(), "scheduled_relink_failed", "error", err.Error())
+			return
+		}
+		for _, r := range relinked {
+			_ = audit.Log(s.AuditPath(), "scheduled_relinked", "draft_id", r.ID, "queue_id", r.Queue, "message_id", r.Real)
+		}
+		relinkUnsaved(s, relinked)
+	}
+}
+
+// relinkUnsaved — в файле sent-unsaved отметка с id очереди: черновик уже
+// перезаписан, не дать уборке вернуть id очереди обратно (writeUnsaved
+// перезаписывает файл тем же форматом).
+func relinkUnsaved(s *config.Settings, relinked []outbox.Relink) {
+	for _, r := range relinked {
+		raw, err := os.ReadFile(unsavedPath(s, r.ID))
+		if err != nil {
+			continue
+		}
+		var v struct {
+			MessageID int64  `json:"message_id"`
+			At        string `json:"at"`
+		}
+		if json.Unmarshal(raw, &v) != nil || v.MessageID != r.Queue {
+			continue
+		}
+		if err := writeUnsaved(s, r.ID, r.Real, v.At); err != nil {
+			_ = audit.Log(s.AuditPath(), "scheduled_relink_failed", "what", "sent-unsaved", "draft_id", r.ID, "error", err.Error())
 		}
 	}
 }

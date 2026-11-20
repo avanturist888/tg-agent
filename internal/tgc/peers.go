@@ -246,6 +246,9 @@ type Target struct {
 	ID int64
 	// Topic — тема форума, куда отправлять (0 — не форум или General)
 	Topic int
+	// ScheduleIn — отправить отложенно через это время (0 — сразу). Ставит
+	// schedule_date MTProto: сообщение уйдёт сам Telegram в этот момент.
+	ScheduleIn time.Duration
 }
 
 // MarkedID — id в формате Bot API: -100… для каналов, -… для групп.

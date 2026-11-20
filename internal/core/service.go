@@ -1230,6 +1230,9 @@ type draftSender interface {
 
 // sendDraft — отправить черновик (или правку) и вернуть ответ с message_id.
 func sendDraft(ctx context.Context, c draftSender, t tgc.Target, d *outbox.Draft) (*omap.Map, error) {
+	if d.EditOf == 0 && d.Vote == nil && t.Kind == "self" {
+		t.ScheduleIn = time.Minute // Избранное: уведомление приходит только на отложенные
+	}
 	if d.EditOf != 0 { // правка отправленного: только текст
 		return c.EditMessage(ctx, t, int(d.EditOf), d.Text, d.Fmt)
 	}

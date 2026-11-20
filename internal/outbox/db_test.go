@@ -329,3 +329,37 @@ func TestClaimWaitsLegacy(t *testing.T) {
 		t.Fatalf("автоотправка при ждущем переносе: %v %v", due, err)
 	}
 }
+
+// Отложенная отправка ушла: черновикам sent с id очереди ставится реальный
+// id доставленного сообщения.
+func TestRelinkScheduled(t *testing.T) {
+	o := New(t.TempDir())
+	d := approvedDraft(t, o)
+	if _, err := o.MarkSent(d.ID, 1000, time.Now().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	other := approvedDraft(t, o)
+	if _, err := o.MarkSent(other.ID, 2000, time.Now().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	relinked, err := o.RelinkScheduled([][2]int64{{1000, 3000}, {9999, 4444}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(relinked) != 1 || relinked[0].ID != d.ID || relinked[0].Queue != 1000 || relinked[0].Real != 3000 {
+		t.Fatalf("relinked = %+v", relinked)
+	}
+	got, err := o.Get(d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MessageID == nil || *got.MessageID != 3000 {
+		t.Fatalf("message_id = %v, ждали 3000", got.MessageID)
+	}
+	if got, _ := o.Get(other.ID); got.MessageID == nil || *got.MessageID != 2000 {
+		t.Fatalf("чужой черновик переписан: %v", got.MessageID)
+	}
+	if relinked, err := o.RelinkScheduled([][2]int64{{1000, 3000}}); err != nil || len(relinked) != 0 {
+		t.Fatalf("повторное связывание: %v %v", relinked, err)
+	}
+}
