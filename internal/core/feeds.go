@@ -24,6 +24,7 @@ import (
 	"tgagent/internal/audit"
 	"tgagent/internal/config"
 	"tgagent/internal/outbox"
+	"tgagent/internal/store"
 	"tgagent/internal/tgc"
 )
 
@@ -253,7 +254,10 @@ func FeedOnMessage(loader func() (*config.Settings, error)) tgc.OnMessage {
 // FeedOnScheduledSent — отложенные сообщения ушли: черновикам sent с id из
 // очереди отложенных ставится реальный id доставленного (правка, реакции и
 // уборка проверочных файлов работают по id сообщения). Отметки sent-unsaved
-// переписываются следом: иначе уборка вернула бы id очереди обратно.
+// переписываются следом: иначе уборка вернула бы id очереди обратно. Пары
+// остаются в базе (scheduled_links): доставка случается через минуту после
+// запроса — пока шла загрузка большого файла, черновик мог быть ещё не
+// помечен отправленным, и связать его должна уборка (relinkScheduledLinks).
 func FeedOnScheduledSent(loader func() (*config.Settings, error)) func(ctx context.Context, c *tgc.Conn, pairs [][2]int) {
 	return func(ctx context.Context, _ *tgc.Conn, pairs [][2]int) {
 		s, err := loader()
@@ -264,16 +268,97 @@ func FeedOnScheduledSent(loader func() (*config.Settings, error)) func(ctx conte
 		for _, p := range pairs {
 			qp = append(qp, [2]int64{int64(p[0]), int64(p[1])})
 		}
-		relinked, err := outbox.New(s.DataDir()).RelinkScheduled(qp)
-		if err != nil {
-			_ = audit.Log(s.AuditPath(), "scheduled_relink_failed", "error", err.Error())
-			return
-		}
-		for _, r := range relinked {
-			_ = audit.Log(s.AuditPath(), "scheduled_relinked", "draft_id", r.ID, "queue_id", r.Queue, "message_id", r.Real)
-		}
-		relinkUnsaved(s, relinked)
+		relinkScheduled(s, qp)
+		rememberScheduledLinks(s, qp)
 	}
+}
+
+// scheduledLink — отложенное сообщение ушло: id очереди стал id сообщения.
+type scheduledLink struct {
+	Queue int64     `json:"queue"`
+	Real  int64     `json:"real"`
+	At    time.Time `json:"at"`
+}
+
+// scheduledLinkTTL — сколько хранить пару: минута доставки давно пройдёт, а
+// черновики отправки живут примерно сутки.
+const scheduledLinkTTL = 24 * time.Hour
+
+// relinkScheduled — переписать черновикам id очереди на реальный (пары из
+// события или из базы); для sent-unsaved — та же переписка в отметке.
+func relinkScheduled(s *config.Settings, pairs [][2]int64) {
+	if len(pairs) == 0 {
+		return
+	}
+	relinked, err := outbox.New(s.DataDir()).RelinkScheduled(pairs)
+	if err != nil {
+		_ = audit.Log(s.AuditPath(), "scheduled_relink_failed", "error", err.Error())
+		return
+	}
+	for _, r := range relinked {
+		_ = audit.Log(s.AuditPath(), "scheduled_relinked", "draft_id", r.ID, "queue_id", r.Queue, "message_id", r.Real)
+	}
+	relinkUnsaved(s, relinked)
+}
+
+// rememberScheduledLinks — дописать пары в базу (без дублей), протухшие
+// выкинуть. Чтение, дописка и запись — одной транзакцией.
+func rememberScheduledLinks(s *config.Settings, pairs [][2]int64) {
+	db, err := stateDB(s)
+	if err != nil {
+		return
+	}
+	ctx := context.Background()
+	_ = db.Write(ctx, func(tx *sql.Tx) error {
+		var links []scheduledLink
+		if ok, _ := store.GetKV(ctx, tx, store.KeyScheduledLinks, &links); ok {
+			links = freshScheduledLinks(links, time.Now())
+		}
+		known := map[int64]bool{}
+		for _, l := range links {
+			known[l.Queue] = true
+		}
+		now := time.Now()
+		for _, p := range pairs {
+			if !known[p[0]] {
+				links = append(links, scheduledLink{Queue: p[0], Real: p[1], At: now})
+			}
+		}
+		return store.PutKV(ctx, tx, store.KeyScheduledLinks, links)
+	})
+}
+
+// relinkScheduledLinks — уборка: черновик мог быть помечен отправленным уже
+// после доставки (загрузка большого файла между ответом Telegram и MarkSent)
+// — до-связать его по сохранённым парам и выкинуть протухшие.
+func relinkScheduledLinks(ctx context.Context, s *config.Settings) {
+	db, err := stateDB(s)
+	if err != nil {
+		return
+	}
+	var links []scheduledLink
+	if ok, _ := store.GetKV(ctx, db.Q(), store.KeyScheduledLinks, &links); !ok {
+		return
+	}
+	links = freshScheduledLinks(links, time.Now())
+	if len(links) == 0 {
+		return
+	}
+	var pairs [][2]int64
+	for _, l := range links {
+		pairs = append(pairs, [2]int64{l.Queue, l.Real})
+	}
+	relinkScheduled(s, pairs)
+}
+
+func freshScheduledLinks(links []scheduledLink, now time.Time) []scheduledLink {
+	out := links[:0]
+	for _, l := range links {
+		if now.Sub(l.At) < scheduledLinkTTL {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // relinkUnsaved — в файле sent-unsaved отметка с id очереди: черновик уже

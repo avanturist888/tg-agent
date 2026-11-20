@@ -18,6 +18,7 @@ const (
 	KeyPeersSelf      = "peers_self"      // id своего пользователя Telegram
 	KeyUpdatesState   = "updates_state"   // общая отметка обновлений gotd
 	KeySetsUpdated    = "chat_sets_updated"
+	KeyScheduledLinks = "scheduled_links" // отложенные ушли: пары «id очереди → реальный id»
 )
 
 // GetKV — значение по ключу в v; false — его нет.
