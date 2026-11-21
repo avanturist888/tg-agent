@@ -33,8 +33,8 @@ func TestPhotoOrDocument(t *testing.T) {
 		photo bool
 	}{
 		{pngFile(t, dir, "slide.png", 1800, 1060), true},
-		{pngFile(t, dir, "long.png", 100, 3000), false},  // вытянута сильнее 1:20
-		{pngFile(t, dir, "huge.png", 6000, 5000), false}, // сумма сторон больше 10000
+		{pngFile(t, dir, "long.png", 100, 3000), false},         // вытянута сильнее 1:20
+		{pngHeaderOnly(t, dir, "huge.png", 10000, 7000), false}, // > 25 Мп
 	}
 	pdf := filepath.Join(dir, "report.pdf")
 	os.WriteFile(pdf, []byte("%PDF-1.4"), 0o600)
@@ -51,7 +51,12 @@ func TestPhotoOrDocument(t *testing.T) {
 
 	for _, c := range cases {
 		st, _ := os.Stat(c.path)
-		if got := photoOK(c.path, st.Size()); got != c.photo {
+		dstDir := t.TempDir()
+		_, _, _, got, err := preparePhoto(c.path, dstDir, filepath.Base(c.path), st.Size())
+		if err != nil {
+			t.Fatalf("%s: unexpected err: %v", filepath.Base(c.path), err)
+		}
+		if got != c.photo {
 			t.Errorf("%s: фото=%v, ждали %v", filepath.Base(c.path), got, c.photo)
 		}
 	}

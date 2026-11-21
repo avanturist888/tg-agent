@@ -245,6 +245,7 @@ func (c *Conn) SendFiles(ctx context.Context, t Target, files []OutFile, reply *
 		got, err := c.sendAlbum(ctx, t, g.paths, g.photo, reply)
 		if err != nil && g.photo && photoRejected(err) {
 			// фото Telegram не принял (размеры, формат) — те же файлы документами
+			fmt.Fprintf(os.Stderr, "tgc: photo rejected by Telegram, falling back to document (%d files): %v\n", len(g.paths), err)
 			got, err = c.sendAlbum(ctx, t, g.paths, false, reply)
 		}
 		if err != nil {
