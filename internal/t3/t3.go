@@ -103,6 +103,44 @@ func find(ctx context.Context) (*install, error) {
 	return in, nil
 }
 
+// SendThread — отправить text напрямую в известный тред локального T3 Code:
+// на протоколе 2 — проверяет, что тред открыт, и шлёт message.dispatch с
+// deliveryIntent "auto" (инжектит без прерывания, если провайдер умеет
+// active steering, иначе ставит в очередь; при простое начинает ход), на
+// протоколе 1 — thread.turn.start (без обхода Busy).
+func SendThread(ctx context.Context, tokenPath, thread, text string) error {
+	if strings.TrimSpace(thread) == "" {
+		return NoThread
+	}
+	in, err := find(ctx)
+	if err != nil {
+		return err
+	}
+	return in.sendThread(ctx, tokenPath, thread, text, false)
+}
+
+func (in *install) sendThread(ctx context.Context, tokenPath, thread, text string, forceV1 bool) error {
+	in.env.TokenPath = tokenPath
+	var err error
+	if in.proto == protocolV2 {
+		p := filepath.Join(in.home, "userdata", "statev2.sqlite")
+		if _, statErr := os.Stat(p); statErr == nil {
+			if err := threadOpenV2(ctx, p, thread); err != nil {
+				return err
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+		err = in.env.sendV2(ctx, thread, text)
+	} else {
+		_, err = in.env.startTurn(ctx, thread, text, forceV1)
+	}
+	if errors.Is(err, ThreadGone) {
+		return NoThread // тред удалён или в архиве — владелец его закрыл, не тревожим
+	}
+	return err
+}
+
 // Wake — начать в треде сессии ход с текстом text.
 func Wake(ctx context.Context, tokenPath, session, text string) error {
 	in, err := find(ctx)
@@ -113,17 +151,11 @@ func Wake(ctx context.Context, tokenPath, session, text string) error {
 	if err != nil {
 		return err
 	}
-	in.env.TokenPath = tokenPath
-	if in.proto == protocolV2 {
-		err = in.env.sendV2(ctx, thread, text)
-	} else {
-		// процесс сессии уже остановлен, так что «идущий» ход в снимке — старый
-		_, err = in.env.startTurn(ctx, thread, text, true)
+	if strings.TrimSpace(thread) == "" {
+		return NoThread
 	}
-	if errors.Is(err, ThreadGone) {
-		return NoThread // тред удалён или в архиве — владелец его закрыл, не тревожим
-	}
-	return err
+	// процесс сессии уже остановлен, так что на v1 «идущий» ход в снимке — старый
+	return in.sendThread(ctx, tokenPath, thread, text, true)
 }
 
 // pairingCode — одноразовый код от встроенной команды T3 (живёт 5 минут).

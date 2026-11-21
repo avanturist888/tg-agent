@@ -412,7 +412,7 @@ func TestSubscriptionsFollowCodexHandoff(t *testing.T) {
 			}
 			appendNewer(s, "test", []int{93})
 			calls := 0
-			codexNotice = func(_ context.Context, agent inbox.Addr, text string) error {
+			codexNotice = func(_ context.Context, _ *config.Settings, agent inbox.Addr, text string) error {
 				calls++
 				if agent != fresh || !strings.Contains(text, fmt.Sprintf("after_id=%d", want)) ||
 					!strings.Contains(text, fmt.Sprintf("новых: %d", 93-want)) {
@@ -421,7 +421,7 @@ func TestSubscriptionsFollowCodexHandoff(t *testing.T) {
 				return nil
 			}
 			wakeT3 = func(context.Context, *config.Settings, string, string) error {
-				t.Fatal("Codex notification must not become user/steer")
+				t.Fatal("direct T3 notification must not fall back to wakeT3")
 				return nil
 			}
 			notifyOnce(ctx, s, map[string]time.Time{})

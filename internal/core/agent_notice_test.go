@@ -15,14 +15,11 @@ import (
 	"tgagent/internal/t3"
 )
 
-func TestCodexNoticeMailboxContract(t *testing.T) {
+func TestCodexNoticeT3Contract(t *testing.T) {
 	notice := codexNotice
-	mailbox := threadNotice
-	watchEnv(t)
-	threadNotice = mailbox
-	t.Setenv("TG_NESTOR", "synthetic-nestor")
-	oldSend := nestorSend
-	t.Cleanup(func() { nestorSend = oldSend })
+	direct := threadNotice
+	s := watchEnv(t)
+	threadNotice = direct
 	threadOf = func(_ context.Context, session string) (string, error) {
 		if session != "native-codex" {
 			t.Fatalf("wrong session: %q", session)
@@ -31,32 +28,36 @@ func TestCodexNoticeMailboxContract(t *testing.T) {
 	}
 	calls := 0
 	var sendError error
-	nestorSend = func(_ context.Context, exe, text string, args ...string) error {
+	t3SendThread = func(_ context.Context, tokenPath, thread, text string) error {
 		calls++
-		if exe != "synthetic-nestor" || text != "tg-agent: test 11" || strings.Join(args, " ") != "send mcp:target -" {
-			t.Fatalf("mailbox invocation: %q %q %q", exe, text, args)
+		if tokenPath != t3TokenPath(s) || thread != "mcp:target" || text != "tg-agent: test 11" {
+			t.Fatalf("t3 invocation: %q %q %q", tokenPath, thread, text)
 		}
 		return sendError
 	}
 	agent := inbox.Addr{Kind: inbox.KindCodex, Session: "native-codex"}
-	if err := notice(context.Background(), agent, "tg-agent: test 11"); err != nil || calls != 1 {
-		t.Fatalf("mailbox: %v, calls %d", err, calls)
+	if err := notice(context.Background(), s, agent, "tg-agent: test 11"); err != nil || calls != 1 {
+		t.Fatalf("t3 notice: %v, calls %d", err, calls)
 	}
-	sendError = errors.New("mailbox unavailable")
-	if err := notice(context.Background(), agent, "tg-agent: test 11"); !errors.Is(err, sendError) {
-		t.Fatalf("mailbox failure hidden: %v", err)
+	codexNotice = notice
+	if via, err := sendAgentNotice(context.Background(), s, agent, "tg-agent: test 11"); err != nil || via != "t3" || calls != 2 {
+		t.Fatalf("sendAgentNotice codex: via=%q err=%v calls=%d", via, err, calls)
+	}
+	sendError = errors.New("t3 unavailable")
+	if err := notice(context.Background(), s, agent, "tg-agent: test 11"); !errors.Is(err, sendError) {
+		t.Fatalf("t3 failure hidden: %v", err)
 	}
 	threadOf = func(context.Context, string) (string, error) { return "", t3.NoThread }
-	if err := notice(context.Background(), agent, "tg-agent: test 11"); !errors.Is(err, t3.NoThread) || calls != 2 {
+	if err := notice(context.Background(), s, agent, "tg-agent: test 11"); !errors.Is(err, t3.NoThread) || calls != 3 {
 		t.Fatalf("unknown thread sent: %v, calls %d", err, calls)
 	}
 	threadOf = func(context.Context, string) (string, error) { return "", nil }
-	if err := notice(context.Background(), agent, "tg-agent: test 11"); !errors.Is(err, t3.NoThread) || calls != 2 {
+	if err := notice(context.Background(), s, agent, "tg-agent: test 11"); !errors.Is(err, t3.NoThread) || calls != 3 {
 		t.Fatalf("empty target sent: %v, calls %d", err, calls)
 	}
 }
 
-func TestCodexAccessNoticeRetryWithoutSteering(t *testing.T) {
+func TestCodexAccessNoticeRetryWithoutFallback(t *testing.T) {
 	for _, handoff := range []bool{false, true} {
 		name := "codex-address"
 		if handoff {
@@ -99,7 +100,7 @@ func testAccessNoticeRetry(t *testing.T, handoff bool) {
 	}
 	r := &accessRequest{ID: "synthetic-request", Title: "Synthetic chat", Status: accessDenied, Agent: &agent}
 	wakeT3 = func(context.Context, *config.Settings, string, string) error {
-		t.Fatal("Codex access decision fell back to user/steer")
+		t.Fatal("direct T3 access decision fell back to wakeT3")
 		return nil
 	}
 	calls := 0
@@ -110,17 +111,17 @@ func testAccessNoticeRetry(t *testing.T, handoff bool) {
 			t.Fatalf("wrong access notice: %s", text)
 		}
 		if fail {
-			return errors.New("mailbox unavailable")
+			return errors.New("t3 unavailable")
 		}
 		return nil
 	}
-	codexNotice = func(_ context.Context, got inbox.Addr, text string) error {
+	codexNotice = func(_ context.Context, _ *config.Settings, got inbox.Addr, text string) error {
 		if handoff || got != agent {
 			t.Fatalf("wrong Codex notice address: %+v", got)
 		}
 		return accept(text)
 	}
-	threadNotice = func(_ context.Context, thread, text string) error {
+	threadNotice = func(_ context.Context, _ *config.Settings, thread, text string) error {
 		if !handoff || thread != "logical-thread" {
 			t.Fatalf("wrong handoff target: %q", thread)
 		}
@@ -139,21 +140,21 @@ func testAccessNoticeRetry(t *testing.T, handoff bool) {
 }
 
 func TestCurrentClaudeNoticeKeepsInbox(t *testing.T) {
-	watchEnv(t)
+	s := watchEnv(t)
 	agent := inbox.Addr{Session: "current-claude"}
 	threadOf = func(context.Context, string) (string, error) { return "logical-thread", nil }
 	currentSession = func(context.Context, string) string { return agent.Session }
-	threadNotice = func(context.Context, string, string) error {
-		t.Fatal("current Claude address was sent to the mailbox")
+	threadNotice = func(context.Context, *config.Settings, string, string) error {
+		t.Fatal("current Claude address was sent directly to T3")
 		return nil
 	}
-	via, err := sendAgentNotice(context.Background(), agent, "synthetic notice")
+	via, err := sendAgentNotice(context.Background(), s, agent, "synthetic notice")
 	if via != "inbox" || !errors.Is(err, inbox.ErrNoSocket) {
 		t.Fatalf("current Claude route changed: %s, %v", via, err)
 	}
 }
 
-func TestCodexNotificationRetryWithoutSteering(t *testing.T) {
+func TestCodexNotificationRetryWithoutFallback(t *testing.T) {
 	s := watchEnv(t)
 	ctx := context.Background()
 	agent := inbox.Addr{Kind: inbox.KindCodex, Session: "native-codex"}
@@ -167,18 +168,18 @@ func TestCodexNotificationRetryWithoutSteering(t *testing.T) {
 		t.Fatal(err)
 	}
 	wakeT3 = func(context.Context, *config.Settings, string, string) error {
-		t.Fatal("Codex notification fell back to user/steer")
+		t.Fatal("direct T3 notification fell back to wakeT3")
 		return nil
 	}
 	calls := 0
 	fail := true
-	codexNotice = func(_ context.Context, got inbox.Addr, text string) error {
+	codexNotice = func(_ context.Context, _ *config.Settings, got inbox.Addr, text string) error {
 		calls++
 		if got != agent || !strings.Contains(text, "after_id=10") {
 			t.Fatalf("wrong notice: %+v %s", got, text)
 		}
 		if fail {
-			return errors.New("mailbox unavailable")
+			return errors.New("t3 unavailable")
 		}
 		return nil
 	}

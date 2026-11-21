@@ -36,11 +36,14 @@ func watchEnv(t *testing.T) *config.Settings {
 	config.Root = t.TempDir()
 	t.Cleanup(func() { config.Root = old })
 	// настоящий T3 Code этой машины тесты не трогают
-	oldWake, oldNotice, oldThreadNotice := wakeT3, codexNotice, threadNotice
+	oldWake, oldNotice, oldThreadNotice, oldSendThread := wakeT3, codexNotice, threadNotice, t3SendThread
 	wakeT3 = func(context.Context, *config.Settings, string, string) error { return t3.Unavailable }
-	codexNotice = func(context.Context, inbox.Addr, string) error { return t3.Unavailable }
-	threadNotice = func(context.Context, string, string) error { return t3.Unavailable }
-	t.Cleanup(func() { wakeT3, codexNotice, threadNotice = oldWake, oldNotice, oldThreadNotice })
+	codexNotice = func(context.Context, *config.Settings, inbox.Addr, string) error { return t3.Unavailable }
+	threadNotice = func(context.Context, *config.Settings, string, string) error { return t3.Unavailable }
+	t3SendThread = func(context.Context, string, string, string) error { return t3.Unavailable }
+	t.Cleanup(func() {
+		wakeT3, codexNotice, threadNotice, t3SendThread = oldWake, oldNotice, oldThreadNotice, oldSendThread
+	})
 	oldThread, oldCur, oldInfo := threadOf, currentSession, threadInfo
 	threadOf = func(context.Context, string) (string, error) { return "", t3.NoThread }
 	currentSession = func(context.Context, string) string { return "" }

@@ -8,7 +8,7 @@ package core
 // (он не передатчик): задание записывается до обращения к транспорту,
 // передаётся агенту независимо от бота; карточка доставляется отдельно.
 // Агент проекта просыпается только в назначенном треде (tg updates thread)
-// (через Нестора) — проверяет, чинит сам и
+// (напрямую через T3 Code) — проверяет, чинит сам и
 // снимает карточку (tg updates ack) или зовёт владельца (tg updates escalate:
 // закрепить со звуком). Агента не разбудить — карточка сразу владельцу,
 // закреплённая, пока он не нажмёт «Разобрано» (u:ack). Новая карточка
@@ -22,9 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -645,63 +642,21 @@ func SetUpstreamThread(thread string) error {
 	})
 }
 
-var nestorSend = func(ctx context.Context, exe, text string, args ...string) error {
-	cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, exe, args...)
-	cmd.Stdin = strings.NewReader(text)
-	// пишет служба, а не тред: с T3CODE_THREAD_ID (запуск из треда) Нестор
-	// не шлёт в «свой собственный тред» — назначенный тред не разбудить
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(strings.ToUpper(kv), "T3CODE_THREAD_ID=") {
-			cmd.Env = append(cmd.Env, kv)
-		}
-	}
-	hideWindow(cmd)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%w: %s", err, truncRunes(strings.TrimSpace(string(out)), 300))
-	}
-	return nil
-}
-
-// wakeProjectAgent — разбудить агента этого проекта через Нестора (почта
-// между агентами машины): только в назначенном треде (tg updates thread).
-// Нет назначения или доставка не удалась — ошибка, карточка идёт владельцу;
-// другой тред автоматически не создаётся.
+// wakeProjectAgent — разбудить агента этого проекта напрямую через T3 Code:
+// только в назначенном треде (tg updates thread). Нет назначения или доставка
+// не удалась — ошибка, карточка идёт владельцу; другой тред автоматически не
+// создаётся.
 func wakeProjectAgent(ctx context.Context, s *config.Settings, title, text string) error {
-	exe := nestorExe()
-	if exe == "" {
-		return errors.New("Нестор не найден (TG_NESTOR, PATH, ~/nestor/bin)")
-	}
 	t := ReadUpstreamThread()
 	if t == nil {
 		return errors.New("тред разбора не назначен: tg updates thread here|<id>")
 	}
-	err := nestorSend(ctx, exe, "«"+title+"»\n\n"+text, "send", t.Thread, "-")
+	body := "tg-agent: служебное уведомление о новом обновлении (не просьба владельца).\n«" + title + "»\n\n" + text
+	err := threadNotice(ctx, s, t.Thread, body)
 	if err != nil && s != nil {
 		logEvent(s, "upstream_wake_thread_failed", "thread", t.Thread, "error", err.Error())
 	}
 	return err
-}
-
-func nestorExe() string {
-	exe := os.Getenv("TG_NESTOR")
-	if exe == "" {
-		exe, _ = exec.LookPath("nestor")
-	}
-	if exe == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			if p := filepath.Join(home, "nestor", "bin", "nestor.exe"); fileExists(p) {
-				exe = p
-			}
-		}
-	}
-	return exe
-}
-
-func fileExists(p string) bool {
-	st, err := os.Stat(p)
-	return err == nil && !st.IsDir()
 }
 
 // upstreamCommand — /updates: проверить сейчас и показать, что видно.

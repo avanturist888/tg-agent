@@ -5,12 +5,15 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -73,9 +76,9 @@ func TestThreadOfV2(t *testing.T) {
 }
 
 // fakeWS — сервер T3 v2: тикет по токену и RPC по /ws; reply — ответ на команду.
-func fakeWS(t *testing.T, reply func(cmd map[string]any) string) (*Env, *[]map[string]any) {
+func fakeWS(t *testing.T, reply func(cmd map[string]any) string) (*Env, <-chan map[string]any) {
 	t.Helper()
-	var got []map[string]any
+	got := make(chan map[string]any, 4)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/auth/websocket-ticket", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
@@ -109,7 +112,7 @@ func fakeWS(t *testing.T, reply func(cmd map[string]any) string) (*Env, *[]map[s
 			t.Errorf("запрос RPC: %s", raw)
 			return
 		}
-		got = append(got, req.Payload)
+		got <- req.Payload
 		c.Write(r.Context(), websocket.MessageText, []byte(`{"_tag":"Pong"}`))
 		c.Write(r.Context(), websocket.MessageText, []byte(reply(req.Payload)))
 		c.Read(r.Context()) // ждём, пока клиент закроет
@@ -118,7 +121,7 @@ func fakeWS(t *testing.T, reply func(cmd map[string]any) string) (*Env, *[]map[s
 	t.Cleanup(srv.Close)
 	tf := filepath.Join(t.TempDir(), "token.json")
 	os.WriteFile(tf, []byte(`{"token":"tok"}`), 0o600)
-	return &Env{Name: "fake", Origin: srv.URL, TokenFile: tf, TokenPath: filepath.Join(t.TempDir(), "t.json")}, &got
+	return &Env{Name: "fake", Origin: srv.URL, TokenFile: tf, TokenPath: filepath.Join(t.TempDir(), "t.json")}, got
 }
 
 func TestSendV2(t *testing.T) {
@@ -128,13 +131,10 @@ func TestSendV2(t *testing.T) {
 	if err := e.sendV2(context.Background(), "th-1", "привет"); err != nil {
 		t.Fatal(err)
 	}
-	if len(*got) != 1 {
-		t.Fatalf("команд: %d", len(*got))
-	}
-	cmd := (*got)[0]
+	cmd := <-got
 	mode, _ := cmd["dispatchMode"].(map[string]any)
 	if cmd["type"] != "message.dispatch" || cmd["threadId"] != "th-1" || cmd["text"] != "привет" ||
-		cmd["deliveryIntent"] != "steer" || mode["type"] != "start_immediately" || cmd["commandId"] == "" || cmd["messageId"] == "" {
+		cmd["deliveryIntent"] != "auto" || mode["type"] != "start_immediately" || cmd["commandId"] == "" || cmd["messageId"] == "" {
 		t.Fatalf("команда: %v", cmd)
 	}
 }
@@ -152,4 +152,131 @@ func TestSendV2Failures(t *testing.T) {
 	if err := e.sendV2(context.Background(), "th-1", "x"); err == nil || !strings.Contains(err.Error(), "createdBy") {
 		t.Fatalf("ждали отказ с причиной, а не %v", err)
 	}
+}
+
+func TestSendThread(t *testing.T) {
+	ctx := context.Background()
+	tokPath := filepath.Join(t.TempDir(), "t3-token.json")
+
+	// Пустой тред — сразу NoThread, не трогая T3.
+	t.Setenv("T3CODE_HOME", filepath.Join(t.TempDir(), "missing"))
+	if err := SendThread(ctx, tokPath, "", "привет"); !errors.Is(err, NoThread) {
+		t.Fatalf("пустой тред: ждали NoThread, получили %v", err)
+	}
+	// Без T3 — Unavailable.
+	if err := SendThread(ctx, tokPath, "th-1", "привет"); !errors.Is(err, Unavailable) {
+		t.Fatalf("без T3: ждали Unavailable, получили %v", err)
+	}
+
+	// Локальный фейковый сервер T3 v2.
+	got := make(chan map[string]any, 4)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /.well-known/t3/environment", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"label":                        "local",
+			"serverVersion":                "1.0",
+			"orchestrationProtocolVersion": 2,
+		})
+	})
+	mux.HandleFunc("POST /api/auth/websocket-ticket", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok" {
+			http.Error(w, "no", http.StatusUnauthorized)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"ticket": "tk-send"})
+	})
+	mux.HandleFunc("GET /ws", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("orchestrationProtocol") != "2" || r.URL.Query().Get("wsTicket") != "tk-send" {
+			http.Error(w, "bad", http.StatusUpgradeRequired)
+			return
+		}
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		_, raw, err := c.Read(r.Context())
+		if err != nil {
+			return
+		}
+		var req struct {
+			Payload map[string]any `json:"payload"`
+		}
+		json.Unmarshal(raw, &req)
+		got <- req.Payload
+		reply := `[{"_tag":"Exit","requestId":"1","exit":{"_tag":"Success","value":{"sequence":1}}}]`
+		if req.Payload["threadId"] == "mcp:gone" {
+			reply = `{"_tag":"Exit","requestId":"1","exit":{"_tag":"Failure","cause":[{"_tag":"Fail","error":{"_tag":"OrchestrationV2DispatchCommandError","message":"No orchestration projection exists for thread mcp:gone.","cause":{"name":"OrchestratorProjectionError","cause":{"name":"ProjectionStoreThreadNotFoundError"}}}}]}}`
+		}
+		c.Write(r.Context(), websocket.MessageText, []byte(reply))
+		c.Read(r.Context())
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+	home := t.TempDir()
+	t.Setenv("T3CODE_HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, "userdata"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "userdata", "server-runtime.json"),
+		[]byte(fmt.Sprintf(`{"port":%d}`, port)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(home, "userdata", "statev2.sqlite")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, title TEXT, archived_at TEXT, deleted_at TEXT)`,
+		`INSERT INTO orchestration_v2_projection_threads VALUES
+			('mcp:target', 'Рабочий', NULL, NULL),
+			('mcp:gone', 'Пропавший', NULL, NULL),
+			('mcp:arch', 'Архив', '2026-11-20T10:00:00Z', NULL),
+			('mcp:del', 'Удалён', NULL, '2026-11-20T10:00:00Z')`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	saved, _ := json.Marshal(savedToken{
+		Origin:  fmt.Sprintf("http://127.0.0.1:%d", port),
+		Token:   "tok",
+		Expires: time.Now().Add(7 * 24 * time.Hour),
+	})
+	if err := os.WriteFile(tokPath, saved, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Архивный, удалённый и отсутствующий в базе треды отвергаются до RPC.
+	for _, closed := range []string{"mcp:arch", "mcp:del", "mcp:missing"} {
+		if err := SendThread(ctx, tokPath, closed, "тест"); !errors.Is(err, NoThread) {
+			t.Fatalf("%s: ждали NoThread, получили %v", closed, err)
+		}
+	}
+	select {
+	case unexpected := <-got:
+		t.Fatalf("отправка в закрытый/неизвестный тред: %v", unexpected)
+	default:
+	}
+
+	if err := SendThread(ctx, tokPath, "mcp:target", "привет напрямую"); err != nil {
+		t.Fatalf("SendThread v2: %v", err)
+	}
+	cmd := <-got
+	mode, _ := cmd["dispatchMode"].(map[string]any)
+	if cmd["type"] != "message.dispatch" || cmd["threadId"] != "mcp:target" || cmd["text"] != "привет напрямую" ||
+		cmd["deliveryIntent"] != "auto" || mode["type"] != "start_immediately" {
+		t.Fatalf("неожиданная команда: %v", cmd)
+	}
+
+	// ThreadGone от сервера превращается в NoThread.
+	if err := SendThread(ctx, tokPath, "mcp:gone", "тест"); !errors.Is(err, NoThread) {
+		t.Fatalf("ThreadGone: ждали NoThread, получили %v", err)
+	}
+	<-got
 }

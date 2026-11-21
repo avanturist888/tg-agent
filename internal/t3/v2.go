@@ -7,10 +7,12 @@ package t3
 // Подключение: одноразовый тикет POST /api/auth/websocket-ticket (тем же
 // токеном) → /ws?orchestrationProtocol=2&wsTicket=….
 //
-// Сообщение в тред — команда message.dispatch с deliveryIntent "steer":
-// сервер сам смотрит на тред — идёт ход, и сообщение уходит в него
-// (steer_active, агент видит его сразу, а не после хода), нет — начинает
-// ход (start_immediately).
+// Сообщение в тред — команда message.dispatch с deliveryIntent "auto":
+// сервер сам смотрит на тред — спит → начинает ход (start_immediately),
+// идёт и провайдер умеет безопасный active steering → инжектит в текущий ход
+// (steer_active, агент видит сразу без прерывания), иначе (например,
+// Antigravity с supportsActiveSteering=false) → ставит в очередь
+// (queue_after_active), не прерывая работу.
 //
 // База десктопа — statev2.sqlite. Сессия Claude у треда —
 // orchestration_v2_projection_provider_threads.payload_json
@@ -158,7 +160,33 @@ func infoV2(ctx context.Context, path, session string) (SessionThread, error) {
 	return SessionThread{ID: thread, Title: title.String, Closed: archived.Valid || deleted.Valid}, nil
 }
 
-// sendV2 — сообщение text в тред: в идущий ход или новым ходом.
+// threadOpenV2 — проверка, что тред есть в базе v2 и не в архиве/удалён.
+// Обычный message.dispatch в T3 может принять команду для архивного треда,
+// поэтому проверяем состояние адресата до отправки.
+func threadOpenV2(ctx context.Context, path, thread string) error {
+	db, err := openRO(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var archived, deleted sql.NullString
+	err = db.QueryRowContext(ctx, `SELECT archived_at, deleted_at FROM orchestration_v2_projection_threads
+		WHERE thread_id = ?`, thread).Scan(&archived, &deleted)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return NoThread
+	case err != nil:
+		return fmt.Errorf("база T3: %w", err)
+	case archived.Valid || deleted.Valid:
+		return NoThread
+	default:
+		return nil
+	}
+}
+
+// sendV2 — сообщение text в тред: при простое начинает ход, в идущий ход
+// инжектит без прерывания (если провайдер умеет active steering) или ставит
+// в очередь.
 func (e *Env) sendV2(ctx context.Context, thread, text string) error {
 	return e.dispatchV2(ctx, map[string]any{
 		"type":           "message.dispatch",
@@ -169,7 +197,7 @@ func (e *Env) sendV2(ctx context.Context, thread, text string) error {
 		"messageId":      randomID(),
 		"text":           text,
 		"attachments":    []any{},
-		"deliveryIntent": "steer",
+		"deliveryIntent": "auto",
 		// без deliveryIntent (старый сервер) — просто начать ход
 		"dispatchMode": map[string]string{"type": "start_immediately"},
 	})

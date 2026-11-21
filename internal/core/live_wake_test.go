@@ -10,7 +10,7 @@ import (
 )
 
 // TestLiveWakeAgent — путь, которым служба отдаёт карточку обновления агенту:
-// Нестор доставляет отметку в назначенный существующий тред проекта.
+// прямая отправка в назначенный существующий тред проекта через T3 Code.
 // go test -tags live -run LiveWakeAgent -v ./internal/core
 func TestLiveWakeAgent(t *testing.T) {
 	if config.Root == "" {
@@ -18,7 +18,7 @@ func TestLiveWakeAgent(t *testing.T) {
 	}
 	err := wakeProjectAgent(context.Background(), nil, "Проверка: пробуждение агента службой tg-agent",
 		"Это живая проверка пути, которым служба tg-agent отдаёт агенту карточки обновлений MAX "+
-			"(core.wakeProjectAgent → nestor send). Это служебная тестовая отметка, не поручение владельца. "+
+			"(core.wakeProjectAgent → t3.SendThread). Это служебная тестовая отметка, не поручение владельца. "+
 			"Отметь получение и продолжай текущую задачу.")
 	if err != nil {
 		t.Fatal(err)

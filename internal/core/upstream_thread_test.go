@@ -11,28 +11,28 @@ import (
 )
 
 func TestUpstreamWakeThread(t *testing.T) {
-	old, oldSend := config.Root, nestorSend
+	old, oldSend := config.Root, t3SendThread
 	config.Root = t.TempDir()
-	t.Setenv("TG_NESTOR", "nestor-test")
-	t.Cleanup(func() { config.Root, nestorSend = old, oldSend })
-	var calls [][]string
+	t.Cleanup(func() { config.Root, t3SendThread = old, oldSend })
+	type call struct{ tokenPath, thread, text string }
+	var calls []call
 	fail := map[string]bool{}
 	sendErr := errors.New("тред закрыт")
-	nestorSend = func(_ context.Context, exe, text string, args ...string) error {
-		calls = append(calls, append([]string{text}, args...))
-		if fail[args[1]] {
+	t3SendThread = func(_ context.Context, tokenPath, thread, text string) error {
+		calls = append(calls, call{tokenPath: tokenPath, thread: thread, text: text})
+		if fail[thread] {
 			return sendErr
 		}
 		return nil
 	}
 	s := &config.Settings{}
 
-	// Без назначения не создаём ни тред, ни письмо другому агенту.
+	// Без назначения не создаём ни тред, ни сообщение другому агенту.
 	if err := wakeProjectAgent(context.Background(), s, "Заголовок", "задание"); err == nil {
 		t.Fatal("нет ошибки при отсутствующем назначении")
 	}
 	if len(calls) != 0 {
-		t.Fatalf("отправка без назначения: %q", calls)
+		t.Fatalf("отправка без назначения: %+v", calls)
 	}
 
 	// назначенный — туда, с заголовком в тексте
@@ -43,8 +43,10 @@ func TestUpstreamWakeThread(t *testing.T) {
 	if err := wakeProjectAgent(context.Background(), s, "Заголовок", "задание"); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 1 || strings.Join(calls[0][1:], " ") != "send mcp:abc -" || !strings.HasPrefix(calls[0][0], "«Заголовок»") {
-		t.Fatalf("назначенный тред: %q", calls)
+	if len(calls) != 1 || calls[0].tokenPath != t3TokenPath(s) || calls[0].thread != "mcp:abc" ||
+		!strings.HasPrefix(calls[0].text, "tg-agent: служебное уведомление") ||
+		!strings.Contains(calls[0].text, "«Заголовок»") {
+		t.Fatalf("назначенный тред: %+v", calls)
 	}
 
 	// Не дошло — ошибка остаётся видимой, никакого нового треда.
@@ -53,8 +55,8 @@ func TestUpstreamWakeThread(t *testing.T) {
 	if err := wakeProjectAgent(context.Background(), s, "Заголовок", "задание"); !errors.Is(err, sendErr) {
 		t.Fatalf("ошибка доставки потеряна: %v", err)
 	}
-	if len(calls) != 1 || strings.Join(calls[0][1:], " ") != "send mcp:abc -" {
-		t.Fatalf("адресат после сбоя: %q", calls)
+	if len(calls) != 1 || calls[0].thread != "mcp:abc" {
+		t.Fatalf("адресат после сбоя: %+v", calls)
 	}
 
 	for _, invalid := range []string{"", "   ", "new"} {
@@ -69,7 +71,7 @@ func TestUpstreamWakeThread(t *testing.T) {
 	fail["mcp:abc"] = false
 	calls = nil
 	if err := wakeProjectAgent(context.Background(), s, "Заголовок", "задание"); err != nil || len(calls) != 1 {
-		t.Fatalf("повтор: %v, %q", err, calls)
+		t.Fatalf("повтор: %v, %+v", err, calls)
 	}
 }
 

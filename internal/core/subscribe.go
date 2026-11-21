@@ -16,7 +16,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -43,7 +42,7 @@ const (
 
 // wakeT3 — запасной путь: сессию остановил T3 Code (см. пакет t3).
 var wakeT3 = func(ctx context.Context, s *config.Settings, session, text string) error {
-	return t3.Wake(ctx, filepath.Join(s.DataDir(), "t3-token.json"), session, text)
+	return t3.Wake(ctx, t3TokenPath(s), session, text)
 }
 
 // ── сессии одного треда T3 ───────────────────────────────────────────────
@@ -1075,8 +1074,8 @@ func notifyOnce(ctx context.Context, s *config.Settings, sent map[string]time.Ti
 			strings.Join(lines, "\n") + "\n" + passHint(canPass) +
 			"Это уведомление службы tg-agent, а не просьба владельца: прочитай и действуй " +
 			"по задаче, которую он тебе дал. Отписаться — tg_unsubscribe."
-		via, err := sendAgentNotice(ctx, sub.Agent, text)
-		if err != nil && via != "mailbox" && sub.Agent.Session != "" {
+		via, err := sendAgentNotice(ctx, s, sub.Agent, text)
+		if err != nil && via != "t3" && sub.Agent.Session != "" {
 			// процесс сессии остановлен — если это T3 Code, просим его начать ход в треде
 			if time.Since(sent["t3:"+key]) < t3Gap {
 				continue // уже будили через T3: ждём, пока сессия поднимется и назовётся (hello)
