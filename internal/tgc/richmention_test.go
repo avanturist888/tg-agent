@@ -1,9 +1,11 @@
 package tgc
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 )
 
@@ -84,5 +86,91 @@ func TestRichMentionsRead(t *testing.T) {
 	}
 	if un, _ := got[1].Get("username"); un != "MariShora" {
 		t.Fatalf("по username: %v", un)
+	}
+}
+
+func TestRichInputPreservesBreaks(t *testing.T) {
+	var c *Conn
+	in, err := c.richInput(context.Background(), "Что уже готово:\n— пункт 1\n— пункт 2")
+	if err != nil {
+		t.Fatalf("richInput: %v", err)
+	}
+	md, ok := in.(*tg.InputRichMessageMarkdown)
+	if !ok {
+		t.Fatalf("ждали *tg.InputRichMessageMarkdown, получили %T", in)
+	}
+	want := "Что уже готово:  \n— пункт 1  \n— пункт 2"
+	if md.Markdown != want {
+		t.Fatalf("Markdown = %q, ждали %q", md.Markdown, want)
+	}
+}
+
+type fakeDraftInvoker struct {
+	savedMarkdown string
+	dialogsCalls  int
+}
+
+func (f *fakeDraftInvoker) Invoke(_ context.Context, input bin.Encoder, output bin.Decoder) error {
+	switch req := input.(type) {
+	case *tg.MessagesGetPeerDialogsRequest:
+		f.dialogsCalls++
+		var draft tg.DraftMessageClass = &tg.DraftMessageEmpty{}
+		if f.dialogsCalls > 1 {
+			dm := &tg.DraftMessage{}
+			dm.SetRichMessage(tg.RichMessage{Blocks: []tg.PageBlockClass{
+				&tg.PageBlockParagraph{Text: &tg.TextURL{
+					Text: &tg.TextPlain{Text: "Света"},
+					URL:  mentionStub + "5",
+				}},
+			}})
+			draft = dm
+		}
+		var b bin.Buffer
+		resp := &tg.MessagesPeerDialogs{Dialogs: []tg.DialogClass{&tg.Dialog{
+			Peer:  &tg.PeerUser{UserID: 1},
+			Draft: draft,
+		}}}
+		if err := resp.Encode(&b); err != nil {
+			return err
+		}
+		return output.Decode(&b)
+	case *tg.MessagesSaveDraftRequest:
+		if rm, ok := req.GetRichMessage(); ok {
+			if md, ok := rm.(*tg.InputRichMessageMarkdown); ok {
+				f.savedMarkdown = md.Markdown
+			}
+		}
+		var b bin.Buffer
+		if err := (&tg.BoolTrue{}).Encode(&b); err != nil {
+			return err
+		}
+		return output.Decode(&b)
+	}
+	return nil
+}
+
+func TestRichInputStubMentionsGetsPreservedBreaks(t *testing.T) {
+	inv := &fakeDraftInvoker{}
+	peers := LoadPeers("")
+	peers.data.Users[5] = 777
+	c := &Conn{
+		API:   tg.NewClient(inv),
+		Peers: peers,
+	}
+
+	in, err := c.richInput(context.Background(), "Привет, [Света](tg://user?id=5)\n— пункт 1\n— пункт 2")
+	if err != nil {
+		t.Fatalf("richInput: %v", err)
+	}
+	rich, ok := in.(*tg.InputRichMessage)
+	if !ok {
+		t.Fatalf("ждали *tg.InputRichMessage, получили %T", in)
+	}
+	wantSaved := "Привет, [Света](" + mentionStub + "5)  \n— пункт 1  \n— пункт 2"
+	if inv.savedMarkdown != wantSaved {
+		t.Fatalf("parseRich получил:\n%q\nждали:\n%q", inv.savedMarkdown, wantSaved)
+	}
+	if len(rich.Users) != 1 {
+		t.Fatalf("ждали 1 пользователя в rich.Users, получили %d", len(rich.Users))
 	}
 }

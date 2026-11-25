@@ -26,6 +26,7 @@ import (
 	"tgagent/internal/audit"
 	"tgagent/internal/config"
 	"tgagent/internal/outbox"
+	"tgagent/internal/richtext"
 )
 
 const api = "https://api.telegram.org"
@@ -323,8 +324,9 @@ func CardMarkdown(d *outbox.Draft, title, note, status string) string {
 	} else if d.Bot != nil {
 		body = "🤖 " + MDEscape(BotLine(d.Bot))
 	} else if d.Text != "" {
-		body = d.Text
-		if d.Fmt != "markdown" {
+		if d.Fmt == "markdown" {
+			body = richtext.PreserveBreaks(d.Text)
+		} else {
 			body = MDEscape(d.Text)
 		}
 	}
