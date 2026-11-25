@@ -5,13 +5,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"unicode"
 
+	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 // Bad — ошибка во входных данных (нет сообщения, нет картинки…).
@@ -57,8 +62,81 @@ func largestPhotoSize(sizes []tg.PhotoSizeClass) (typ string, inline []byte, siz
 	return typ, inline, size
 }
 
-func (c *Conn) download(ctx context.Context, loc tg.InputFileLocationClass, w interface{ Write([]byte) (int, error) }) error {
-	_, err := downloader.NewDownloader().Download(c.API, loc).Stream(ctx, w)
+var (
+	streamDownload = func(ctx context.Context, api *tg.Client, loc tg.InputFileLocationClass, w io.Writer) error {
+		_, err := downloader.NewDownloader().Download(api, loc).Stream(ctx, w)
+		return err
+	}
+	openFreshDC = func(ctx context.Context, client *telegram.Client, dcID int) (telegram.CloseInvoker, error) {
+		return client.DC(ctx, dcID, 1)
+	}
+)
+
+func isMediaConnBroken(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "engine forcibly closed") {
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if _, ok := tgerr.As(err); ok {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+	for _, sub := range []string{"wsasend", "wsarecv", "connection aborted", "connection reset", "broken pipe"} {
+		if strings.Contains(msg, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Conn) download(ctx context.Context, loc tg.InputFileLocationClass, dcID int, w io.Writer, reset func() error) error {
+	err := streamDownload(ctx, c.API, loc, w)
+	if err == nil || !isMediaConnBroken(err) || ctx.Err() != nil || dcID <= 0 || c.Client == nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "tgc: media download retry on fresh DC %d after transport error: %v\n", dcID, err)
+	return c.downloadFreshDC(ctx, loc, dcID, w, reset)
+}
+
+func (c *Conn) downloadFreshDC(ctx context.Context, loc tg.InputFileLocationClass, dcID int, w io.Writer, reset func() error) error {
+	tryDC := func(dc int) error {
+		if reset != nil {
+			if err := reset(); err != nil {
+				return err
+			}
+		}
+		inv, err := openFreshDC(ctx, c.Client, dc)
+		if err != nil {
+			return err
+		}
+		defer inv.Close()
+		var apiInv tg.Invoker = inv
+		if c.Settings != nil {
+			apiInv = floodLog(c.Settings).Handle(inv)
+		}
+		return streamDownload(ctx, tg.NewClient(apiInv), loc, w)
+	}
+
+	err := tryDC(dcID)
+	if err == nil {
+		return nil
+	}
+	if rpcErr, ok := tgerr.AsType(err, "FILE_MIGRATE"); ok && rpcErr.Argument > 0 && rpcErr.Argument != dcID && ctx.Err() == nil {
+		return tryDC(rpcErr.Argument)
+	}
 	return err
 }
 
@@ -100,16 +178,21 @@ func (c *Conn) FetchImage(ctx context.Context, t Target, msgID int) (*Image, err
 		return img, nil
 	}
 	var buf bytes.Buffer
+	reset := func() error {
+		buf.Reset()
+		return nil
+	}
 	switch {
 	case PhotoOf(msg) != nil:
+		p := PhotoOf(msg)
 		img.Kind, img.Format = "photo", "jpeg"
-		if size := photoSize(PhotoOf(msg)); size > MaxImageBytes {
+		if size := photoSize(p); size > MaxImageBytes {
 			return nil, &Bad{fmt.Sprintf("Картинка слишком большая: %d КБ, предел %d КБ.", size/1024, MaxImageBytes/1024)}
 		}
-		loc, inline := photoLocation(PhotoOf(msg))
+		loc, inline := photoLocation(p)
 		if inline != nil {
 			buf.Write(inline)
-		} else if err := c.download(ctx, loc, &buf); err != nil {
+		} else if err := c.download(ctx, loc, p.DCID, &buf, reset); err != nil {
 			return nil, err
 		}
 	case doc != nil && imageFormats[mimeType] != "":
@@ -120,7 +203,7 @@ func (c *Conn) FetchImage(ctx context.Context, t Target, msgID int) (*Image, err
 		if doc.Size > MaxImageBytes {
 			return nil, &Bad{fmt.Sprintf("Картинка слишком большая: %d КБ, предел %d КБ.", doc.Size/1024, MaxImageBytes/1024)}
 		}
-		if err := c.download(ctx, documentLocation(doc, ""), &buf); err != nil {
+		if err := c.download(ctx, documentLocation(doc, ""), doc.DCID, &buf, reset); err != nil {
 			return nil, err
 		}
 	case doc != nil && (isVideo(doc) || IsVideoNote(msg) || isGIF(doc) || isSticker(doc)):
@@ -130,7 +213,7 @@ func (c *Conn) FetchImage(ctx context.Context, t Target, msgID int) (*Image, err
 		case inline != nil:
 			buf.Write(inline)
 		case typ != "":
-			if err := c.download(ctx, documentLocation(doc, typ), &buf); err != nil {
+			if err := c.download(ctx, documentLocation(doc, typ), doc.DCID, &buf, reset); err != nil {
 				return nil, err
 			}
 		}
@@ -216,10 +299,17 @@ func (c *Conn) DownloadFile(ctx context.Context, t Target, msgID int, destDir st
 		cached = true
 	}
 	if !cached {
-		tmp := target + ".part"
-		out, err := os.Create(tmp)
+		out, err := os.CreateTemp(destDir, fmt.Sprintf(".%d-*.part", msgID))
 		if err != nil {
 			return nil, err
+		}
+		tmp := out.Name()
+		reset := func() error {
+			if err := out.Truncate(0); err != nil {
+				return err
+			}
+			_, err := out.Seek(0, io.SeekStart)
+			return err
 		}
 		var derr error
 		if p := PhotoOf(msg); p != nil {
@@ -227,10 +317,10 @@ func (c *Conn) DownloadFile(ctx context.Context, t Target, msgID int, destDir st
 			if inline != nil {
 				_, derr = out.Write(inline)
 			} else {
-				derr = c.download(ctx, loc, out)
+				derr = c.download(ctx, loc, p.DCID, out, reset)
 			}
 		} else if d := DocumentOf(msg); d != nil {
-			derr = c.download(ctx, documentLocation(d, ""), out)
+			derr = c.download(ctx, documentLocation(d, ""), d.DCID, out, reset)
 		} else {
 			derr = errors.New("нечего скачивать")
 		}
@@ -240,6 +330,7 @@ func (c *Conn) DownloadFile(ctx context.Context, t Target, msgID int, destDir st
 			return nil, errors.Join(derr, cerr)
 		}
 		if err := os.Rename(tmp, target); err != nil {
+			_ = os.Remove(tmp)
 			return nil, err
 		}
 	}
