@@ -115,6 +115,19 @@ type Draft struct {
 	// EditOld — его текст до правки (для карточки «было → станет»)
 	EditOf  int64
 	EditOld string
+	// DeleteOf — это не новое сообщение, а удаление уже отправленного (его id);
+	// DeleteOld — снимок его содержимого (для карточки подтверждения);
+	// DeletePeer — стабильный marked peer ID чата на момент создания черновика удаления.
+	DeleteOf   int64
+	DeleteOld  string
+	DeletePeer int64
+	// PeerID — стабильный marked peer ID чата, в который сообщение реально ушло (Telegram).
+	PeerID int64
+	// Scheduled — сообщение ушло в очередь отложенных Telegram (Избранное, schedule_date):
+	// в MessageID лежит id очереди, пока RelinkScheduled не заменит его на реальный.
+	Scheduled bool
+	// Repaired — MessageID восстановлен эвристически по истории (repair.go), а не получен от Telegram.
+	Repaired bool
 	// Poll — черновик опроса (текста и файлов тогда нет)
 	Poll *PollSpec
 	// Vote — не сообщение, а голос владельца в опросе
@@ -138,6 +151,7 @@ var known = map[string]bool{
 	"status": true, "origin": true, "approved_at": true, "sent_at": true, "message_id": true,
 	"bot_message_id": true, "fmt": true, "files": true, "send_error": true, "note": true,
 	"history": true, "send_at": true, "topic": true, "topic_title": true, "edit_of": true, "edit_old": true,
+	"delete_of": true, "delete_old": true, "delete_peer": true, "peer_id": true, "scheduled": true, "repaired": true,
 	"poll": true, "vote": true, "bot": true, "card_due": true, "card_due_at": true,
 }
 
@@ -167,6 +181,21 @@ func (d *Draft) MarshalJSON() ([]byte, error) {
 	}
 	if d.EditOf != 0 {
 		m.Set("edit_of", d.EditOf).Set("edit_old", d.EditOld)
+	}
+	if d.DeleteOf != 0 {
+		m.Set("delete_of", d.DeleteOf).Set("delete_old", d.DeleteOld)
+	}
+	if d.DeletePeer != 0 {
+		m.Set("delete_peer", d.DeletePeer)
+	}
+	if d.PeerID != 0 {
+		m.Set("peer_id", d.PeerID)
+	}
+	if d.Scheduled {
+		m.Set("scheduled", true)
+	}
+	if d.Repaired {
+		m.Set("repaired", true)
 	}
 	if d.Poll != nil {
 		m.Set("poll", d.Poll)
@@ -212,6 +241,12 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		TopicTitle   string            `json:"topic_title"`
 		EditOf       int64             `json:"edit_of"`
 		EditOld      string            `json:"edit_old"`
+		DeleteOf     int64             `json:"delete_of,omitempty"`
+		DeleteOld    string            `json:"delete_old,omitempty"`
+		DeletePeer   int64             `json:"delete_peer,omitempty"`
+		PeerID       int64             `json:"peer_id,omitempty"`
+		Scheduled    bool              `json:"scheduled,omitempty"`
+		Repaired     bool              `json:"repaired,omitempty"`
 		Poll         *PollSpec         `json:"poll"`
 		Vote         *VoteSpec         `json:"vote"`
 		Bot          *BotSpec          `json:"bot"`
@@ -226,7 +261,9 @@ func (d *Draft) UnmarshalJSON(data []byte) error {
 		ExpiresAt: aux.ExpiresAt, Status: aux.Status, Origin: aux.Origin, ApprovedAt: aux.ApprovedAt,
 		SentAt: aux.SentAt, MessageID: aux.MessageID, BotMessageID: aux.BotMessageID, Fmt: aux.Fmt,
 		Files: aux.Files, SendError: aux.SendError, Note: aux.Note, History: aux.History, SendAt: aux.SendAt,
-		Topic: aux.Topic, TopicTitle: aux.TopicTitle, EditOf: aux.EditOf, EditOld: aux.EditOld, Poll: aux.Poll, Vote: aux.Vote,
+		Topic: aux.Topic, TopicTitle: aux.TopicTitle, EditOf: aux.EditOf, EditOld: aux.EditOld,
+		DeleteOf: aux.DeleteOf, DeleteOld: aux.DeleteOld, DeletePeer: aux.DeletePeer, PeerID: aux.PeerID,
+		Scheduled: aux.Scheduled, Repaired: aux.Repaired, Poll: aux.Poll, Vote: aux.Vote,
 		Bot: aux.Bot, CardDue: aux.CardDue, CardDueAt: aux.CardDueAt,
 	}
 	if d.Status == "" {
@@ -327,6 +364,10 @@ type CreateOpts struct {
 	// EditOf, EditOld — правка отправленного сообщения (его id и прежний текст)
 	EditOf  int64
 	EditOld string
+	// DeleteOf, DeleteOld, DeletePeer — удаление отправленного сообщения (id, снимок и стабильный peer_id)
+	DeleteOf   int64
+	DeleteOld  string
+	DeletePeer int64
 	// Poll — опрос вместо текста
 	Poll *PollSpec
 	// Vote — голос в опросе вместо сообщения
@@ -458,15 +499,43 @@ func (d *Draft) dueCard(now time.Time) {
 	}
 }
 
-func (o *Outbox) MarkSent(id string, messageID int64, at string) (*Draft, error) {
+// SentMeta — дополнительные сведения об отправке (стабильный peer и флаг
+// отложенной доставки в Избранное), сохраняются вместе с MarkSent.
+type SentMeta struct {
+	PeerID    int64
+	Scheduled bool
+}
+
+func (o *Outbox) MarkSent(id string, messageID int64, at string, meta ...SentMeta) (*Draft, error) {
+	var sm SentMeta
+	if len(meta) > 0 {
+		sm = meta[0]
+	}
 	return o.Update(id, func(d *Draft) error {
 		d.Status = Sent
 		d.SendError = nil
 		d.SentAt = &at
 		d.MessageID = &messageID
+		if sm.PeerID != 0 {
+			d.PeerID = sm.PeerID
+		}
+		d.Scheduled = sm.Scheduled
 		d.CardDue, d.CardDueAt = false, ""
 		d.dueCard(time.Now())
 		d.AddHistory("event", "sent", "at", at, "message_id", messageID)
+		return nil
+	})
+}
+
+// SetRepairedMessageID — дописать потерянный message_id отправленному черновику.
+// heuristic == true означает эвристический подбор по истории (не подтверждённый ответ Telegram).
+func (o *Outbox) SetRepairedMessageID(id string, messageID int64, heuristic bool) (*Draft, error) {
+	return o.Update(id, func(d *Draft) error {
+		d.MessageID = &messageID
+		if heuristic {
+			d.Repaired = true
+		}
+		d.AddHistory("event", "message_id_repaired", "at", audit.Now(), "message_id", messageID)
 		return nil
 	})
 }
@@ -479,12 +548,13 @@ type Relink struct {
 }
 
 // RelinkScheduled — отложенная отправка ушла (updateDeleteScheduledMessages):
-// пары «id очереди → реальный id». Черновикам sent с id очереди в MessageID
-// ставит реальный: правка, реакции, голоса и уборка проверочных файлов
-// работают по id сообщения, а id очереди с ним не совпадает. Переписанное
-// чёрновику возвращается — в data/sent-unsaved лежит такая же отметка, её
-// надо переписать следом, иначе уборка вернёт id очереди обратно.
-func (o *Outbox) RelinkScheduled(pairs [][2]int64) ([]Relink, error) {
+// peerID чата и пары «id очереди → реальный id». Черновикам sent с Scheduled == true,
+// совпавшим PeerID и id очереди в MessageID ставит реальный и сбрасывает Scheduled.
+// Обычные (не отложенные) черновики и черновики других чатов не трогаются.
+func (o *Outbox) RelinkScheduled(peerID int64, pairs [][2]int64) ([]Relink, error) {
+	if peerID == 0 {
+		return nil, nil
+	}
 	byQueue := map[int64]int64{}
 	for _, p := range pairs {
 		byQueue[p[0]] = p[1]
@@ -498,7 +568,7 @@ func (o *Outbox) RelinkScheduled(pairs [][2]int64) ([]Relink, error) {
 	}
 	var out []Relink
 	for _, d := range sent {
-		if d.MessageID == nil {
+		if !d.Scheduled || d.PeerID != peerID || d.MessageID == nil {
 			continue
 		}
 		queue := *d.MessageID
@@ -508,10 +578,11 @@ func (o *Outbox) RelinkScheduled(pairs [][2]int64) ([]Relink, error) {
 		}
 		var changed bool
 		if _, err := o.Update(d.ID, func(d *Draft) error {
-			if d.MessageID == nil || *d.MessageID != queue {
-				return nil // id сменился, пока шли — чужой, не трогаем
+			if !d.Scheduled || d.PeerID != peerID || d.MessageID == nil || *d.MessageID != queue {
+				return nil // уже перепривязан или id сменился, пока шли — не трогаем
 			}
 			d.MessageID = &real
+			d.Scheduled = false
 			d.AddHistory("event", "scheduled_sent", "at", audit.Now(), "queue_id", queue, "message_id", real)
 			changed = true
 			return nil

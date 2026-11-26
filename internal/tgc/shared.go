@@ -180,9 +180,9 @@ type Events struct {
 	// Telegram не говорит, где они были (id там общие на весь аккаунт).
 	Delete func(ctx context.Context, c *Conn, peer tg.PeerClass, ids []int)
 	// ScheduledSent — отложенные сообщения ушли (updateDeleteScheduledMessages):
-	// пары «id очереди отложенных → реальный id доставленного» в порядке
-	// Telegram. id очереди не совпадает с id сообщения в чате.
-	ScheduledSent func(ctx context.Context, c *Conn, pairs [][2]int)
+	// peer чата и пары «id очереди отложенных → реальный id доставленного» в порядке
+	// Telegram. id очереди не совпадает с id сообщения в чате и уникален лишь внутри peer.
+	ScheduledSent func(ctx context.Context, c *Conn, peer tg.PeerClass, pairs [][2]int)
 }
 
 // Serve — держать постоянное соединение, пока не отменят ctx. Переподключается
@@ -319,8 +319,8 @@ func serveOnce(ctx context.Context, s *config.Settings, storage session.Storage,
 				pairs = append(pairs, [2]int{queue, u.SentMessages[i]})
 			}
 		}
-		if len(pairs) > 0 {
-			ev.ScheduledSent(ctx, c, pairs)
+		if len(pairs) > 0 && u.Peer != nil {
+			ev.ScheduledSent(ctx, c, u.Peer, pairs)
 		}
 		return nil
 	})

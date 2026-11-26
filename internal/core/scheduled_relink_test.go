@@ -21,13 +21,13 @@ func TestRelinkUnsavedFile(t *testing.T) {
 	if _, err := box.Approve(d.ID, "test"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := box.MarkSent(d.ID, 1000, time.Now().Format(time.RFC3339)); err != nil {
+	if _, err := box.MarkSent(d.ID, 1000, time.Now().Format(time.RFC3339), outbox.SentMeta{PeerID: 1, Scheduled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeUnsaved(s, d.ID, 1000, "2026-11-20T12:00:00Z"); err != nil {
+	if err := writeUnsaved(s, d.ID, 1000, "2026-11-20T12:00:00Z", outbox.SentMeta{PeerID: 1, Scheduled: true}); err != nil {
 		t.Fatal(err)
 	}
-	relinked, err := box.RelinkScheduled([][2]int64{{1000, 3000}})
+	relinked, err := box.RelinkScheduled(1, [][2]int64{{1000, 3000}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,8 +39,8 @@ func TestRelinkUnsavedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.MessageID == nil || *got.MessageID != 3000 {
-		t.Fatalf("message_id = %v, ждали 3000", got.MessageID)
+	if got.MessageID == nil || *got.MessageID != 3000 || got.Scheduled {
+		t.Fatalf("message_id = %v Scheduled = %v, ждали 3000 и false", got.MessageID, got.Scheduled)
 	}
 }
 
@@ -58,14 +58,14 @@ func TestScheduledRelinkAfterMarkSent(t *testing.T) {
 		t.Fatal(err)
 	}
 	// доставка: событие пришло, черновик ещё approved без message_id —
-	// связывать нечего, пара запоминается в базе
-	rememberScheduledLinks(s, [][2]int64{{94, 3614944}})
-	// отправитель доджлал загрузку и записал id очереди
-	if _, err := box.MarkSent(d.ID, 94, time.Now().Format(time.RFC3339)); err != nil {
+	// связывать нечего, пара запоминается в базе с peer_id=1
+	rememberScheduledLinks(s, 1, [][2]int64{{94, 3614944}})
+	// отправитель дождался загрузки и записал id очереди
+	if _, err := box.MarkSent(d.ID, 94, time.Now().Format(time.RFC3339), outbox.SentMeta{PeerID: 1, Scheduled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := box.Get(d.ID); err != nil || got.MessageID == nil || *got.MessageID != 94 {
-		t.Fatalf("до уборки: %v %v", got.MessageID, err)
+	if got, err := box.Get(d.ID); err != nil || got.MessageID == nil || *got.MessageID != 94 || !got.Scheduled {
+		t.Fatalf("до уборки: %v Scheduled=%v err=%v", got.MessageID, got.Scheduled, err)
 	}
 	// уборка службы — раз в минуту
 	relinkScheduledLinks(context.Background(), s)
@@ -73,8 +73,8 @@ func TestScheduledRelinkAfterMarkSent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.MessageID == nil || *got.MessageID != 3614944 {
-		t.Fatalf("message_id = %v, ждали 3614944", got.MessageID)
+	if got.MessageID == nil || *got.MessageID != 3614944 || got.Scheduled {
+		t.Fatalf("message_id = %v Scheduled = %v, ждали 3614944 и false", got.MessageID, got.Scheduled)
 	}
 	hist := got.HistoryEvents()
 	last := hist[len(hist)-1]

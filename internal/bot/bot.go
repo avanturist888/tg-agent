@@ -256,6 +256,12 @@ func heading(d *outbox.Draft) string {
 		}
 		return who + " просит исправить своё сообщение"
 	}
+	if d.DeleteOf != 0 {
+		if d.Status == outbox.Scheduled || d.ApprovedBy() == "auto_send" {
+			return who + " удаляет своё сообщение (автоотправка)"
+		}
+		return who + " просит удалить своё сообщение"
+	}
 	if d.Status == outbox.Scheduled || d.ApprovedBy() == "auto_send" {
 		if d.Poll != nil {
 			return who + " отправляет опрос (автоотправка)"
@@ -316,8 +322,17 @@ func CardMarkdown(d *outbox.Draft, title, note, status string) string {
 		head = append(head, fmt.Sprintf("Сообщение #%d. **Было:**", d.EditOf), quoteMD(truncate(d.EditOld, oldShown)),
 			"**Станет:**")
 	}
+	if d.DeleteOf != 0 {
+		head = append(head, fmt.Sprintf("🗑 Сообщение #%d (будет удалено):", d.DeleteOf))
+	}
 	body := "*без текста — только файлы*"
-	if d.Poll != nil {
+	if d.DeleteOf != 0 {
+		if d.DeleteOld != "" {
+			body = quoteMD(truncate(d.DeleteOld, oldShown))
+		} else {
+			body = "*без текста*"
+		}
+	} else if d.Poll != nil {
 		body = pollMD(d.Poll)
 	} else if d.Vote != nil {
 		body = "🗳 " + MDEscape(voteLine(d.Vote))
@@ -456,8 +471,17 @@ func CardHTML(d *outbox.Draft, title, note, status string) string {
 		head = append(head, fmt.Sprintf("Сообщение #%d. <b>Было:</b>\n<blockquote>%s</blockquote>\n<b>Станет:</b>",
 			d.EditOf, html.EscapeString(truncate(d.EditOld, oldShown))))
 	}
+	if d.DeleteOf != 0 {
+		head = append(head, fmt.Sprintf("🗑 Сообщение #%d (будет удалено):", d.DeleteOf))
+	}
 	body := "<pre>" + html.EscapeString(d.Text) + "</pre>"
-	if d.Poll != nil {
+	if d.DeleteOf != 0 {
+		if d.DeleteOld != "" {
+			body = "<blockquote>" + html.EscapeString(truncate(d.DeleteOld, oldShown)) + "</blockquote>"
+		} else {
+			body = "<i>без текста</i>"
+		}
+	} else if d.Poll != nil {
 		body = pollHTML(d.Poll)
 	} else if d.Vote != nil {
 		body = "🗳 " + html.EscapeString(voteLine(d.Vote))
@@ -471,10 +495,13 @@ func CardHTML(d *outbox.Draft, title, note, status string) string {
 	return card
 }
 
-// verb — что делает кнопка: отправляет сообщение или применяет правку.
+// verb — что делает кнопка: отправляет сообщение, применяет правку или удаляет.
 func verb(d *outbox.Draft) string {
 	if d.EditOf != 0 {
 		return "Исправить"
+	}
+	if d.DeleteOf != 0 {
+		return "Удалить"
 	}
 	if d.Vote != nil {
 		return "Проголосовать"
@@ -509,6 +536,9 @@ func ScheduledStatus(d *outbox.Draft) string {
 		if at, err := time.Parse(time.RFC3339, *d.SendAt); err == nil {
 			when = at.Local().Format("15:04:05")
 		}
+	}
+	if d.DeleteOf != 0 {
+		return fmt.Sprintf("⏳ **Удалится в %s**, если не отменить. Можно удалить сразу.", when)
 	}
 	return fmt.Sprintf("⏳ **Уйдёт в %s**, если не отменить. Можно отправить сразу.", when)
 }

@@ -57,7 +57,11 @@ func RepairSentIDs(ctx context.Context, s *config.Settings) {
 			continue
 		}
 		if d.EditOf != 0 { // правка: её сообщение — то, что правили
-			setRepaired(s, box, d, d.EditOf)
+			setRepaired(s, box, d, d.EditOf, false)
+			continue
+		}
+		if d.DeleteOf != 0 { // удаление: его сообщение — то, что удалили
+			setRepaired(s, box, d, d.DeleteOf, false)
 			continue
 		}
 		todo = append(todo, item{d, at})
@@ -108,7 +112,7 @@ func RepairSentIDs(ctx context.Context, s *config.Settings) {
 					"history", len(b.Messages), "oldest", first, "newest", last)
 			} else {
 				taken[d.Chat][id] = true
-				setRepaired(s, box, d, id)
+				setRepaired(s, box, d, id, true)
 				fixed++
 			}
 			sleepCtx(ctx, 300*time.Millisecond)
@@ -121,13 +125,8 @@ func RepairSentIDs(ctx context.Context, s *config.Settings) {
 	logEvent(s, "repair_sent_done", "fixed", fixed, "skipped", skipped, "total", len(todo))
 }
 
-func setRepaired(s *config.Settings, box *outbox.Outbox, d *outbox.Draft, id int64) {
-	_, err := box.Update(d.ID, func(d *outbox.Draft) error {
-		d.MessageID = &id
-		d.AddHistory("event", "message_id_repaired", "at", time.Now().UTC().Format(time.RFC3339), "message_id", id)
-		return nil
-	})
-	if err == nil {
+func setRepaired(s *config.Settings, box *outbox.Outbox, d *outbox.Draft, id int64, heuristic bool) {
+	if _, err := box.SetRepairedMessageID(d.ID, id, heuristic); err == nil {
 		logEvent(s, "repair_sent", "draft_id", d.ID, "chat", d.Chat, "message_id", id)
 	}
 }

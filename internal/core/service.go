@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gotd/td/tg"
+
 	"tgagent/internal/attach"
 	"tgagent/internal/audit"
 	"tgagent/internal/bot"
@@ -1044,6 +1046,8 @@ func finishDraft(ctx context.Context, s *config.Settings, rule config.ChatRule, 
 	switch {
 	case d.EditOf != 0:
 		what, button = "правка ПРИМЕНИТСЯ САМА", "«Исправить» применяет правку сама"
+	case d.DeleteOf != 0:
+		what, button = "сообщение УДАЛИТСЯ САМО", "«Удалить» удаляет сообщение само"
 	case d.Poll != nil:
 		what, button = "опрос УЙДЁТ САМ", "«Отправить» отправляет опрос сам"
 	case d.Vote != nil:
@@ -1166,6 +1170,9 @@ func deliverClaimed(ctx context.Context, s *config.Settings, draftID, by string)
 	if mid, ok := unsavedSent(s, draftID); ok {
 		return nil, denied("Черновик %s уже отправлен (message_id %d), отметка в базу ещё не записалась — второй раз не отправляю.", draftID, mid)
 	}
+	if d.DeleteOf != 0 && !s.IsTelegram() {
+		return nil, &Bad{Msg: fmt.Sprintf("Удаление сообщений пока доступно только в Telegram (%s не поддерживается).", NetName(s.Network))}
+	}
 	result := omap.New()
 	if n := netOf(s); n != nil {
 		result, err = n.deliver(ctx, s, rule, d)
@@ -1226,15 +1233,55 @@ type draftSender interface {
 	SendFiles(ctx context.Context, t tgc.Target, files []tgc.OutFile, reply *int64) ([]int, error)
 	SendPoll(ctx context.Context, t tgc.Target, p tgc.PollOut, reply *int64) (*omap.Map, error)
 	SendVote(ctx context.Context, t tgc.Target, msgID int, options []int) (*omap.Map, error)
+	Message(ctx context.Context, t tgc.Target, id int) (tg.MessageClass, *tgc.Batch, error)
+	DeleteMessages(ctx context.Context, t tgc.Target, ids []int) error
 }
 
-// sendDraft — отправить черновик (или правку) и вернуть ответ с message_id.
+// sendDraft — отправить черновик (или правку / удаление) и вернуть ответ с message_id.
 func sendDraft(ctx context.Context, c draftSender, t tgc.Target, d *outbox.Draft) (*omap.Map, error) {
-	if d.EditOf == 0 && d.Vote == nil && t.Kind == "self" {
+	if d.EditOf == 0 && d.DeleteOf == 0 && d.Vote == nil && t.Kind == "self" {
 		t.ScheduleIn = time.Minute // Избранное: уведомление приходит только на отложенные
 	}
+	res, err := sendDraftBody(ctx, c, t, d)
+	if err != nil {
+		return nil, err
+	}
+	if res == nil {
+		res = omap.New()
+	}
+	if peerID := t.MarkedID(); peerID != 0 {
+		res.Set("peer_id", peerID)
+	}
+	if t.ScheduleIn > 0 {
+		res.Set("scheduled", true)
+	}
+	return res, nil
+}
+
+func sendDraftBody(ctx context.Context, c draftSender, t tgc.Target, d *outbox.Draft) (*omap.Map, error) {
 	if d.EditOf != 0 { // правка отправленного: только текст
 		return c.EditMessage(ctx, t, int(d.EditOf), d.Text, d.Fmt)
+	}
+	if d.DeleteOf != 0 { // удаление своего отправленного сообщения
+		peerID := t.MarkedID()
+		if d.DeletePeer == 0 || d.DeletePeer != peerID {
+			return nil, denied("Alias '%s' теперь указывает на другой чат — удаление сообщения %d не выполняется.", d.Chat, d.DeleteOf)
+		}
+		m, _, err := c.Message(ctx, t, int(d.DeleteOf))
+		if err != nil {
+			return nil, notSent(err)
+		}
+		msg, ok := m.(*tgc.MessageT)
+		if !ok || m == nil {
+			return nil, denied("Сообщение %d не найдено в этом чате — удаление не выполняется.", d.DeleteOf)
+		}
+		if !msg.Out && t.Kind != "self" {
+			return nil, denied("Сообщение %d отправлено не с этого аккаунта — удаление не выполняется.", d.DeleteOf)
+		}
+		if err := c.DeleteMessages(ctx, t, []int{int(d.DeleteOf)}); err != nil {
+			return nil, err
+		}
+		return omap.New().Set("message_id", d.DeleteOf).Set("deleted", true).Set("format", "delete"), nil
 	}
 	if d.Poll != nil {
 		return c.SendPoll(ctx, t, pollOut(d.Poll), d.ReplyTo)
@@ -1305,15 +1352,26 @@ func unsavedPath(s *config.Settings, draftID string) string {
 	return filepath.Join(s.DataDir(), "sent-unsaved", draftID)
 }
 
+type unsavedMark struct {
+	MessageID int64  `json:"message_id"`
+	At        string `json:"at"`
+	PeerID    int64  `json:"peer_id,omitempty"`
+	Scheduled bool   `json:"scheduled,omitempty"`
+}
+
 // markSentDurably — MarkSent с несколькими быстрыми повторами; не легло —
 // файл-отметка (её доделает уборка службы).
-func markSentDurably(s *config.Settings, box *outbox.Outbox, draftID string, msgID int64) {
+func markSentDurably(s *config.Settings, box *outbox.Outbox, draftID string, msgID int64, meta ...outbox.SentMeta) {
+	var sm outbox.SentMeta
+	if len(meta) > 0 {
+		sm = meta[0]
+	}
 	at := audit.Now()
 	for i := 0; i <= 3; i++ {
 		if i > 0 {
 			time.Sleep(time.Duration(i) * markSentRetry.quick)
 		}
-		_, err := box.MarkSent(draftID, msgID, at)
+		_, err := box.MarkSent(draftID, msgID, at, sm)
 		if err == nil {
 			if i > 0 {
 				_ = os.Remove(unsavedPath(s, draftID))
@@ -1322,19 +1380,23 @@ func markSentDurably(s *config.Settings, box *outbox.Outbox, draftID string, msg
 		}
 		_ = audit.Log(s.AuditPath(), "mark_sent_failed", "draft_id", draftID, "message_id", msgID, "attempt", i+1, "error", err.Error())
 		if i == 0 {
-			if werr := writeUnsaved(s, draftID, msgID, at); werr != nil {
+			if werr := writeUnsaved(s, draftID, msgID, at, sm); werr != nil {
 				_ = audit.Log(s.AuditPath(), "mark_sent_failed", "draft_id", draftID, "what", "sent-unsaved", "error", werr.Error())
 			}
 		}
 	}
 }
 
-func writeUnsaved(s *config.Settings, draftID string, msgID int64, at string) error {
+func writeUnsaved(s *config.Settings, draftID string, msgID int64, at string, meta ...outbox.SentMeta) error {
+	var sm outbox.SentMeta
+	if len(meta) > 0 {
+		sm = meta[0]
+	}
 	p := unsavedPath(s, draftID)
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	raw, _ := json.Marshal(map[string]any{"message_id": msgID, "at": at})
+	raw, _ := json.Marshal(unsavedMark{MessageID: msgID, At: at, PeerID: sm.PeerID, Scheduled: sm.Scheduled})
 	return fsx.WriteFile(p, raw, 0o600)
 }
 
@@ -1344,9 +1406,7 @@ func unsavedSent(s *config.Settings, draftID string) (int64, bool) {
 	if err != nil {
 		return 0, !errors.Is(err, os.ErrNotExist) // не прочитать — считаем, что ушло: не задвоить
 	}
-	var v struct {
-		MessageID int64 `json:"message_id"`
-	}
+	var v unsavedMark
 	_ = json.Unmarshal(raw, &v)
 	return v.MessageID, true
 }
@@ -1366,10 +1426,7 @@ func finishUnsaved(ctx context.Context, s *config.Settings) {
 		if err != nil {
 			continue
 		}
-		var v struct {
-			MessageID int64  `json:"message_id"`
-			At        string `json:"at"`
-		}
+		var v unsavedMark
 		if json.Unmarshal(raw, &v) != nil {
 			continue
 		}
@@ -1389,7 +1446,7 @@ func finishUnsaved(ctx context.Context, s *config.Settings) {
 		// могло успеть протухнуть (TTL идёт и у approved) — оно всё равно
 		// отправлено. Файл снимается, только когда отметка с message_id легла
 		if d.Status != outbox.Sent || d.MessageID == nil {
-			done, err := box.MarkSent(id, v.MessageID, v.At)
+			done, err := box.MarkSent(id, v.MessageID, v.At, outbox.SentMeta{PeerID: v.PeerID, Scheduled: v.Scheduled})
 			if err != nil {
 				continue
 			}
@@ -1408,9 +1465,11 @@ func finishDelivery(s *config.Settings, rule config.ChatRule, d *outbox.Draft, d
 	box := outbox.New(s.DataDir())
 	mid, _ := result.Get("message_id")
 	msgID := toInt64(mid)
+	pid, _ := result.Get("peer_id")
+	sched, _ := result.Get("scheduled")
 	// сообщение уже ушло — ошибку записи статуса не выдаём за провал
 	// отправки, но и отправить его снова не даём
-	markSentDurably(s, box, draftID, msgID)
+	markSentDurably(s, box, draftID, msgID, outbox.SentMeta{PeerID: toInt64(pid), Scheduled: sched == true})
 	attach.Drop(s, draftID)
 	names := make([]string, len(d.Files))
 	for i, f := range d.Files {
@@ -1502,6 +1561,9 @@ func ListDrafts(s *config.Settings, status string) (*omap.Map, error) {
 		}
 		if d.EditOf != 0 {
 			row.Set("edit_of", d.EditOf) // правка отправленного сообщения
+		}
+		if d.DeleteOf != 0 {
+			row.Set("delete_of", d.DeleteOf) // удаление отправленного сообщения
 		}
 		if d.Poll != nil {
 			row.Set("poll", d.Poll)

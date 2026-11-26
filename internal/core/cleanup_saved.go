@@ -25,7 +25,7 @@ func savedFileDraft(s *config.Settings, id string) (*outbox.Draft, config.ChatRu
 		return nil, rule, err
 	}
 	if d.Chat != rule.Alias || d.Status != outbox.Sent || d.MessageID == nil || *d.MessageID <= 0 ||
-		len(d.Files) != 1 || d.Text != "" || d.Poll != nil || d.Vote != nil || d.Bot != nil || d.EditOf != 0 || d.SentAt == nil {
+		len(d.Files) != 1 || d.Text != "" || d.Poll != nil || d.Vote != nil || d.Bot != nil || d.EditOf != 0 || d.DeleteOf != 0 || d.SentAt == nil {
 		return nil, rule, denied("Нужен отправленный этим шлюзом черновик одного файла без отдельного текста в saved.")
 	}
 	at, err := time.Parse(time.RFC3339, *d.SentAt)

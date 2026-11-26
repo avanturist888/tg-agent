@@ -258,8 +258,12 @@ func FeedOnMessage(loader func() (*config.Settings, error)) tgc.OnMessage {
 // остаются в базе (scheduled_links): доставка случается через минуту после
 // запроса — пока шла загрузка большого файла, черновик мог быть ещё не
 // помечен отправленным, и связать его должна уборка (relinkScheduledLinks).
-func FeedOnScheduledSent(loader func() (*config.Settings, error)) func(ctx context.Context, c *tgc.Conn, pairs [][2]int) {
-	return func(ctx context.Context, _ *tgc.Conn, pairs [][2]int) {
+func FeedOnScheduledSent(loader func() (*config.Settings, error)) func(ctx context.Context, c *tgc.Conn, peer tg.PeerClass, pairs [][2]int) {
+	return func(ctx context.Context, _ *tgc.Conn, peer tg.PeerClass, pairs [][2]int) {
+		peerID := tgc.MarkedPeerID(peer)
+		if peerID == 0 {
+			return
+		}
 		s, err := loader()
 		if err != nil {
 			return
@@ -268,16 +272,17 @@ func FeedOnScheduledSent(loader func() (*config.Settings, error)) func(ctx conte
 		for _, p := range pairs {
 			qp = append(qp, [2]int64{int64(p[0]), int64(p[1])})
 		}
-		relinkScheduled(s, qp)
-		rememberScheduledLinks(s, qp)
+		relinkScheduled(s, peerID, qp)
+		rememberScheduledLinks(s, peerID, qp)
 	}
 }
 
-// scheduledLink — отложенное сообщение ушло: id очереди стал id сообщения.
+// scheduledLink — отложенное сообщение ушло: id очереди стал id сообщения в чате PeerID.
 type scheduledLink struct {
-	Queue int64     `json:"queue"`
-	Real  int64     `json:"real"`
-	At    time.Time `json:"at"`
+	PeerID int64     `json:"peer_id,omitempty"`
+	Queue  int64     `json:"queue"`
+	Real   int64     `json:"real"`
+	At     time.Time `json:"at"`
 }
 
 // scheduledLinkTTL — сколько хранить пару: минута доставки давно пройдёт, а
@@ -286,24 +291,27 @@ const scheduledLinkTTL = 24 * time.Hour
 
 // relinkScheduled — переписать черновикам id очереди на реальный (пары из
 // события или из базы); для sent-unsaved — та же переписка в отметке.
-func relinkScheduled(s *config.Settings, pairs [][2]int64) {
-	if len(pairs) == 0 {
+func relinkScheduled(s *config.Settings, peerID int64, pairs [][2]int64) {
+	if peerID == 0 || len(pairs) == 0 {
 		return
 	}
-	relinked, err := outbox.New(s.DataDir()).RelinkScheduled(pairs)
+	relinked, err := outbox.New(s.DataDir()).RelinkScheduled(peerID, pairs)
 	if err != nil {
 		_ = audit.Log(s.AuditPath(), "scheduled_relink_failed", "error", err.Error())
 		return
 	}
 	for _, r := range relinked {
-		_ = audit.Log(s.AuditPath(), "scheduled_relinked", "draft_id", r.ID, "queue_id", r.Queue, "message_id", r.Real)
+		_ = audit.Log(s.AuditPath(), "scheduled_relinked", "draft_id", r.ID, "peer_id", peerID, "queue_id", r.Queue, "message_id", r.Real)
 	}
 	relinkUnsaved(s, relinked)
 }
 
 // rememberScheduledLinks — дописать пары в базу (без дублей), протухшие
 // выкинуть. Чтение, дописка и запись — одной транзакцией.
-func rememberScheduledLinks(s *config.Settings, pairs [][2]int64) {
+func rememberScheduledLinks(s *config.Settings, peerID int64, pairs [][2]int64) {
+	if peerID == 0 || len(pairs) == 0 {
+		return
+	}
 	db, err := stateDB(s)
 	if err != nil {
 		return
@@ -314,14 +322,16 @@ func rememberScheduledLinks(s *config.Settings, pairs [][2]int64) {
 		if ok, _ := store.GetKV(ctx, tx, store.KeyScheduledLinks, &links); ok {
 			links = freshScheduledLinks(links, time.Now())
 		}
-		known := map[int64]bool{}
+		type key struct{ peer, queue int64 }
+		known := map[key]bool{}
 		for _, l := range links {
-			known[l.Queue] = true
+			known[key{l.PeerID, l.Queue}] = true
 		}
 		now := time.Now()
 		for _, p := range pairs {
-			if !known[p[0]] {
-				links = append(links, scheduledLink{Queue: p[0], Real: p[1], At: now})
+			k := key{peerID, p[0]}
+			if !known[k] {
+				links = append(links, scheduledLink{PeerID: peerID, Queue: p[0], Real: p[1], At: now})
 			}
 		}
 		return store.PutKV(ctx, tx, store.KeyScheduledLinks, links)
@@ -344,11 +354,16 @@ func relinkScheduledLinks(ctx context.Context, s *config.Settings) {
 	if len(links) == 0 {
 		return
 	}
-	var pairs [][2]int64
+	byPeer := map[int64][][2]int64{}
 	for _, l := range links {
-		pairs = append(pairs, [2]int64{l.Queue, l.Real})
+		if l.PeerID == 0 {
+			continue
+		}
+		byPeer[l.PeerID] = append(byPeer[l.PeerID], [2]int64{l.Queue, l.Real})
 	}
-	relinkScheduled(s, pairs)
+	for peerID, pairs := range byPeer {
+		relinkScheduled(s, peerID, pairs)
+	}
 }
 
 func freshScheduledLinks(links []scheduledLink, now time.Time) []scheduledLink {
@@ -370,14 +385,11 @@ func relinkUnsaved(s *config.Settings, relinked []outbox.Relink) {
 		if err != nil {
 			continue
 		}
-		var v struct {
-			MessageID int64  `json:"message_id"`
-			At        string `json:"at"`
-		}
+		var v unsavedMark
 		if json.Unmarshal(raw, &v) != nil || v.MessageID != r.Queue {
 			continue
 		}
-		if err := writeUnsaved(s, r.ID, r.Real, v.At); err != nil {
+		if err := writeUnsaved(s, r.ID, r.Real, v.At, outbox.SentMeta{PeerID: v.PeerID, Scheduled: false}); err != nil {
 			_ = audit.Log(s.AuditPath(), "scheduled_relink_failed", "what", "sent-unsaved", "draft_id", r.ID, "error", err.Error())
 		}
 	}

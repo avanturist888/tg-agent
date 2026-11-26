@@ -330,19 +330,32 @@ func TestClaimWaitsLegacy(t *testing.T) {
 	}
 }
 
-// Отложенная отправка ушла: черновикам sent с id очереди ставится реальный
-// id доставленного сообщения.
+// Отложенная отправка ушла: черновикам sent с Scheduled=true и id очереди
+// ставится реальный id доставленного сообщения, а флаг Scheduled сбрасывается.
+// Обычный (не отложенный) черновик с таким же числовым id не трогается.
 func TestRelinkScheduled(t *testing.T) {
 	o := New(t.TempDir())
 	d := approvedDraft(t, o)
-	if _, err := o.MarkSent(d.ID, 1000, time.Now().Format(time.RFC3339)); err != nil {
+	if _, err := o.MarkSent(d.ID, 1000, time.Now().Format(time.RFC3339), SentMeta{PeerID: 77, Scheduled: true}); err != nil {
+		t.Fatal(err)
+	}
+	plainSameID := approvedDraft(t, o)
+	if _, err := o.MarkSent(plainSameID.ID, 1000, time.Now().Format(time.RFC3339), SentMeta{PeerID: -1000000000099}); err != nil {
 		t.Fatal(err)
 	}
 	other := approvedDraft(t, o)
-	if _, err := o.MarkSent(other.ID, 2000, time.Now().Format(time.RFC3339)); err != nil {
+	if _, err := o.MarkSent(other.ID, 2000, time.Now().Format(time.RFC3339), SentMeta{PeerID: 77, Scheduled: true}); err != nil {
 		t.Fatal(err)
 	}
-	relinked, err := o.RelinkScheduled([][2]int64{{1000, 3000}, {9999, 4444}})
+	otherPeer := approvedDraft(t, o)
+	if _, err := o.MarkSent(otherPeer.ID, 1000, time.Now().Format(time.RFC3339), SentMeta{PeerID: 88, Scheduled: true}); err != nil {
+		t.Fatal(err)
+	}
+	// Другой peer не должен тронуть черновик peer=77.
+	if relinked, err := o.RelinkScheduled(999, [][2]int64{{1000, 3000}}); err != nil || len(relinked) != 0 {
+		t.Fatalf("чужой peer перепривязал: %v %v", relinked, err)
+	}
+	relinked, err := o.RelinkScheduled(77, [][2]int64{{1000, 3000}, {9999, 4444}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,13 +366,19 @@ func TestRelinkScheduled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.MessageID == nil || *got.MessageID != 3000 {
-		t.Fatalf("message_id = %v, ждали 3000", got.MessageID)
+	if got.MessageID == nil || *got.MessageID != 3000 || got.Scheduled || got.PeerID != 77 {
+		t.Fatalf("got = %+v, ждали message_id=3000 Scheduled=false PeerID=77", got)
 	}
-	if got, _ := o.Get(other.ID); got.MessageID == nil || *got.MessageID != 2000 {
-		t.Fatalf("чужой черновик переписан: %v", got.MessageID)
+	if got, _ := o.Get(plainSameID.ID); got.MessageID == nil || *got.MessageID != 1000 || got.Scheduled {
+		t.Fatalf("неотложенный черновик с тем же id переписан: %+v", got)
 	}
-	if relinked, err := o.RelinkScheduled([][2]int64{{1000, 3000}}); err != nil || len(relinked) != 0 {
+	if got, _ := o.Get(other.ID); got.MessageID == nil || *got.MessageID != 2000 || !got.Scheduled {
+		t.Fatalf("чужой черновик переписан: %+v", got)
+	}
+	if got, _ := o.Get(otherPeer.ID); got.MessageID == nil || *got.MessageID != 1000 || !got.Scheduled {
+		t.Fatalf("отложенный черновик другого peer переписан: %+v", got)
+	}
+	if relinked, err := o.RelinkScheduled(77, [][2]int64{{1000, 3000}}); err != nil || len(relinked) != 0 {
 		t.Fatalf("повторное связывание: %v %v", relinked, err)
 	}
 }

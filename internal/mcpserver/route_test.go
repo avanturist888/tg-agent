@@ -99,10 +99,13 @@ func TestRouteToOtherAccount(t *testing.T) {
 	}
 	// alias, который есть только у work, — тоже туда
 	callText(t, ctx, "tg_subscribe", `{"chat":"client"}`)
+	if out := callText(t, ctx, "tg_delete_message", `{"chat":"work/team","message_id":42}`); !strings.Contains(out, `"from":"work"`) {
+		t.Fatalf("tg_delete_message work/team: %s", out)
+	}
 	calls := f.got()
-	if len(calls) != 2 || calls[0].Name != "tg_read_chat" || !calls[0].Local || calls[0].Agent == nil ||
+	if len(calls) != 3 || calls[0].Name != "tg_read_chat" || !calls[0].Local || calls[0].Agent == nil ||
 		calls[0].Agent.Session != "s1" || !strings.Contains(string(calls[0].Args), "work/team") ||
-		calls[1].Name != "tg_subscribe" {
+		calls[1].Name != "tg_subscribe" || calls[2].Name != "tg_delete_message" {
 		t.Fatalf("передача: %+v", calls)
 	}
 	// alias, который есть у обоих, — свой

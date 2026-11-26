@@ -316,6 +316,13 @@ type editIn struct {
 	Format    string `json:"format,omitempty" jsonschema:"markdown (по умолчанию) или plain"`
 }
 
+type deleteIn struct {
+	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
+	MessageID int64  `json:"message_id,omitempty" jsonschema:"id своего отправленного сообщения (из tg_wait_approval / tg_send_draft)"`
+	DraftID   string `json:"draft_id,omitempty" jsonschema:"или id черновика, которым это сообщение ушло (подходит и draft_id правки)"`
+	Note      string `json:"note,omitempty" jsonschema:"зачем удалять — показывается владельцу в карточке"`
+}
+
 type reactIn struct {
 	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
 	MessageID int    `json:"message_id" jsonschema:"id сообщения"`
@@ -1033,6 +1040,27 @@ tg_wait_approval(draft_id). В чате с auto_send правка примени
 		func(ctx context.Context, _ *mcp.CallToolRequest, in editIn) (*mcp.CallToolResult, any, error) {
 			return run(ctx, 10*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
 				return core.EditMessage(ctx, s, in.Chat, in.MessageID, in.DraftID, in.Text, in.Note, in.Format)
+			})
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "tg_delete_message", Description: `Удалить своё уже отправленное сообщение в Telegram. САМО ПО СЕБЕ НЕ УДАЛЯЕТ — как и tg_edit_message.
+
+Удалять можно только сообщения, отправленные через tg-agent (message_id из
+tg_wait_approval или tg_send_draft, либо draft_id, которым оно ушло; подходит
+и draft_id правки). Чужие сообщения и сообщения, которые владелец писал сам,
+строго запрещены. Ограничения TG_EDIT_WINDOW_MIN нет — удаление доступно, пока
+исходный черновик хранится в журнале outbox (последние 200 черновиков профиля);
+для альбомов удаляется сообщение с сохранённым message_id. Пока работает только
+в Telegram.
+
+Удаление проходит то же подтверждение, что и отправка или правка: владельцу
+в бот уходит карточка с цитатой удаляемого сообщения и кнопками «Удалить» /
+«Отклонить», дальше — tg_wait_approval(draft_id). В чате с auto_send сообщение
+удалится само через окно на отмену (tg_cancel_draft). note — коротко, зачем
+удалять.`},
+		func(ctx context.Context, _ *mcp.CallToolRequest, in deleteIn) (*mcp.CallToolResult, any, error) {
+			return run(ctx, 10*time.Minute, func(ctx context.Context, s *config.Settings) (*omap.Map, error) {
+				return core.DeleteMessage(ctx, s, in.Chat, in.MessageID, in.DraftID, in.Note)
 			})
 		})
 

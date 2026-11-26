@@ -1208,7 +1208,11 @@ func WaitForDecision(ctx context.Context, s *config.Settings, draftID string, ti
 	var hint string
 	switch d.Status {
 	case outbox.Sent:
-		hint = "Отправлено."
+		if d.DeleteOf != 0 {
+			hint = "Удалено."
+		} else {
+			hint = "Отправлено."
+		}
 	case outbox.Cancelled:
 		hint = "Человек отклонил отправку — не переспрашивай и не пересоздавай черновик без новой просьбы."
 	case outbox.Expired:
@@ -1337,6 +1341,8 @@ func sentSummary(s *config.Settings, d *outbox.Draft, mid any) string {
 	done := "Отправлено"
 	if d.EditOf != 0 {
 		done = "Исправлено"
+	} else if d.DeleteOf != 0 {
+		done = "Удалено"
 	}
 	at := time.Now()
 	if d.SentAt != nil { // итог мог показаться позже (уборка) — время отправки, а не показа
@@ -1429,8 +1435,13 @@ func EditDraft(ctx context.Context, s *config.Settings, draftID, text, by string
 		return &Bad{fmt.Sprintf("Слишком длинно: %d символов, предел Telegram — 32768.", n)}
 	}
 	box := outbox.New(s.DataDir())
-	if d, err := box.Get(draftID); err == nil && text == "" && len(d.Files) == 0 {
-		return &Bad{"Пустое сообщение: нужен текст или файлы."}
+	if d, err := box.Get(draftID); err == nil {
+		if d.DeleteOf != 0 {
+			return &Bad{"Черновик удаления нельзя править текстом."}
+		}
+		if text == "" && len(d.Files) == 0 {
+			return &Bad{"Пустое сообщение: нужен текст или файлы."}
+		}
 	}
 	d, err := box.EditText(draftID, text, by)
 	if err != nil {

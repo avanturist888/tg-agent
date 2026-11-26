@@ -253,13 +253,26 @@ type Target struct {
 
 // MarkedID — id в формате Bot API: -100… для каналов, -… для групп.
 func (t Target) MarkedID() int64 {
-	switch t.Kind {
-	case "chat":
-		return -t.ID
-	case "channel":
-		return -(channelShift + t.ID)
+	if t.ID != 0 {
+		switch t.Kind {
+		case "chat":
+			return -t.ID
+		case "channel":
+			return -(channelShift + t.ID)
+		}
+		return t.ID
 	}
-	return t.ID
+	switch v := t.Input.(type) {
+	case *tg.InputPeerUser:
+		return v.UserID
+	case *tg.InputPeerChat:
+		return -v.ChatID
+	case *tg.InputPeerChannel:
+		if v.ChannelID != 0 {
+			return -(channelShift + v.ChannelID)
+		}
+	}
+	return 0
 }
 
 // Self — id владельца (запрашивает у Telegram, если в кэше нет).

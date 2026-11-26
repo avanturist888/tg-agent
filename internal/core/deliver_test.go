@@ -6,18 +6,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gotd/td/tg"
+
 	"tgagent/internal/omap"
 	"tgagent/internal/outbox"
 	"tgagent/internal/tgc"
 )
 
 type fakeSender struct {
-	sent, edited, files int
-	polls               []tgc.PollOut
-	filesErr            error // SendFiles: ушло filesOK файлов, дальше эта ошибка
-	filesOK             int
-	fileArgs            []tgc.OutFile
-	lastTarget          tgc.Target
+	sent, edited, deleted, files int
+	polls                        []tgc.PollOut
+	filesErr                     error // SendFiles: ушло filesOK файлов, дальше эта ошибка
+	filesOK                      int
+	fileArgs                     []tgc.OutFile
+	lastTarget                   tgc.Target
+	msg                          tg.MessageClass
+	msgErr                       error
+	delErr                       error
 }
 
 func (f *fakeSender) SendMessage(_ context.Context, target tgc.Target, _ string, _ *int64, format string) (*omap.Map, error) {
@@ -41,6 +46,23 @@ func (f *fakeSender) SendPoll(_ context.Context, target tgc.Target, p tgc.PollOu
 func (f *fakeSender) SendVote(_ context.Context, target tgc.Target, msgID int, _ []int) (*omap.Map, error) {
 	f.lastTarget = target
 	return omap.New().Set("message_id", msgID).Set("format", "vote"), nil
+}
+
+func (f *fakeSender) Message(_ context.Context, target tgc.Target, id int) (tg.MessageClass, *tgc.Batch, error) {
+	f.lastTarget = target
+	if f.msgErr != nil {
+		return nil, nil, f.msgErr
+	}
+	if f.msg != nil {
+		return f.msg, nil, nil
+	}
+	return &tg.Message{ID: id, Out: true, Message: "old"}, nil, nil
+}
+
+func (f *fakeSender) DeleteMessages(_ context.Context, target tgc.Target, _ []int) error {
+	f.deleted++
+	f.lastTarget = target
+	return f.delErr
 }
 
 func (f *fakeSender) SendFiles(_ context.Context, target tgc.Target, files []tgc.OutFile, _ *int64) ([]int, error) {
@@ -123,11 +145,12 @@ func TestSendDraftKeepsMessageID(t *testing.T) {
 		{"текст и файл", outbox.Draft{Text: "привет", Files: []outbox.FileSnap{{Path: "a.txt"}}}, 3606036},
 		{"только файлы", outbox.Draft{Files: []outbox.FileSnap{{Path: "a.txt"}, {Path: "b.txt"}}}, 500},
 		{"правка", outbox.Draft{Text: "стало", EditOf: 77}, 77},
+		{"удаление", outbox.Draft{DeleteOf: 88, DeleteOld: "старое", DeletePeer: 10}, 88},
 		{"голос", outbox.Draft{Vote: &outbox.VoteSpec{MessageID: 41, Options: []int{0}}}, 41},
 		{"опрос", outbox.Draft{Poll: &outbox.PollSpec{Question: "Кто идёт?", Options: []string{"я", "не я"}}}, 900},
 	}
 	for _, c := range cases {
-		r, err := sendDraft(ctx, &fakeSender{}, tgc.Target{}, &c.d)
+		r, err := sendDraft(ctx, &fakeSender{}, tgc.Target{Kind: "user", ID: 10}, &c.d)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
@@ -148,6 +171,7 @@ func TestSendDraftSchedulesSelf(t *testing.T) {
 		{"Избранное", tgc.Target{Kind: "self"}, outbox.Draft{Text: "привет"}, time.Minute},
 		{"обычный чат", tgc.Target{Kind: "user"}, outbox.Draft{Text: "привет"}, 0},
 		{"правка в Избранном", tgc.Target{Kind: "self"}, outbox.Draft{Text: "стало", EditOf: 77}, 0},
+		{"удаление в Избранном", tgc.Target{Kind: "self", ID: 1}, outbox.Draft{DeleteOf: 88, DeleteOld: "старое", DeletePeer: 1}, 0},
 		{"файлы в Избранном", tgc.Target{Kind: "self"}, outbox.Draft{Files: []outbox.FileSnap{{Path: "a.txt"}}}, time.Minute},
 		{"опрос в Избранном", tgc.Target{Kind: "self"}, outbox.Draft{Poll: &outbox.PollSpec{Question: "Кто?", Options: []string{"я"}}}, time.Minute},
 		{"голос в Избранном", tgc.Target{Kind: "self"}, outbox.Draft{Vote: &outbox.VoteSpec{MessageID: 41, Options: []int{0}}}, 0},
