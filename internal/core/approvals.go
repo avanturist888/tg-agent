@@ -716,6 +716,13 @@ func refusal(err error) error {
 	return retryable{err}
 }
 
+var (
+	answerCallback      = bot.AnswerCallback // тесты подменяют
+	callAccountCallback = func(ctx context.Context, account string, q *bot.CallbackQuery) error {
+		return accounts.Call(ctx, account, "callback", q, nil)
+	}
+)
+
 // HandleCallback — нажатие кнопки под карточкой. Ошибка (retryable) —
 // решение не принято из-за сбоя: нажатие надо разобрать снова.
 func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) (err error) {
@@ -726,40 +733,63 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 		}
 	}()
 	data := q.Data
-	if _, rest := config.SplitCallback(data); isDecisionData(rest) {
+	acct, rest := config.SplitCallback(data)
+	if isDecisionData(rest) {
 		if why := stateWaiting(s); why != "" {
 			// перенос ждёт — решать не по чему (сюда — и через op callback)
 			return retryable{fmt.Errorf("состояние ещё не перенесено в базу: %s", why)}
 		}
 	}
-	if q.From.ID != s.ApprovalChatID {
-		bot.AnswerCallback(ctx, s, q.ID, "Эта кнопка не для вас.")
-		_ = audit.Log(s.AuditPath(), "callback_rejected", "sender", q.From.ID, "data", data)
-		return
-	}
-	// «@work|…» — кнопка аккаунта work под общим ботом: решает его служба
-	if acct, rest := config.SplitCallback(data); acct != "" {
-		if !config.IsOwnAccount(acct) {
-			err = passCallback(ctx, s, q, acct)
-			return
+	// «@work|…» — кнопка аккаунта work под общим ботом: проверяем владельца
+	// и передаём его службе
+	if acct != "" && !config.IsOwnAccount(acct) {
+		target := config.FindAccount(acct)
+		if target == "" {
+			answerCallback(ctx, s, q.ID, "Аккаунта "+acct+" больше нет.")
+			return nil
 		}
+		expected := config.ApprovalChatIDOf(target)
+		if !config.SharesBotWith(target, config.AccountName()) || expected == 0 || q.From.ID != expected {
+			answerCallback(ctx, s, q.ID, "Эта кнопка не для вас.")
+			_ = audit.Log(s.AuditPath(), "callback_rejected", "sender", q.From.ID, "account", target, "data", data)
+			return nil
+		}
+		return passCallback(ctx, s, q, target)
+	}
+	if acct != "" {
 		data = rest
 		q.Data = rest
+	}
+	if strings.HasPrefix(data, "am:") {
+		if len(menuAccountsForChat(s, q.From.ID)) == 0 {
+			answerCallback(ctx, s, q.ID, "Эта кнопка не для вас.")
+			_ = audit.Log(s.AuditPath(), "callback_rejected", "sender", q.From.ID, "data", data)
+			return
+		}
+		handleAutoMenuCallback(ctx, s, q) // фильтр и страницы меню /auto
+		return
+	}
+	if strings.HasPrefix(data, "n:") {
+		accts := menuAccountsForChat(s, q.From.ID)
+		if len(accts) == 0 {
+			answerCallback(ctx, s, q.ID, "Эта кнопка не для вас.")
+			_ = audit.Log(s.AuditPath(), "callback_rejected", "sender", q.From.ID, "data", data)
+			return
+		}
+		handleNotesCallback(ctx, s, q, accts) // заметки к аккаунтам (/notes)
+		return
+	}
+	if s.ApprovalChatID == 0 || q.From.ID != s.ApprovalChatID {
+		answerCallback(ctx, s, q.ID, "Эта кнопка не для вас.")
+		_ = audit.Log(s.AuditPath(), "callback_rejected", "sender", q.From.ID, "data", data)
+		return
 	}
 	if strings.HasPrefix(data, "s:") {
 		handleAutoCallback(ctx, s, q) // переключатель автоотправки (/auto)
 		return
 	}
-	if strings.HasPrefix(data, "am:") {
-		handleAutoMenuCallback(ctx, s, q) // фильтр и страницы меню /auto
-		return
-	}
 	if strings.HasPrefix(data, "a:") {
 		err = handleAccessCallback(ctx, s, q) // запрос доступа к чату
-		return
-	}
-	if strings.HasPrefix(data, "n:") {
-		handleNotesCallback(ctx, s, q) // заметки к аккаунтам (/notes)
 		return
 	}
 	if data == upstreamAck {
@@ -872,12 +902,12 @@ func HandleCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuer
 func passCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery, acct string) error {
 	name := config.FindAccount(acct)
 	if name == "" {
-		bot.AnswerCallback(ctx, s, q.ID, "Аккаунта "+acct+" больше нет.")
+		answerCallback(ctx, s, q.ID, "Аккаунта "+acct+" больше нет.")
 		return nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Minute) // «Отправить» ждёт отправки
 	defer cancel()
-	if err := accounts.Call(cctx, name, "callback", q, nil); err != nil {
+	if err := callAccountCallback(cctx, name, q); err != nil {
 		_ = audit.Log(s.AuditPath(), "callback_pass_failed", "account", name, "error", err.Error())
 		return retryable{err}
 	}
@@ -1086,8 +1116,16 @@ func pumpUpdates(ctx context.Context, s *config.Settings, offset int64, updates 
 				if lastErr != "" {
 					text += " (" + html.EscapeString(lastErr) + ")"
 				}
-				if err := sayErr(ctx, s, text+". Нажми её ещё раз."); err != nil {
-					_ = audit.Log(s.AuditPath(), "bot_update_skip_unsaid", "update_id", u.UpdateID, "error", err.Error())
+				notice := text + ". Нажми её ещё раз."
+				var sayErrResult error
+				if u.CallbackQuery != nil && u.CallbackQuery.From.ID != 0 && u.CallbackQuery.From.ID != s.ApprovalChatID &&
+					len(menuAccountsForChat(s, u.CallbackQuery.From.ID)) > 0 {
+					sayErrResult = sayToErr(ctx, s, u.CallbackQuery.From.ID, notice)
+				} else {
+					sayErrResult = sayErr(ctx, s, notice)
+				}
+				if sayErrResult != nil {
+					_ = audit.Log(s.AuditPath(), "bot_update_skip_unsaid", "update_id", u.UpdateID, "error", sayErrResult.Error())
 					return offset, true
 				}
 				_ = audit.Log(s.AuditPath(), "bot_update_skipped", "update_id", u.UpdateID, "tries", tries-1, "error", lastErr)

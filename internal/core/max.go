@@ -151,6 +151,15 @@ func maxLoggedIn(ctx context.Context, loader func() (*config.Settings, error), r
 		maxRT.chats[ch.ID] = ch
 	}
 	maxRT.Unlock()
+	var phone string
+	if r.Profile.Contact.Phone > 0 {
+		phone = config.NormPhone(strconv.FormatInt(r.Profile.Contact.Phone, 10))
+	}
+	saveAccountMeta(ctx, config.AccountMeta{
+		ID:        r.Profile.Contact.ID,
+		Phone:     phone,
+		FirstName: r.Profile.Contact.DisplayName(),
+	}, true)
 	s, err := loader()
 	if err != nil {
 		return

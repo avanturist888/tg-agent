@@ -10,50 +10,88 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"tgagent/internal/audit"
 	"tgagent/internal/bot"
 	"tgagent/internal/chatsfile"
 	"tgagent/internal/config"
 )
 
-// setCommands — подсказка команд в меню бота (только в чате владельца).
+var botCall = bot.Call // тесты подменяют
+
+// setCommands — подсказка команд в меню бота (в чате каждого владельца на этом боте).
 func setCommands(ctx context.Context, s *config.Settings) {
 	if !s.BotReady() {
 		return
 	}
-	_ = bot.Call(ctx, s, "setMyCommands", map[string]any{
-		"commands": []map[string]string{
-			{"command": "auto", "description": "автоотправка по чатам"},
-			{"command": "notes", "description": "заметки к аккаунтам"},
-			{"command": "updates", "description": "обновления MAX и PyMax"},
-		},
-		"scope": map[string]any{"type": "chat", "chat_id": s.ApprovalChatID},
+	seen := map[int64]bool{}
+	var chatIDs []int64
+	addChat := func(cid int64) {
+		if cid != 0 && !seen[cid] {
+			seen[cid] = true
+			chatIDs = append(chatIDs, cid)
+		}
+	}
+	addChat(s.ApprovalChatID)
+	for _, acct := range config.Accounts() {
+		if config.IsOwnAccount(acct) {
+			continue
+		}
+		tok, cid, _ := config.BotOf(acct)
+		if tok != "" && tok == s.BotToken {
+			addChat(cid)
+		}
+	}
+	for _, cid := range chatIDs {
+		setCommandsForChat(ctx, s, cid)
+	}
+}
+
+func setCommandsForChat(ctx context.Context, s *config.Settings, cid int64) {
+	if !s.BotReady() || cid == 0 {
+		return
+	}
+	cmds := []map[string]string{
+		{"command": "auto", "description": "автоотправка по чатам"},
+		{"command": "notes", "description": "заметки к аккаунтам"},
+	}
+	if cid == s.ApprovalChatID && config.Profile() == "" {
+		cmds = append(cmds, map[string]string{"command": "updates", "description": "обновления MAX и PyMax"})
+	}
+	_ = botCall(ctx, s, "setMyCommands", map[string]any{
+		"commands": cmds,
+		"scope":    map[string]any{"type": "chat", "chat_id": cid},
 	}, nil)
 }
 
-// HandleMessage — сообщение боту. Слушаем только владельца в его чате с ботом.
+// HandleMessage — сообщение боту. Принимаем только личные сообщения владельцев
+// аккаунтов, привязанных к этому боту.
 func HandleMessage(ctx context.Context, s *config.Settings, m *bot.Message) {
-	if m.From.IsBot && m.Chat.ID == s.ApprovalChatID {
+	accts := menuAccountsForChat(s, m.Chat.ID)
+	if m.From.IsBot && len(accts) > 0 {
 		return // сервисное от самого бота («закрепил сообщение») — не отказ
 	}
-	if m.From.ID != s.ApprovalChatID || m.Chat.ID != s.ApprovalChatID {
+	if m.From.ID != m.Chat.ID || len(accts) == 0 {
 		logEvent(s, "command_rejected", "sender", m.From.ID)
 		return
 	}
+	chatID := m.Chat.ID
 	text := strings.TrimSpace(m.Text)
 	if !strings.HasPrefix(text, "/") {
-		if acct, ok := takePendingNote(); ok && text != "" {
-			addOwnerNote(ctx, s, acct, text)
+		if acct, ok := takePendingNote(chatID); ok && text != "" && slices.Contains(accts, acct) {
+			addOwnerNote(ctx, s, chatID, acct, text)
 		}
 		return
 	}
-	takePendingNote() // любая команда отменяет ожидание текста заметки
+	takePendingNote(chatID) // любая команда отменяет ожидание текста заметки
 	cmd, rest, _ := strings.Cut(text, " ")
 	cmd, _, _ = strings.Cut(cmd, "@") // /auto@имя_бота
 	switch strings.ToLower(cmd) {
@@ -65,18 +103,27 @@ func HandleMessage(ctx context.Context, s *config.Settings, m *bot.Message) {
 		case "off", "выкл", "n":
 			v.Filter = 'n'
 		}
-		sendAutoMenu(ctx, s, v)
+		sendAutoMenu(ctx, s, chatID, accts, v)
 	case "/notes":
-		sendNotesMenu(ctx, s)
+		sendNotesMenu(ctx, s, chatID, accts)
 	case "/note":
-		noteCommand(ctx, s, strings.TrimSpace(rest))
+		noteCommand(ctx, s, chatID, accts, strings.TrimSpace(rest))
 	case "/updates":
-		upstreamCommand(ctx, s)
+		if chatID == s.ApprovalChatID {
+			upstreamCommand(ctx, s)
+		}
 	case "/start", "/help":
-		say(ctx, s, "Здесь приходят карточки сообщений агентов на одобрение и запросы доступа к чатам.\n"+
-			"/auto — включить или выключить автоотправку по чатам (/auto вкл, /auto выкл — сразу с фильтром).\n"+
-			"/notes — заметки к аккаунтам: агенты видят их рядом со списком чатов.\n"+
-			"/updates — версии MAX и PyMax; изменения приходят сами, закреплёнными.")
+		setCommandsForChat(ctx, s, chatID)
+		msg := "Здесь приходят карточки сообщений агентов на одобрение и запросы доступа к чатам.\n"
+		if config.Multi() {
+			msg += "Аккаунты этого чата: <b>" + html.EscapeString(strings.Join(accts, ", ")) + "</b>.\n"
+		}
+		msg += "/auto — включить или выключить автоотправку по чатам (/auto вкл, /auto выкл — сразу с фильтром).\n" +
+			"/notes — заметки к аккаунтам: агенты видят их рядом со списком чатов."
+		if chatID == s.ApprovalChatID && config.Profile() == "" {
+			msg += "\n/updates — версии MAX и PyMax; изменения приходят сами, закреплёнными."
+		}
+		sayTo(ctx, s, chatID, msg)
 	}
 }
 
@@ -89,8 +136,18 @@ func say(ctx context.Context, s *config.Settings, text string) {
 
 // sayErr — say с ошибкой: кому важно, дошло ли (тесты подменяют).
 var sayErr = func(ctx context.Context, s *config.Settings, text string) error {
-	return bot.Call(ctx, s, "sendMessage", map[string]any{
-		"chat_id": s.ApprovalChatID, "text": text, "parse_mode": "HTML",
+	return sayToErr(ctx, s, s.ApprovalChatID, text)
+}
+
+func sayTo(ctx context.Context, s *config.Settings, chatID int64, text string) {
+	if err := sayToErr(ctx, s, chatID, text); err != nil {
+		logEvent(s, "command_failed", "error", err.Error())
+	}
+}
+
+func sayToErr(ctx context.Context, s *config.Settings, chatID int64, text string) error {
+	return botCall(ctx, s, "sendMessage", map[string]any{
+		"chat_id": chatID, "text": text, "parse_mode": "HTML",
 	}, nil)
 }
 
@@ -129,13 +186,16 @@ type autoItem struct {
 	on          bool
 }
 
-// autoItems — чаты с отправкой. В callback — alias: порядок чатов мог
-// поменяться, пока меню висело. В общем боте — чаты всех аккаунтов, что его
-// делят: нажатие по чату другого аккаунта основная служба передаст ему
-// (метка CallbackPrefixFor).
+// autoItems — чаты с отправкой для меню /auto текущего чата.
 func autoItems(s *config.Settings) []autoItem {
+	return autoItemsFor(s, menuAccounts(s))
+}
+
+// autoItemsFor — чаты с отправкой для указанных аккаунтов. В callback — alias:
+// порядок чатов мог поменяться, пока меню висело. В общем боте нажатие по
+// чату другого аккаунта служба-хост передаст ему (метка CallbackPrefixFor).
+func autoItemsFor(s *config.Settings, accts []string) []autoItem {
 	var out []autoItem
-	accts := menuAccounts(s)
 	for _, acct := range accts {
 		prefix := config.CallbackPrefixFor(acct)
 		if config.IsOwnAccount(acct) && !s.SharedBot {
@@ -161,10 +221,12 @@ func autoItems(s *config.Settings) []autoItem {
 	return out
 }
 
-// autoMenu — текст и кнопки меню /auto в виде v: строка фильтров, чаты
-// страницы, листание.
+// autoMenu — текст и кнопки меню /auto в виде v для чата текущего профиля.
 func autoMenu(s *config.Settings, v autoView) (string, map[string]any) {
-	all := autoItems(s)
+	return autoMenuItems(s, autoItems(s), v)
+}
+
+func autoMenuItems(s *config.Settings, all []autoItem, v autoView) (string, map[string]any) {
 	var on, shown []autoItem
 	for _, it := range all {
 		if it.on {
@@ -224,20 +286,39 @@ func autoMenu(s *config.Settings, v autoView) (string, map[string]any) {
 	return text, map[string]any{"inline_keyboard": rows}
 }
 
-// menuAccounts — чьи чаты в меню бота: основной и все, кто делит его бота;
-// у профиля со своим ботом — только он сам.
-func menuAccounts(s *config.Settings) []string {
-	own := config.AccountName()
-	if own != config.MainAccount && !s.SharedBot {
-		return []string{own}
+// menuAccountsForChat — все аккаунты на этом боте (с тем же BotToken), у
+// которых разрешённый ApprovalChatID == chatID, в стабильном порядке Accounts().
+func menuAccountsForChat(s *config.Settings, chatID int64) []string {
+	if chatID == 0 {
+		return nil
 	}
-	out := []string{config.MainAccount}
-	for _, a := range config.Accounts() {
-		if a != config.MainAccount && config.SharesMainBot(a) {
-			out = append(out, a)
+	var out []string
+	for _, acct := range config.Accounts() {
+		if config.IsOwnAccount(acct) {
+			if s.ApprovalChatID == chatID {
+				out = append(out, acct)
+			}
+			continue
+		}
+		if s.BotToken == "" {
+			continue
+		}
+		tok, cid, _ := config.BotOf(acct)
+		if tok != "" && tok == s.BotToken && cid == chatID {
+			out = append(out, acct)
 		}
 	}
 	return out
+}
+
+// menuAccounts — чьи чаты в меню бота для s.ApprovalChatID.
+func menuAccounts(s *config.Settings) []string {
+	if s.ApprovalChatID != 0 {
+		if accts := menuAccountsForChat(s, s.ApprovalChatID); len(accts) > 0 {
+			return accts
+		}
+	}
+	return []string{config.AccountName()}
 }
 
 // rulesOf — белый список аккаунта: свой — из s, чужой — из его chats.toml.
@@ -256,14 +337,15 @@ func rulesOf(s *config.Settings, acct string) []config.ChatRule {
 	return out
 }
 
-func sendAutoMenu(ctx context.Context, s *config.Settings, v autoView) {
-	text, kb := autoMenu(s, v)
-	if len(autoItems(s)) == 0 {
+func sendAutoMenu(ctx context.Context, s *config.Settings, chatID int64, accts []string, v autoView) {
+	items := autoItemsFor(s, accts)
+	text, kb := autoMenuItems(s, items, v)
+	if len(items) == 0 {
 		text = "Ни в один чат агентам не разрешено писать — автоотправку включать не для чего.\n" +
 			"Отправку открывает " + html.EscapeString("tg allow <alias> --send") + "."
 	}
-	if err := bot.Call(ctx, s, "sendMessage", map[string]any{
-		"chat_id": s.ApprovalChatID, "text": text, "parse_mode": "HTML", "reply_markup": kb,
+	if err := botCall(ctx, s, "sendMessage", map[string]any{
+		"chat_id": chatID, "text": text, "parse_mode": "HTML", "reply_markup": kb,
 	}, nil); err != nil {
 		logEvent(s, "command_failed", "command", "/auto", "error", err.Error())
 	}
@@ -271,7 +353,7 @@ func sendAutoMenu(ctx context.Context, s *config.Settings, v autoView) {
 
 // handleAutoMenuCallback — «am:<вид>»: фильтр или другая страница меню /auto.
 func handleAutoMenuCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) {
-	bot.AnswerCallback(ctx, s, q.ID, "")
+	answerCallback(ctx, s, q.ID, "")
 	if q.Message == nil {
 		return
 	}
@@ -279,13 +361,17 @@ func handleAutoMenuCallback(ctx context.Context, s *config.Settings, q *bot.Call
 	if err != nil {
 		return
 	}
-	editAutoMenu(ctx, fresh, q.Message.MessageID, parseAutoView(strings.TrimPrefix(q.Data, "am:")))
+	accts := menuAccountsForChat(fresh, q.From.ID)
+	if len(accts) == 0 {
+		return
+	}
+	editAutoMenu(ctx, fresh, q.From.ID, accts, q.Message.MessageID, parseAutoView(strings.TrimPrefix(q.Data, "am:")))
 }
 
-func editAutoMenu(ctx context.Context, s *config.Settings, messageID int64, v autoView) {
-	text, kb := autoMenu(s, v)
-	_ = bot.Call(ctx, s, "editMessageText", map[string]any{
-		"chat_id": s.ApprovalChatID, "message_id": messageID, "text": text, "parse_mode": "HTML", "reply_markup": kb,
+func editAutoMenu(ctx context.Context, s *config.Settings, chatID int64, accts []string, messageID int64, v autoView) {
+	text, kb := autoMenuItems(s, autoItemsFor(s, accts), v)
+	_ = botCall(ctx, s, "editMessageText", map[string]any{
+		"chat_id": chatID, "message_id": messageID, "text": text, "parse_mode": "HTML", "reply_markup": kb,
 	}, nil)
 }
 
@@ -296,12 +382,12 @@ func handleAutoCallback(ctx context.Context, s *config.Settings, q *bot.Callback
 	alias, code, _ := strings.Cut(strings.TrimPrefix(q.Data, "s:"), "~")
 	fresh, err := config.Load() // права могли поменять, пока меню висело
 	if err != nil {
-		bot.AnswerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
+		answerCallback(ctx, s, q.ID, "Не вышло: "+err.Error())
 		return
 	}
 	on, err := toggleAuto(fresh, alias)
 	if err != nil {
-		bot.AnswerCallback(ctx, s, q.ID, err.Error())
+		answerCallback(ctx, s, q.ID, err.Error())
 		logEvent(s, "auto_send_change_failed", "chat", alias, "error", err.Error())
 		return
 	}
@@ -310,14 +396,14 @@ func handleAutoCallback(ctx context.Context, s *config.Settings, q *bot.Callback
 	if on {
 		state = "включена"
 	}
-	bot.AnswerCallback(ctx, s, q.ID, "Автоотправка в "+fresh.Ref(alias)+" "+state+".")
+	answerCallback(ctx, s, q.ID, "Автоотправка в "+fresh.Ref(alias)+" "+state+".")
 	if q.Message == nil {
 		return
 	}
 	if fresh, err = config.Load(); err != nil {
 		return
 	}
-	editAutoMenu(ctx, fresh, q.Message.MessageID, parseAutoView(code))
+	editAutoMenu(ctx, fresh, fresh.ApprovalChatID, menuAccountsForChat(fresh, fresh.ApprovalChatID), q.Message.MessageID, parseAutoView(code))
 }
 
 // toggleAuto — переключить автоотправку чата в chats.toml; вернёт новое состояние.
@@ -335,61 +421,95 @@ func toggleAuto(s *config.Settings, alias string) (bool, error) {
 
 // ── заметки к аккаунтам ──────────────────────────────────────────────────
 
-// pendingNote — владелец нажал «➕»: следующее его сообщение — текст заметки.
-var pendingNote struct {
-	sync.Mutex
+type pendingNoteEntry struct {
 	acct  string
 	until time.Time
 }
 
-func takePendingNote() (string, bool) {
-	pendingNote.Lock()
-	defer pendingNote.Unlock()
-	acct, live := pendingNote.acct, time.Now().Before(pendingNote.until)
-	pendingNote.acct = ""
-	return acct, live && acct != ""
+// pendingNote — владелец нажал «➕»: следующее его сообщение — текст заметки.
+// Хранится отдельно на каждый chat_id, чтобы разные чаты общего бота не
+// перебивали друг друга.
+var pendingNote struct {
+	sync.Mutex
+	byChat map[int64]pendingNoteEntry
 }
 
-func addOwnerNote(ctx context.Context, s *config.Settings, acct, text string) {
+func setPendingNote(chatID int64, acct string, until time.Time) {
+	pendingNote.Lock()
+	defer pendingNote.Unlock()
+	if pendingNote.byChat == nil {
+		pendingNote.byChat = map[int64]pendingNoteEntry{}
+	}
+	pendingNote.byChat[chatID] = pendingNoteEntry{acct: acct, until: until}
+}
+
+func takePendingNote(chatID int64) (string, bool) {
+	pendingNote.Lock()
+	defer pendingNote.Unlock()
+	entry, ok := pendingNote.byChat[chatID]
+	delete(pendingNote.byChat, chatID)
+	if !ok {
+		return "", false
+	}
+	return entry.acct, time.Now().Before(entry.until) && entry.acct != ""
+}
+
+func addOwnerNote(ctx context.Context, s *config.Settings, chatID int64, acct, text string) {
 	note, err := AddNote(acct, text, noteByOwner, "")
 	if err != nil {
-		say(ctx, s, "Не вышло: "+html.EscapeString(err.Error()))
+		sayTo(ctx, s, chatID, "Не вышло: "+html.EscapeString(err.Error()))
 		return
 	}
 	logEvent(s, "account_note_added", "account", acct, "note_id", note.ID, "by", "owner_bot",
 		"chars", len([]rune(note.Text)))
-	say(ctx, s, "✅ Заметка к аккаунту <b>"+html.EscapeString(acct)+"</b> добавлена — агенты увидят её в списке чатов.")
+	sayTo(ctx, s, chatID, "✅ Заметка к аккаунту <b>"+html.EscapeString(acct)+"</b> добавлена — агенты увидят её в списке чатов.")
 }
 
-// noteCommand — «/note <аккаунт> <текст>» (аккаунт один — просто «/note <текст>»).
-func noteCommand(ctx context.Context, s *config.Settings, rest string) {
-	acct := config.MainAccount
-	if config.Multi() {
+func findInAccounts(accts []string, name string) string {
+	name = strings.TrimSpace(name)
+	for _, a := range accts {
+		if strings.EqualFold(a, name) {
+			return a
+		}
+	}
+	return ""
+}
+
+// noteCommand — «/note <аккаунт> <текст>» (аккаунт в чате один — просто «/note <текст>»).
+func noteCommand(ctx context.Context, s *config.Settings, chatID int64, accts []string, rest string) {
+	var acct string
+	if len(accts) == 1 {
+		acct = accts[0]
+	} else {
 		head, tail, _ := strings.Cut(rest, " ")
-		a := config.FindAccount(head)
+		a := findInAccounts(accts, head)
 		if a == "" {
-			say(ctx, s, "Напиши так: /note &lt;аккаунт&gt; &lt;текст&gt;. Аккаунты: "+
-				html.EscapeString(strings.Join(config.Accounts(), ", "))+".")
+			sayTo(ctx, s, chatID, "Напиши так: /note &lt;аккаунт&gt; &lt;текст&gt;. Аккаунты: "+
+				html.EscapeString(strings.Join(accts, ", "))+".")
 			return
 		}
 		acct, rest = a, strings.TrimSpace(tail)
 	}
 	if rest == "" {
-		sendNotesMenu(ctx, s)
+		sendNotesMenu(ctx, s, chatID, accts)
 		return
 	}
-	addOwnerNote(ctx, s, acct, rest)
+	addOwnerNote(ctx, s, chatID, acct, rest)
 }
 
 const noteShown = 300 // в меню длинная заметка обрезается
 
 func notesMenu() (string, map[string]any) {
+	return notesMenuFor(config.Accounts())
+}
+
+func notesMenuFor(accts []string) (string, map[string]any) {
 	var b strings.Builder
 	b.WriteString("📝 <b>Заметки к аккаунтам</b>\n" +
 		"Агенты видят их рядом со списком чатов: чей аккаунт, от чьего имени и как там писать.\n")
 	var add, del []map[string]string
 	n := 0
-	for _, acct := range config.Accounts() {
+	for _, acct := range accts {
 		b.WriteString("\n<b>" + html.EscapeString(acct) + "</b>")
 		if l := AccountLabel(acct); l != "" {
 			b.WriteString(" — " + html.EscapeString(l))
@@ -412,7 +532,7 @@ func notesMenu() (string, map[string]any) {
 		add = append(add, map[string]string{"text": "➕ " + acct, "callback_data": "n:+:" + acct})
 	}
 	b.WriteString("\nДобавить — кнопка ➕ (потом текст сообщением) или /note")
-	if config.Multi() {
+	if len(accts) > 1 {
 		b.WriteString(" &lt;аккаунт&gt;")
 	}
 	b.WriteString(" &lt;текст&gt;. Убрать — 🗑 с номером.")
@@ -428,17 +548,17 @@ func notesMenu() (string, map[string]any) {
 	return b.String(), map[string]any{"inline_keyboard": rows}
 }
 
-func sendNotesMenu(ctx context.Context, s *config.Settings) {
-	text, kb := notesMenu()
-	if err := bot.Call(ctx, s, "sendMessage", map[string]any{
-		"chat_id": s.ApprovalChatID, "text": text, "parse_mode": "HTML", "reply_markup": kb,
+func sendNotesMenu(ctx context.Context, s *config.Settings, chatID int64, accts []string) {
+	text, kb := notesMenuFor(accts)
+	if err := botCall(ctx, s, "sendMessage", map[string]any{
+		"chat_id": chatID, "text": text, "parse_mode": "HTML", "reply_markup": kb,
 	}, nil); err != nil {
 		logEvent(s, "command_failed", "command", "/notes", "error", err.Error())
 	}
 }
 
 // handleNotesCallback — «n:+:<аккаунт>» (ждать текст заметки) и «n:-:<id>» (убрать).
-func handleNotesCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery) {
+func handleNotesCallback(ctx context.Context, s *config.Settings, q *bot.CallbackQuery, accts []string) {
 	parts := strings.SplitN(q.Data, ":", 3)
 	if len(parts) < 3 {
 		return
@@ -447,27 +567,36 @@ func handleNotesCallback(ctx context.Context, s *config.Settings, q *bot.Callbac
 	case "+":
 		acct := config.FindAccount(parts[2])
 		if acct == "" {
-			bot.AnswerCallback(ctx, s, q.ID, "Аккаунта "+parts[2]+" больше нет.")
+			answerCallback(ctx, s, q.ID, "Аккаунта "+parts[2]+" больше нет.")
 			return
 		}
-		pendingNote.Lock()
-		pendingNote.acct, pendingNote.until = acct, time.Now().Add(10*time.Minute)
-		pendingNote.Unlock()
-		bot.AnswerCallback(ctx, s, q.ID, "Жду текст заметки.")
-		say(ctx, s, "Пришли текст заметки к аккаунту <b>"+html.EscapeString(acct)+"</b> следующим сообщением "+
+		if !slices.Contains(accts, acct) {
+			answerCallback(ctx, s, q.ID, "Эта кнопка не для вас.")
+			_ = audit.Log(s.AuditPath(), "callback_rejected", "sender", q.From.ID, "account", acct, "data", q.Data)
+			return
+		}
+		setPendingNote(q.From.ID, acct, time.Now().Add(10*time.Minute))
+		answerCallback(ctx, s, q.ID, "Жду текст заметки.")
+		sayTo(ctx, s, q.From.ID, "Пришли текст заметки к аккаунту <b>"+html.EscapeString(acct)+"</b> следующим сообщением "+
 			"(в течение 10 минут). Передумал — /cancel.")
 	case "-":
-		acct, err := DeleteNote(parts[2], false)
+		acct, err := deleteNoteFor(parts[2], accts)
 		if err != nil {
-			bot.AnswerCallback(ctx, s, q.ID, err.Error())
+			var d *Denied
+			if errors.As(err, &d) {
+				answerCallback(ctx, s, q.ID, "Эта кнопка не для вас.")
+				_ = audit.Log(s.AuditPath(), "callback_rejected", "sender", q.From.ID, "data", q.Data)
+				return
+			}
+			answerCallback(ctx, s, q.ID, err.Error())
 		} else {
 			logEvent(s, "account_note_deleted", "account", acct, "note_id", parts[2], "by", "owner_bot")
-			bot.AnswerCallback(ctx, s, q.ID, "Заметка убрана.")
+			answerCallback(ctx, s, q.ID, "Заметка убрана.")
 		}
 		if q.Message != nil {
-			text, kb := notesMenu()
-			_ = bot.Call(ctx, s, "editMessageText", map[string]any{
-				"chat_id": s.ApprovalChatID, "message_id": q.Message.MessageID,
+			text, kb := notesMenuFor(accts)
+			_ = botCall(ctx, s, "editMessageText", map[string]any{
+				"chat_id": q.From.ID, "message_id": q.Message.MessageID,
 				"text": text, "parse_mode": "HTML", "reply_markup": kb,
 			}, nil)
 		}

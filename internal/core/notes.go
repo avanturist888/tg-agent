@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -151,6 +152,32 @@ func DeleteNote(id string, onlyAgents bool) (string, error) {
 	return acct, err
 }
 
+// deleteNoteFor — убрать заметку, только если она принадлежит одному из allowed аккаунтов.
+func deleteNoteFor(id string, allowed []string) (string, error) {
+	id = strings.TrimSpace(id)
+	var acct string
+	err := editNotes(func(all map[string][]AccountNote) error {
+		for a, list := range all {
+			for i, n := range list {
+				if n.ID != id {
+					continue
+				}
+				if !slices.Contains(allowed, a) {
+					return &Denied{Msg: "Эта кнопка не для вас."}
+				}
+				acct = a
+				all[a] = append(list[:i:i], list[i+1:]...)
+				if len(all[a]) == 0 {
+					delete(all, a)
+				}
+				return nil
+			}
+		}
+		return &NotFound{Msg: "Заметки " + id + " нет."}
+	})
+	return acct, err
+}
+
 // notesView — заметки для агента.
 func notesView(notes []AccountNote) []*omap.Map {
 	out := make([]*omap.Map, 0, len(notes))
@@ -188,57 +215,98 @@ func AccountNoteTool(ctx context.Context, s *config.Settings, account, text, del
 
 // ── кто владелец аккаунта ───────────────────────────────────────────────
 
-type accountUser struct {
-	ID        int64  `json:"id"`
-	FirstName string `json:"first_name"`
-	LastName  string `json:"last_name"`
-	Username  string `json:"username"`
-}
-
-func (u accountUser) label() string {
-	name := strings.TrimSpace(u.FirstName + " " + u.LastName)
-	if u.Username != "" {
-		if name != "" {
-			name += " "
-		}
-		name += "@" + u.Username
-	}
-	return name
-}
-
 // accountDB — база профиля аккаунта (в ней kv account — чей он).
 func accountDB(account string) (*store.DB, error) {
 	return store.Open(filepath.Join(config.HomeOf(account), "data"))
 }
 
-// AccountLabel — чей аккаунт (имя и @username из Telegram); "" — ещё не знаем.
-func AccountLabel(account string) string {
-	db, err := accountDB(account)
+// saveAccountMeta сохраняет сведения об аккаунте в kv account текущего профиля.
+// При merge=true непустые прежние поля сохраняются, если в новом снимке они пусты.
+func saveAccountMeta(ctx context.Context, meta config.AccountMeta, merge bool) {
+	meta.Phone = config.NormPhone(meta.Phone)
+	db, err := accountDB(config.AccountName())
 	if err != nil {
+		return
+	}
+	_ = db.Write(ctx, func(tx *sql.Tx) error {
+		var prev config.AccountMeta
+		hasPrev, err := store.GetKV(ctx, tx, store.KeyAccount, &prev)
+		if err != nil {
+			return err
+		}
+		if merge && hasPrev {
+			if meta.ID == 0 {
+				meta.ID = prev.ID
+			}
+			if meta.Phone == "" {
+				meta.Phone = prev.Phone
+			}
+			if meta.FirstName == "" {
+				meta.FirstName = prev.FirstName
+			}
+			if meta.LastName == "" {
+				meta.LastName = prev.LastName
+			}
+			if meta.Username == "" {
+				meta.Username = prev.Username
+			}
+		}
+		if hasPrev && meta == prev {
+			return nil
+		}
+		return store.PutKV(ctx, tx, store.KeyAccount, meta)
+	})
+}
+
+// SyncTelegramAccount обновляет kv account при подключении службы Telegram,
+// чтобы ID, телефон и имя оставались актуальными даже после повторного входа.
+func SyncTelegramAccount(ctx context.Context, c *tgc.Conn) {
+	if c == nil {
+		return
+	}
+	me, err := c.Self(ctx)
+	if err != nil {
+		return
+	}
+	saveAccountMeta(ctx, config.AccountMeta{
+		ID:        me.ID,
+		Phone:     config.NormPhone(me.Phone),
+		FirstName: me.FirstName,
+		LastName:  me.LastName,
+		Username:  me.Username,
+	}, false)
+}
+
+// AccountLabel — чей аккаунт (имя и @username); "" — ещё не знаем.
+func AccountLabel(account string) string {
+	meta, ok := config.AccountMetaOf(account)
+	if !ok {
 		return ""
 	}
-	var u accountUser
-	if ok, err := store.GetKV(context.Background(), db.Q(), store.KeyAccount, &u); !ok || err != nil {
-		return ""
-	}
-	return u.label()
+	return meta.Label()
 }
 
 // selfLabel — то же для своего аккаунта; первый раз спрашивает Telegram.
 func selfLabel(ctx context.Context, s *config.Settings) string {
-	if l := AccountLabel(config.AccountName()); l != "" {
-		return l
-	}
 	if n := netOf(s); n != nil {
 		return n.selfLabel()
 	}
-	var u accountUser
+	if l := AccountLabel(config.AccountName()); l != "" {
+		return l
+	}
+	var u config.AccountMeta
 	err := tgc.Run(ctx, s, tgc.Opts{}, func(ctx context.Context, c *tgc.Conn) error {
 		me, err := c.Self(ctx)
 		if err != nil {
 			return err
 		}
-		u = accountUser{ID: me.ID, FirstName: me.FirstName, LastName: me.LastName, Username: me.Username}
+		u = config.AccountMeta{
+			ID:        me.ID,
+			Phone:     config.NormPhone(me.Phone),
+			FirstName: me.FirstName,
+			LastName:  me.LastName,
+			Username:  me.Username,
+		}
 		return nil
 	})
 	if err != nil {
@@ -248,8 +316,6 @@ func selfLabel(ctx context.Context, s *config.Settings) string {
 		}
 		return ""
 	}
-	if db, err := accountDB(config.AccountName()); err == nil {
-		_ = db.Write(ctx, func(tx *sql.Tx) error { return store.PutKV(ctx, tx, store.KeyAccount, u) })
-	}
-	return u.label()
+	saveAccountMeta(ctx, u, false)
+	return u.Label()
 }

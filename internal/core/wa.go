@@ -239,6 +239,7 @@ func (waNet) run(ctx context.Context, loader func() (*config.Settings, error)) {
 				OnPaired: func(phone string) {
 					waLoginUpdate(func(l *WALogin) { l.Stage, l.Phone, l.QR, l.Code = "done", phone, "", "" })
 					log("wa_login", "phone", phoneTail(phone))
+					saveWAAccountMeta(cctx, cl, phone)
 				},
 			}
 			// не связали за отведённое время — бросить; связали — соединение остаётся
@@ -317,9 +318,10 @@ func (waNet) run(ctx context.Context, loader func() (*config.Settings, error)) {
 	}
 }
 
-// waConnected — после подключения: названия групп, ленты догоняют то, что
-// пришло без связи.
+// waConnected — после подключения: сведения об аккаунте, названия групп,
+// ленты догоняют то, что пришло без связи.
 func waConnected(ctx context.Context, c *wac.Client, loader func() (*config.Settings, error)) {
+	saveWAAccountMeta(ctx, c, "")
 	s, err := loader()
 	if err != nil {
 		return
@@ -332,7 +334,31 @@ func waConnected(ctx context.Context, c *wac.Client, loader func() (*config.Sett
 	if err := c.SyncAppState(ctx); err != nil {
 		logEvent(s, "wa_appstate_failed", "error", err.Error())
 	}
+	saveWAAccountMeta(ctx, c, "")
 	(waNet{}).catchup(ctx, s)
+}
+
+func saveWAAccountMeta(ctx context.Context, c *wac.Client, pairedPhone string) {
+	phone := config.NormPhone(pairedPhone)
+	var name string
+	if c != nil {
+		if self := c.Self(); !self.IsEmpty() {
+			if phone == "" {
+				phone = config.NormPhone(self.User)
+			}
+			n := strings.TrimSpace(c.Name(ctx, self.String(), ""))
+			if n != "" && config.NormPhone(n) != phone {
+				name = n
+			}
+		}
+	}
+	if phone == "" && name == "" {
+		return
+	}
+	saveAccountMeta(ctx, config.AccountMeta{
+		Phone:     phone,
+		FirstName: name,
+	}, true)
 }
 
 func waOnEvent(loader func() (*config.Settings, error), c *wac.Client, ev wac.Event) {

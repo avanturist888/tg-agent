@@ -181,16 +181,20 @@ func (s *Settings) IsWA() bool { return s.Network == NetWA }
 // IsTelegram — профиль аккаунта Telegram (не MAX и не WhatsApp).
 func (s *Settings) IsTelegram() bool { return s.Network == NetTelegram || s.Network == "" }
 
-// Network — сеть профиля этого процесса (после SetProfile и чтения .env).
-func Network() string {
-	applyDotenv(EnvPath())
-	switch n := strings.ToLower(strings.TrimSpace(os.Getenv("TG_NETWORK"))); n {
+func normNetwork(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case NetMAX:
 		return NetMAX
 	case NetWA, "wa":
 		return NetWA
 	}
 	return NetTelegram
+}
+
+// Network — сеть профиля этого процесса (после SetProfile и чтения .env).
+func Network() string {
+	applyDotenv(EnvPath())
+	return normNetwork(os.Getenv("TG_NETWORK"))
 }
 
 func (s *Settings) DataDir() string         { return DataPath() }
@@ -354,12 +358,6 @@ func defaultDonor() string {
 	return filepath.Join(home, ".local", "share", "cc-telegram-notify", "config.env")
 }
 
-// mainBotToken — токен бота основного профиля.
-func mainBotToken() string {
-	tok, _ := mainBot()
-	return tok
-}
-
 func parseProxy(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -441,11 +439,17 @@ func load(requireCredentials bool) (*Settings, error) {
 
 	token, chatID := botCredentials()
 	shared := false
-	if profile != "" && policy == "bot_approval" {
-		// своего бота нет (или он тот же) — бот основного профиля: карточки
-		// шлём сами, нажатия разбирает основная служба и передаёт нам
-		if mainTok, mainChat := mainBot(); mainTok != "" && (token == "" || token == mainTok) {
-			token, chatID, shared = mainTok, mainChat, true
+	if policy == "bot_approval" {
+		if profile == "" {
+			if chatID == 0 {
+				chatID = AccountSelfID(MainAccount)
+			}
+		} else {
+			phone := AccountPhone(profile)
+			if phone == "" {
+				phone = NormPhone(os.Getenv("TG_PHONE"))
+			}
+			token, chatID, shared = resolveBot(profile, policy, network, phone, token, chatID)
 		}
 	}
 	if policy == "bot_approval" && (token == "" || chatID == 0) {
