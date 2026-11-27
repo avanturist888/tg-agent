@@ -246,7 +246,7 @@ type msgIn struct {
 type transcribeIn struct {
 	Chat      string `json:"chat" jsonschema:"alias из tg_list_chats"`
 	MessageID int    `json:"message_id" jsonschema:"id сообщения из tg_read_chat"`
-	Engine    string `json:"engine,omitempty" jsonschema:"auto (по умолчанию): русская речь — GigaAM, другая — Telegram; gigaam или telegram — принудительно"`
+	Engine    string `json:"engine,omitempty" jsonschema:"auto (по умолчанию): русская и английская речь — GigaAM, другая — Telegram; gigaam или telegram — принудительно"`
 }
 
 type searchIn struct {
@@ -738,7 +738,7 @@ Entities заголовка и пунктов сохраняют разметк�
 Чтение не меняет checklist и не отмечает пункты выполненными.
 
 Голосовые и кружки (media = voice / video_note) приходят с расшифровкой:
-русская речь — GigaAM на машине владельца, другая — Telegram; чем именно —
+русская и английская речь — GigaAM на машине владельца, другая — Telegram; чем именно —
 transcript_engine, язык — transcript_language. transcript_status: done —
 transcript полный; pending — готово только начало (transcript_partial),
 дожми через tg_transcribe; not_requested — вызови tg_transcribe; error —
@@ -823,7 +823,7 @@ pinned, hidden. У General id = 1. Если чат добавлен в белы�
 
 	mcp.AddTool(server, &mcp.Tool{Name: "tg_transcribe", Annotations: readOnly, Description: `Расшифровать голосовое или кружок из разрешённого чата.
 
-Русскую речь расшифровывает GigaAM на машине владельца (если установлен):
+Русскую и английскую речь расшифровывает GigaAM на машине владельца (если установлен):
 точнее Telegram, с пунктуацией, без ограничения длины. Язык определяется
 сам; другой язык — встроенная расшифровка Telegram (кнопка «→A»), она
 ждёт ПОЛНЫЙ текст (до пары минут на длинной записи). Чем расшифровано —
@@ -831,7 +831,8 @@ transcript_engine (gigaam-… или telegram), язык — transcript_language
 
 Нужен, когда в tg_read_chat transcript_status = pending или
 not_requested, или когда расшифровка вышла странной: engine = gigaam —
-речь точно русская, без определения языка; engine = telegram — силами
+принудительно GigaAM без определения языка (речь помечается как ru; в auto на
+GigaAM v4 автоматически распознаются русский и английский); engine = telegram — силами
 Telegram (записи от ~5 минут он не берёт: MSG_VOICE_TOO_LONG).
 Расшифровка автоматическая: имена, термины и цифры могут быть искажены.`},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in transcribeIn) (*mcp.CallToolResult, any, error) {

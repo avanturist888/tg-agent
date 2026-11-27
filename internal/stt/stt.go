@@ -1,6 +1,7 @@
-// Package stt — расшифровка голосовых на этой машине: GigaAM для русской
-// речи через sherpa-onnx (bin\tgstt.exe, исходники — stt/; модели в
-// stt\models кладёт scripts\install-stt.ps1). Без Python.
+// Package stt — расшифровка голосовых на этой машине: GigaAM для русской и
+// английской речи (с пунктуацией и code-switching) через sherpa-onnx
+// (bin\tgstt.exe, исходники — stt/; модели в stt\models кладёт
+// scripts\install-stt.ps1). Без Python.
 //
 // Процесс tgstt с загруженными моделями живёт, пока есть работа: первый
 // запрос его запускает (загрузка моделей — секунда-две), после простоя
@@ -34,7 +35,7 @@ type Result struct {
 	// Language — язык речи (whisper), LanguageProb — уверенность
 	Language     string  `json:"language"`
 	LanguageProb float64 `json:"language_prob"`
-	// Engine — "gigaam", если расшифровал; "" — речь не русская, текста нет
+	// Engine — "gigaam", если расшифровал; "" — язык не поддерживается GigaAM, текста нет
 	Engine   string  `json:"engine"`
 	Model    string  `json:"model"`
 	Device   string  `json:"device"`
@@ -44,10 +45,10 @@ type Result struct {
 	Seconds  float64 `json:"seconds"`
 }
 
-// Done — расшифровано здесь (русская речь или тишина).
+// Done — расшифровано здесь (русская/английская речь или тишина).
 func (r Result) Done() bool { return r.Engine != "" }
 
-// Label — чем расшифровано, для агента: «gigaam-v3_e2e_rnnt».
+// Label — чем расшифровано, для агента: «gigaam-v4_e2e_ctc».
 func (r Result) Label() string {
 	if r.Model == "" {
 		return r.Engine
@@ -195,8 +196,8 @@ func (w *worker) call(ctx context.Context, req map[string]any) (Result, error) {
 	return res.Result, nil
 }
 
-// Transcribe — расшифровать файл. language: "auto" — русскую речь
-// расшифровать, о другой только сказать язык (Done() == false); "ru" — без
+// Transcribe — расшифровать файл. language: "auto" — русскую и английскую речь
+// расшифровать, о другой только сказать язык (Done() == false); "ru" / "en" — без
 // определения языка.
 func Transcribe(ctx context.Context, path, language string) (Result, error) {
 	if !Enabled() {
