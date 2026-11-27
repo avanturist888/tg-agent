@@ -31,6 +31,19 @@ func TestCardMarkdownPreservesBreaksForMarkdownDraft(t *testing.T) {
 	}
 }
 
+func TestCardMarkdownEscapesDollarsForMarkdownDraft(t *testing.T) {
+	mdDraft := &outbox.Draft{
+		Chat: "test",
+		Fmt:  "markdown",
+		Text: "Цена $100 и $200, формула $E = mc^2$",
+	}
+	card := CardMarkdown(mdDraft, "Тест", "", "")
+	wantBody := `Цена \$100 и \$200, формула $E = mc^2$`
+	if !strings.HasSuffix(card, "\n\n"+wantBody) {
+		t.Fatalf("CardMarkdown markdown body:\ngot:\n%q\nwant suffix:\n%q", card, wantBody)
+	}
+}
+
 func TestCardDeleteDraft(t *testing.T) {
 	d := &outbox.Draft{
 		ID:        "0101-1200-abcdef",

@@ -105,6 +105,22 @@ func TestRichInputPreservesBreaks(t *testing.T) {
 	}
 }
 
+func TestRichInputEscapesDollars(t *testing.T) {
+	var c *Conn
+	in, err := c.richInput(context.Background(), "Цена $100 и $200, формула $x + y = z$")
+	if err != nil {
+		t.Fatalf("richInput: %v", err)
+	}
+	md, ok := in.(*tg.InputRichMessageMarkdown)
+	if !ok {
+		t.Fatalf("ждали *tg.InputRichMessageMarkdown, получили %T", in)
+	}
+	want := `Цена \$100 и \$200, формула $x + y = z$`
+	if md.Markdown != want {
+		t.Fatalf("Markdown = %q, ждали %q", md.Markdown, want)
+	}
+}
+
 type fakeDraftInvoker struct {
 	savedMarkdown string
 	dialogsCalls  int

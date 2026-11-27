@@ -88,6 +88,7 @@ func unstub(v reflect.Value, found map[int64]bool) {
 // на знакомых людей — markdown как есть (его разбирает сервер при отправке).
 func (c *Conn) richInput(ctx context.Context, text string) (tg.InputRichMessageClass, error) {
 	text = richtext.PreserveBreaks(text)
+	text = richtext.EscapeDollars(text)
 	md := &tg.InputRichMessageMarkdown{Markdown: text}
 	if c == nil || c.Peers == nil || !mentionLink.MatchString(text) {
 		return md, nil

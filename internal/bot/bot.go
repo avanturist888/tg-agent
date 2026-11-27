@@ -340,7 +340,7 @@ func CardMarkdown(d *outbox.Draft, title, note, status string) string {
 		body = "🤖 " + MDEscape(BotLine(d.Bot))
 	} else if d.Text != "" {
 		if d.Fmt == "markdown" {
-			body = richtext.PreserveBreaks(d.Text)
+			body = richtext.EscapeDollars(richtext.PreserveBreaks(d.Text))
 		} else {
 			body = MDEscape(d.Text)
 		}

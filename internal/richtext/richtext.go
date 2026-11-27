@@ -63,6 +63,13 @@ func Text(node tg.RichTextClass) string {
 		return fmt.Sprintf("[%s](tg://user?id=%d)", Text(n.Text), n.UserID)
 	case *tg.TextMention:
 		return Text(n.Text)
+	case *tg.TextMath:
+		if n.Source == "" {
+			return ""
+		}
+		return "$" + n.Source + "$"
+	case *tg.TextCustomEmoji:
+		return n.Alt
 	}
 	// незнакомый тип из будущих слоёв: берём, что похоже на текст
 	return fallbackText(node)
@@ -95,6 +102,9 @@ func fallbackText(node any) string {
 		case string:
 			return t
 		}
+	}
+	if f := v.FieldByName("Source"); f.IsValid() && f.Kind() == reflect.String {
+		return f.String()
 	}
 	return ""
 }
@@ -232,6 +242,12 @@ func Block(b tg.PageBlockClass, indent string) string {
 		return caption(n.Caption, "video")
 	case *tg.PageBlockAudio:
 		return caption(n.Caption, "audio")
+	case *tg.PageBlockMath:
+		if n.Source == "" {
+			return ""
+		}
+		body := strings.ReplaceAll(n.Source, "\n", "\n"+indent)
+		return indent + "$$\n" + indent + body + "\n" + indent + "$$"
 	}
 	// запасной путь для незнакомых блоков
 	v := reflect.ValueOf(b)
