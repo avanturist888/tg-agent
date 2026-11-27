@@ -48,7 +48,7 @@ type Result struct {
 // Done — расшифровано здесь (русская/английская речь или тишина).
 func (r Result) Done() bool { return r.Engine != "" }
 
-// Label — чем расшифровано, для агента: «gigaam-v4_e2e_ctc».
+// Label — чем расшифровано, для агента: «gigaam-v4_e2e_rnnt».
 func (r Result) Label() string {
 	if r.Model == "" {
 		return r.Engine

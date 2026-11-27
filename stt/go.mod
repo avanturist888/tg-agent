@@ -2,7 +2,10 @@ module tgagent/stt
 
 go 1.25.0
 
-require github.com/k2-fsa/sherpa-onnx-go v1.13.8
+require (
+	github.com/k2-fsa/sherpa-onnx-go v1.13.8
+	github.com/yalue/onnxruntime_go v1.32.1
+)
 
 require (
 	github.com/k2-fsa/sherpa-onnx-go-linux v1.13.8 // indirect

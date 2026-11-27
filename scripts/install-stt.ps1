@@ -2,10 +2,10 @@
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\install-stt.ps1
 #
-# Python не нужен: расшифровывает bin\tgstt.exe (sherpa-onnx, на процессоре),
+# Python не нужен: расшифровывает bin\tgstt.exe (ONNX Runtime / sherpa-onnx, на процессоре),
 # его собирает scripts\build.ps1 (нужен gcc — MinGW). Нужен ffmpeg в PATH.
 # Модели:
-#   - GigaAM v4 с пунктуацией (ctc-e2e, int8) — русская и английская речь
+#   - GigaAM v4 с пунктуацией (rnnt-e2e, int8) — русская и английская речь
 #     (включая code-switching);
 #   - whisper base (int8) — только определить язык;
 #   - Silero VAD — нарезать длинные записи по паузам.
@@ -17,7 +17,7 @@ $ProgressPreference = 'SilentlyContinue'
 $root = Split-Path -Parent $PSScriptRoot
 $models = Join-Path $root 'stt\models'
 $base = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models'
-$v4Base = 'https://huggingface.co/ai-babai/gigaam-v4-onnx/resolve/9c1f125787db5befcfcd3c8e232a642f9b1531f6/ctc-e2e'
+$v4Base = 'https://huggingface.co/ai-babai/gigaam-v4-onnx/resolve/9c1f125787db5befcfcd3c8e232a642f9b1531f6/rnnt'
 New-Item -ItemType Directory -Force $models | Out-Null
 
 if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
@@ -43,7 +43,11 @@ function Get-VerifiedFile($url, $dst, $expectedSha256) {
         if ($got -ne $want) {
             throw "не совпал SHA-256 для ${name}: ожидалось $want, получено $got"
         }
-        Move-Item -LiteralPath $tmp -Destination $dst -Force
+        if (Test-Path -LiteralPath $dst) {
+            [IO.File]::Replace($tmp, $dst, $null)
+        } else {
+            Move-Item -LiteralPath $tmp -Destination $dst -Force
+        }
     } catch {
         if (Test-Path -LiteralPath $tmp) {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -69,14 +73,20 @@ function Get-Model($archive, $dir, [string[]]$keep) {
     Remove-Item $tmp, $unpack -Recurse -Force
 }
 
-$v4Dir = Join-Path $models 'giga-am-v4-ctc-e2e'
+$v4Dir = Join-Path $models 'giga-am-v4-rnnt-e2e'
 New-Item -ItemType Directory -Force $v4Dir | Out-Null
-Get-VerifiedFile "$v4Base/model.int8.onnx" (Join-Path $v4Dir 'model.int8.onnx') `
-    '0f61ec8ca69517cb68e24531c5000053b80ab84cf7071cc294571edfae493462'
-Get-VerifiedFile "$v4Base/tokens.txt" (Join-Path $v4Dir 'tokens.txt') `
-    'c6a37fab667d53c37e66835c90083808daa116c3993c5e93ce518b5a3896de6e'
+Get-VerifiedFile "$v4Base/v4_rnnt_encoder.int8.onnx" (Join-Path $v4Dir 'v4_rnnt_encoder.int8.onnx') `
+    '4cc7dd3e2a5f1503239df920976d419287f67df87f1849fff0c34ce4b3d58e20'
+Get-VerifiedFile "$v4Base/v4_rnnt_advance.onnx" (Join-Path $v4Dir 'v4_rnnt_advance.onnx') `
+    'd992302d83f03367202d4200cbdf2f74e65cb36d1e553f5ce330e73f26949b45'
+Get-VerifiedFile "$v4Base/v4_rnnt_mel.npz" (Join-Path $v4Dir 'v4_rnnt_mel.npz') `
+    '8c6fe983296b38324dc41bff809d65dd9199d064f7873936d0b9e71f2e53784d'
+Get-VerifiedFile "$v4Base/v4_rnnt_e2e_tokenizer.model" (Join-Path $v4Dir 'v4_rnnt_e2e_tokenizer.model') `
+    'f547bcb38e071694ef1ddb25d9d40c86b4ab88cd0b16ab9fd52f27dd52c48e39'
 Get-VerifiedFile "$v4Base/LICENSE" (Join-Path $v4Dir 'LICENSE') `
     'd02ed0afc408cb4ed5eb34b233096ad8c3db8b6751cd9385276a6725dbf92925'
+Get-VerifiedFile "$v4Base/LICENSE-APACHE-2.0" (Join-Path $v4Dir 'LICENSE-APACHE-2.0') `
+    'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30'
 
 Get-Model 'sherpa-onnx-whisper-base.tar.bz2' 'sherpa-onnx-whisper-base' `
     @('base-encoder.int8.onnx', 'base-decoder.int8.onnx', 'base-tokens.txt')
@@ -97,7 +107,7 @@ $code = $LASTEXITCODE
 Write-Host $out
 if ($code -ne 0) { throw "проверка не прошла (код $code) — см. вывод выше" }
 $res = $out | ConvertFrom-Json
-if (-not $res.ready -or $res.model -ne 'v4_e2e_ctc') {
-    throw "ожидалась модель v4_e2e_ctc с ready=true, получено ready=$($res.ready), model=$($res.model) — пересобери bin\tgstt.exe"
+if ($res.ready -ne $true -or $res.model -ne 'v4_e2e_rnnt') {
+    throw "ожидалась модель v4_e2e_rnnt с ready=true, получено ready=$($res.ready), model=$($res.model) — пересобери bin\tgstt.exe"
 }
-Write-Host 'Готово: голосовые на русском и английском теперь расшифровывает GigaAM v4.'
+Write-Host 'Готово: голосовые на русском и английском теперь расшифровывает GigaAM v4 RNN-T.'

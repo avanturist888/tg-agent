@@ -1,14 +1,14 @@
 // tgstt — расшифровка голосовых для tg-agent без Python: GigaAM v4
-// (ctc-e2e, INT8: русская и английская речь с пунктуацией и code-switching;
-// мягкий fallback на GigaAM v3, если установлена только v3) через sherpa-onnx,
-// на процессоре.
+// (rnnt-e2e, INT8: русская и английская речь с пунктуацией и code-switching
+// через onnxruntime.dll; мягкий fallback на GigaAM v4 ctc-e2e и GigaAM v3
+// через sherpa-onnx), на процессоре.
 //
 // Служба tg-agent держит этот процесс и шлёт ему запросы строками JSON в
 // stdin, ответ — строкой JSON в stdout (логи — в stderr):
 //
 //	{"id": 1, "path": "C:/.../voice.oga", "language": "auto"}
 //	→ {"id": 1, "ok": true, "language": "ru", "engine": "gigaam",
-//	   "model": "v4_e2e_ctc", "device": "cpu", "text": "…", "speech": true,
+//	   "model": "v4_e2e_rnnt", "device": "cpu", "text": "…", "speech": true,
 //	   "duration": 12.3, "seconds": 0.8}
 //
 // language: "auto" — сначала определить язык (whisper base, только детектор):
@@ -42,20 +42,22 @@ import (
 )
 
 const (
-	sampleRate  = 16000
-	modelNameV4 = "v4_e2e_ctc"
-	modelNameV3 = "v3_e2e_rnnt"
-	maxChunk    = 22 * sampleRate // GigaAM берёт до 25 с за раз
-	pad         = sampleRate / 5  // 0,2 с вокруг речи
-	lidMax      = 29 * sampleRate // детектору языка — до 29 с речи (whisper берёт меньше 30)
+	sampleRate      = 16000
+	modelNameV4RNNT = "v4_e2e_rnnt"
+	modelNameV4CTC  = "v4_e2e_ctc"
+	modelNameV3     = "v3_e2e_rnnt"
+	maxChunk        = 22 * sampleRate // GigaAM берёт до 25 с за раз
+	pad             = sampleRate / 5  // 0,2 с вокруг речи
+	lidMax          = 29 * sampleRate // детектору языка — до 29 с речи (whisper берёт меньше 30)
 )
 
 // Модели внутри каталога моделей (как их раскладывает install-stt.ps1).
 const (
-	asrDirV4 = "giga-am-v4-ctc-e2e"
-	asrDirV3 = "sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16"
-	lidDir   = "sherpa-onnx-whisper-base"
-	vadOnx   = "silero_vad.onnx"
+	asrDirV4RNNT = "giga-am-v4-rnnt-e2e"
+	asrDirV4CTC  = "giga-am-v4-ctc-e2e"
+	asrDirV3     = "sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16"
+	lidDir       = "sherpa-onnx-whisper-base"
+	vadOnx       = "silero_vad.onnx"
 )
 
 func logf(format string, a ...any) {
@@ -78,6 +80,7 @@ func threads() int {
 type engine struct {
 	dir   string
 	model string
+	rnnt  *rnntModel
 	asr   *sherpa.OfflineRecognizer
 	lid   *sherpa.SpokenLanguageIdentification
 }
@@ -92,16 +95,28 @@ func need(paths ...string) error {
 }
 
 func (e *engine) load() error {
-	if e.asr != nil && e.lid != nil {
+	if (e.rnnt != nil || e.asr != nil) && e.lid != nil {
 		return nil
 	}
-	v4Dir := filepath.Join(e.dir, asrDirV4)
+	v4RNNTDir := filepath.Join(e.dir, asrDirV4RNNT)
+	v4CTCDir := filepath.Join(e.dir, asrDirV4CTC)
 	v3Dir := filepath.Join(e.dir, asrDirV3)
-	hasV4 := need(filepath.Join(v4Dir, "model.int8.onnx"), filepath.Join(v4Dir, "tokens.txt")) == nil
+	hasV4RNNT := need(
+		filepath.Join(v4RNNTDir, rnntEncoderFile),
+		filepath.Join(v4RNNTDir, rnntAdvanceFile),
+		filepath.Join(v4RNNTDir, rnntMelFile),
+		filepath.Join(v4RNNTDir, rnntTokenizerFile),
+	) == nil
+	hasV4CTC := need(filepath.Join(v4CTCDir, "model.int8.onnx"), filepath.Join(v4CTCDir, "tokens.txt")) == nil
 	hasV3 := need(filepath.Join(v3Dir, "encoder.int8.onnx"), filepath.Join(v3Dir, "decoder.onnx"),
 		filepath.Join(v3Dir, "joiner.onnx"), filepath.Join(v3Dir, "tokens.txt")) == nil
-	if !hasV4 && !hasV3 {
-		return need(filepath.Join(v4Dir, "model.int8.onnx"), filepath.Join(v4Dir, "tokens.txt"))
+	if !hasV4RNNT && !hasV4CTC && !hasV3 {
+		return need(
+			filepath.Join(v4RNNTDir, rnntEncoderFile),
+			filepath.Join(v4RNNTDir, rnntAdvanceFile),
+			filepath.Join(v4RNNTDir, rnntMelFile),
+			filepath.Join(v4RNNTDir, rnntTokenizerFile),
+		)
 	}
 	l := filepath.Join(e.dir, lidDir)
 	if err := need(filepath.Join(l, "base-encoder.int8.onnx"), filepath.Join(l, "base-decoder.int8.onnx"),
@@ -109,17 +124,43 @@ func (e *engine) load() error {
 		return err
 	}
 	t := time.Now()
-	cfg := sherpa.OfflineRecognizerConfig{}
-	var model string
-	if hasV4 {
+	var (
+		rnnt    *rnntModel
+		asr     *sherpa.OfflineRecognizer
+		model   string
+		lastErr error
+	)
+	if hasV4RNNT {
+		r, err := loadRNNT(v4RNNTDir, threads())
+		if err != nil {
+			logf("GigaAM %s не загрузился (%v) — пробую резервную модель", modelNameV4RNNT, err)
+			lastErr = fmt.Errorf("GigaAM %s не загрузился: %w", modelNameV4RNNT, err)
+		} else {
+			rnnt = r
+			model = modelNameV4RNNT
+		}
+	}
+	if rnnt == nil && hasV4CTC {
+		cfg := sherpa.OfflineRecognizerConfig{}
 		cfg.FeatConfig = sherpa.FeatureConfig{SampleRate: sampleRate, FeatureDim: 64}
 		cfg.ModelConfig.NemoCTC = sherpa.OfflineNemoEncDecCtcModelConfig{
-			Model: filepath.Join(v4Dir, "model.int8.onnx"),
+			Model: filepath.Join(v4CTCDir, "model.int8.onnx"),
 		}
-		cfg.ModelConfig.Tokens = filepath.Join(v4Dir, "tokens.txt")
+		cfg.ModelConfig.Tokens = filepath.Join(v4CTCDir, "tokens.txt")
 		cfg.ModelConfig.ModelType = "nemo_ctc"
-		model = modelNameV4
-	} else {
+		cfg.ModelConfig.NumThreads = threads()
+		cfg.ModelConfig.Provider = "cpu"
+		cfg.DecodingMethod = "greedy_search"
+		if a := sherpa.NewOfflineRecognizer(&cfg); a != nil {
+			asr = a
+			model = modelNameV4CTC
+		} else {
+			logf("GigaAM %s не загрузился — пробую резервную модель", modelNameV4CTC)
+			lastErr = errors.New("GigaAM v4_e2e_ctc не загрузился (подробности выше в логе)")
+		}
+	}
+	if rnnt == nil && asr == nil && hasV3 {
+		cfg := sherpa.OfflineRecognizerConfig{}
 		cfg.FeatConfig = sherpa.FeatureConfig{SampleRate: sampleRate, FeatureDim: 80} // как у sherpa-onnx-offline; размерность NeMo-модели берёт из её метаданных
 		cfg.ModelConfig.Transducer = sherpa.OfflineTransducerModelConfig{
 			Encoder: filepath.Join(v3Dir, "encoder.int8.onnx"),
@@ -128,13 +169,20 @@ func (e *engine) load() error {
 		}
 		cfg.ModelConfig.Tokens = filepath.Join(v3Dir, "tokens.txt")
 		cfg.ModelConfig.ModelType = "nemo_transducer"
-		model = modelNameV3
+		cfg.ModelConfig.NumThreads = threads()
+		cfg.ModelConfig.Provider = "cpu"
+		cfg.DecodingMethod = "greedy_search"
+		if a := sherpa.NewOfflineRecognizer(&cfg); a != nil {
+			asr = a
+			model = modelNameV3
+		} else {
+			lastErr = errors.New("GigaAM не загрузился (подробности выше в логе)")
+		}
 	}
-	cfg.ModelConfig.NumThreads = threads()
-	cfg.ModelConfig.Provider = "cpu"
-	cfg.DecodingMethod = "greedy_search"
-	asr := sherpa.NewOfflineRecognizer(&cfg)
-	if asr == nil {
+	if rnnt == nil && asr == nil {
+		if lastErr != nil {
+			return lastErr
+		}
 		return errors.New("GigaAM не загрузился (подробности выше в логе)")
 	}
 	logf("GigaAM %s на cpu (%d потоков): %.1f с", model, threads(), time.Since(t).Seconds())
@@ -148,16 +196,36 @@ func (e *engine) load() error {
 		Provider:   "cpu",
 	})
 	if lid == nil {
-		sherpa.DeleteOfflineRecognizer(asr)
+		if rnnt != nil {
+			rnnt.close()
+		}
+		if asr != nil {
+			sherpa.DeleteOfflineRecognizer(asr)
+		}
 		return errors.New("детектор языка не загрузился")
 	}
-	e.asr, e.lid, e.model = asr, lid, model
+	e.rnnt, e.asr, e.lid, e.model = rnnt, asr, lid, model
 	logf("детектор языка whisper base: %.1f с", time.Since(t).Seconds())
 	return nil
 }
 
+func (e *engine) close() {
+	if e.rnnt != nil {
+		e.rnnt.close()
+		e.rnnt = nil
+	}
+	if e.asr != nil {
+		sherpa.DeleteOfflineRecognizer(e.asr)
+		e.asr = nil
+	}
+	if e.lid != nil {
+		sherpa.DeleteSpokenLanguageIdentification(e.lid)
+		e.lid = nil
+	}
+}
+
 func (e *engine) supports(lang string) bool {
-	if e.model == modelNameV4 {
+	if e.model == modelNameV4RNNT || e.model == modelNameV4CTC {
 		return lang == "ru" || lang == "en"
 	}
 	return lang == "ru"
@@ -243,18 +311,28 @@ func (e *engine) language(wav []float32, spans []span) string {
 
 // transcribe — куски по одному: все разом одним DecodeStreams на голосовом
 // в 39 минут съели 3,9 ГБ памяти, по одному — 1 ГБ при той же скорости.
-func (e *engine) transcribe(wav []float32, spans []span) string {
+func (e *engine) transcribe(wav []float32, spans []span) (string, error) {
 	var texts []string
 	for _, p := range chunks(len(wav), spans) {
-		st := sherpa.NewOfflineStream(e.asr)
-		st.AcceptWaveform(sampleRate, wav[p.start:p.end])
-		e.asr.Decode(st)
-		if t := strings.TrimSpace(st.GetResult().Text); t != "" {
+		var t string
+		if e.rnnt != nil {
+			var err error
+			t, err = e.rnnt.decodeChunk(wav[p.start:p.end])
+			if err != nil {
+				return "", err
+			}
+		} else {
+			st := sherpa.NewOfflineStream(e.asr)
+			st.AcceptWaveform(sampleRate, wav[p.start:p.end])
+			e.asr.Decode(st)
+			t = strings.TrimSpace(st.GetResult().Text)
+			sherpa.DeleteOfflineStream(st)
+		}
+		if t != "" {
 			texts = append(texts, t)
 		}
-		sherpa.DeleteOfflineStream(st)
 	}
-	return strings.Join(texts, " ")
+	return strings.Join(texts, " "), nil
 }
 
 // loadAudio — файл любого формата в 16 кГц моно через ffmpeg.
@@ -311,7 +389,11 @@ func (e *engine) handle(req request) (map[string]any, error) {
 		}
 		out["language"] = lang
 		if e.supports(lang) {
-			out["engine"], out["model"], out["text"] = "gigaam", e.model, e.transcribe(wav, spans)
+			text, err := e.transcribe(wav, spans)
+			if err != nil {
+				return nil, err
+			}
+			out["engine"], out["model"], out["text"] = "gigaam", e.model, text
 		} else {
 			out["engine"], out["text"] = nil, nil
 		}
@@ -322,6 +404,7 @@ func (e *engine) handle(req request) (map[string]any, error) {
 
 func main() {
 	e := &engine{dir: modelsDir()}
+	defer e.close()
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetEscapeHTML(false)
 	reply := func(id any, res map[string]any, err error) {
